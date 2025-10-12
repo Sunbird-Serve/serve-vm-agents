@@ -2,9 +2,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict  # <-- import the
 
 class Settings(BaseSettings):
     KAFKA_BROKERS: str = "localhost:19092"
-    TOPIC_ONBOARDING: str = "serve.vm.onboarding"
+    TOPIC_WA_IN: str = "serve.vm.whatsapp.in"
+    TOPIC_WA_OUT: str = "serve.vm.whatsapp.out"
     GROUP_ID: str = "vm-agent-onboarding"
-    MCP_BASE: str = "http://localhost:8080"
+    AGENT_NAME: str = "onboarding"
+    MCP_BASE: str = "http://localhost:9000"
     PORT: int = 8001
     # allow unrelated env vars (e.g., AGENT_NAME) without error
     model_config = SettingsConfigDict(env_file=".env",
