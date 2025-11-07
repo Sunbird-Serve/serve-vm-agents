@@ -1,0 +1,465 @@
+# Onboarding Agent Finite State Machine Definition
+# This file documents all states, transitions, triggers, and tool calls for the volunteer onboarding flow
+
+metadata:
+  name: "SERVE Volunteer Onboarding Agent"
+  version: "1.0"
+  description: "WhatsApp-based onboarding conversation flow for volunteer teachers"
+  entry_point: "WELCOME"
+
+states:
+  WELCOME:
+    description: "Initial greeting, SERVE introduction, and consent collection"
+    entry_trigger: "__kick__" | "first_inbound_message"
+    substeps:
+      - name: "greet"
+        action: "send_welcome_messages"
+        tools: ["wa.send_message"]
+        messages:
+          - "Hey {name}! I'm Sia from the SERVE team..."
+          - "Before we move ahead... Shall we continue?"
+      - name: "await_continue"
+        action: "wait_for_user_reply"
+        triggers:
+          - "CONSENT_YES" -> "shared_info"
+          - "CONSENT_NO" -> "REJECTED"
+          - "QUERY" -> "answer_faq"
+          - "DEFERRAL" -> "DEFERRED"
+          - "STOP" -> "OPTOUT"
+          - "RETURNING" -> "fast_forward"
+          - "AMBIGUOUS" -> "clarify"
+        parsing:
+          - rule_based: ["is_yes_response", "is_no_response"]
+          - llm_tool: "onboarding.parse_message"
+          - fallback: "llm.classify_response"
+      - name: "shared_info"
+        action: "send_serve_info_and_consent"
+        tools: ["wa.send_message"]
+        messages:
+          - "SERVE has helped thousands..."
+          - "Just to be clear — this is a volunteer opportunity..."
+    
+    transitions:
+      - from: "WELCOME"
+        to: "ELIGIBILITY_PART1"
+        trigger: "CONSENT_YES"
+        condition: "consent.value == 'yes'"
+        tools: ["consent.record", "state.advance"]
+        action: "record_consent_and_advance"
+      
+      - from: "WELCOME"
+        to: "REJECTED"
+        trigger: "CONSENT_NO"
+        condition: "consent.value == 'no'"
+        action: "decline_politely"
+      
+      - from: "WELCOME"
+        to: "DEFERRED"
+        trigger: "DEFERRAL"
+        tools: ["deferral.create"]
+        action: "create_deferral_and_exit"
+      
+      - from: "WELCOME"
+        to: "OPTOUT"
+        trigger: "STOP"
+        action: "acknowledge_stop"
+      
+      - from: "WELCOME"
+        to: "<existing_state>"
+        trigger: "RETURNING"
+        tools: ["state.get"]
+        action: "fast_forward_to_existing_state"
+
+  ELIGIBILITY_PART1:
+    description: "Two-part eligibility check: Age (Q1) and Device (Q2)"
+    entry_trigger: "consent_recorded"
+    
+    substeps:
+      - name: "age_check"
+        question: "Are you 18 or older?"
+        parsing:
+          - llm_tool: "onboarding.parse_message"
+          - field: "eligibility.age_ok"
+          - fallback: ["is_yes_response", "is_no_response"]
+        validation:
+          - hard_rule: "age >= 18"
+          - on_fail: "REJECTED" (no_persuasion)
+        tools: ["onboarding.parse_message", "eligibility.check"]
+      
+      - name: "device_check"
+        question: "Do you have a smartphone or laptop and stable internet?"
+        parsing:
+          - llm_tool: "onboarding.parse_message"
+          - field: "eligibility.has_device"
+          - fallback: ["is_yes_response", "is_no_response"]
+        validation:
+          - on_fail: "offer_deferral"
+          - deferral_reason: "NO_DEVICE"
+        tools: ["onboarding.parse_message", "eligibility.check", "deferral.create"]
+    
+    transitions:
+      - from: "ELIGIBILITY_PART1"
+        to: "ELIGIBILITY_PART2"
+        trigger: "both_age_and_device_ok"
+        condition: "elig.age == true && elig.device == true"
+        action: "send_commitment_question"
+      
+      - from: "ELIGIBILITY_PART1"
+        to: "REJECTED"
+        trigger: "age_under_18"
+        condition: "age < 18"
+        action: "decline_age_politely"
+      
+      - from: "ELIGIBILITY_PART1"
+        to: "DEFERRED"
+        trigger: "no_device_deferred"
+        condition: "has_device == false && deferral_accepted"
+        tools: ["deferral.create"]
+        action: "create_device_deferral"
+
+  ELIGIBILITY_PART2:
+    description: "Commitment check with persuasion (max 2 attempts)"
+    entry_trigger: "eligibility_part1_complete"
+    
+    question: "Would you be able to give about 2 hours a week for teaching?"
+    parsing:
+      - llm_tool: "onboarding.parse_message"
+      - field: "eligibility.weekly_commitment_hours"
+      - fallback: "_extract_simple_hours"
+    validation:
+      - policy_check: "same_day_request == false"
+      - on_policy_violation: "clarify_split_hours"
+      - persuasion:
+          - max_attempts: 2
+          - on_hesitant: "gently_persuade"
+          - on_insufficient: "offer_deferral"
+    tools: ["onboarding.parse_message", "eligibility.check"]
+    
+    transitions:
+      - from: "ELIGIBILITY_PART2"
+        to: "PREFS_DAYTIME"
+        trigger: "commitment_ok"
+        condition: "weekly_commitment_hours >= 2.0"
+        action: "send_day_preference_question"
+      
+      - from: "ELIGIBILITY_PART2"
+        to: "REJECTED"
+        trigger: "persuasion_exhausted"
+        condition: "persuasion_attempts >= 2 && commitment_insufficient"
+        action: "decline_politely"
+      
+      - from: "ELIGIBILITY_PART2"
+        to: "DEFERRED"
+        trigger: "commitment_deferred"
+        condition: "deferral_requested"
+        tools: ["deferral.create"]
+        action: "create_commitment_deferral"
+
+  PREFS_DAYTIME:
+    description: "Collect teaching day and time preferences (separate from orientation)"
+    entry_trigger: "eligibility_complete"
+    
+    substeps:
+      - name: "days_collection"
+        question: "Which days work best for you?"
+        parsing:
+          - llm_tool: "onboarding.parse_message"
+          - field: "preferences.days"
+          - expand: ["weekdays", "weekends"]
+        validation:
+          - policy_check: "policy.scheduling.weekend_gate"
+          - on_weekend_only: "note_limitation"
+      
+      - name: "time_collection"
+        question: "What time works best?"
+        parsing:
+          - llm_tool: "onboarding.parse_message"
+          - field: "preferences.time_band"
+          - expand: "time_bands_to_windows"
+        validation:
+          - policy_check: "8 AM - 3 PM weekday constraint"
+    
+    tools: ["onboarding.parse_message", "preferences.save", "policy.scheduling"]
+    
+    transitions:
+      - from: "PREFS_DAYTIME"
+        to: "QA_WINDOW"
+        trigger: "preferences_saved"
+        condition: "days && time_band saved"
+        action: "transition_to_qa_with_kick"
+
+  QA_WINDOW:
+    description: "Short Q&A window (max 2 turns) before orientation scheduling"
+    entry_trigger: "__kick__"
+    
+    entry_message: "Before we wrap up, do you have any quick questions for me?"
+    
+    routing:
+      - rule_based:
+          - STOP -> "OPTOUT"
+          - DEFERRAL -> "DEFERRED"
+          - RETURNING -> "fast_forward"
+          - FAQ_KEYWORDS -> "answer_from_cache"
+      - llm_fallback:
+          - tool: "knowledge.search"
+          - tool: "llm.qa"
+          - answer_template: "2-4 lines, end with 'Shall we schedule your orientation?'"
+    
+    timebox:
+      - max_turns: 2
+      - on_exhausted: "nudge_forward"
+      - nudge_message: "Happy to answer more in orientation... orientation is mandatory..."
+    
+    transitions:
+      - from: "QA_WINDOW"
+        to: "ORIENTATION_CONSENT"
+        trigger: "user_ready_to_schedule"
+        condition: "qa_count < 2 && user_says_yes_to_scheduling"
+        tools: ["consent.record", "state.advance"]
+        action: "record_orientation_consent"
+      
+      - from: "QA_WINDOW"
+        to: "DEFERRED"
+        trigger: "orientation_deferred"
+        condition: "user_says_later_to_scheduling"
+        tools: ["deferral.create"]
+        action: "create_orientation_deferral"
+      
+      - from: "QA_WINDOW"
+        to: "OPTOUT"
+        trigger: "stop_detected"
+        action: "acknowledge_stop"
+      
+      - from: "QA_WINDOW"
+        to: "<existing_state>"
+        trigger: "returning_user"
+        tools: ["state.get"]
+        action: "fast_forward_to_existing_state"
+    
+    tools: ["knowledge.search", "llm.qa", "deferral.create", "state.get", "consent.record"]
+
+  ORIENTATION_CONSENT:
+    description: "Ask for orientation availability (separate from teaching preferences)"
+    entry_trigger: "__kick__"
+    
+    entry_message: "Before your first class, we'll do a short orientation (about 30 mins). Could you share 2-3 time slots that work for you?"
+    
+    parsing:
+      - tool: "onboarding.parse_message"
+      - tool: "time.parse_options"
+      - extract: ["availability", "start_iso", "days"]
+    
+    slot_proposal:
+      - tool: "slots.propose"
+      - parameters:
+          - "seedTimeIso": "from_time.parse_options"
+          - "seedTimesIso": "all_parsed_times"
+          - "daysWhitelist": "null_if_multiple_days"
+          - "timeBand": "omitted (server_infers)"
+      - display: "format_slot_options"
+    
+    transitions:
+      - from: "ORIENTATION_CONSENT"
+        to: "ORIENTATION_SCHEDULING"
+        trigger: "slots_proposed"
+        condition: "slots.count > 0"
+        action: "display_slot_options"
+      
+      - from: "ORIENTATION_CONSENT"
+        to: "ORIENTATION_CONSENT"
+        trigger: "parse_failed"
+        condition: "no_slots_parsed"
+        action: "ask_for_clarification"
+    
+    tools: ["onboarding.parse_message", "time.parse_options", "slots.propose", "wa.send_message"]
+
+  ORIENTATION_SCHEDULING:
+    description: "Slot selection, hold, book, and calendar event creation"
+    entry_trigger: "slots_displayed"
+    
+    substeps:
+      - name: "slot_selection"
+        parsing:
+          - rule_based: ["number", "day_time_match", "yes_for_first"]
+          - llm_tool: "onboarding.parse_message"
+        validation:
+          - check: "slot_id in proposed_slots"
+      
+      - name: "slot_hold"
+        tool: "slot.hold"
+        parameters:
+          - "slotId": "selected_slot_id"
+        response_fields:
+          - "hold_id" | "holdId" | "id"
+        timeout: "~2 minutes"
+      
+      - name: "slot_book"
+        tool: "slot.book"
+        parameters:
+          - "holdId": "from_slot_hold"
+        response_fields:
+          - "meetingUrl"
+          - "startISO"
+          - "endISO"
+      
+      - name: "calendar_create"
+        tool: "calendar.create_event"
+        parameters:
+          - "title": "SERVE Orientation"
+          - "start_iso": "from_slot_book"
+          - "end_iso": "from_slot_book"
+          - "attendees": "[volunteer_email]"
+    
+    transitions:
+      - from: "ORIENTATION_SCHEDULING"
+        to: "COMPLETE"
+        trigger: "booking_complete"
+        condition: "calendar_event_created"
+        action: "send_final_confirmation"
+      
+      - from: "ORIENTATION_SCHEDULING"
+        to: "ORIENTATION_SCHEDULING"
+        trigger: "slot_unavailable"
+        condition: "hold_failed"
+        action: "ask_for_alternative_slot"
+      
+      - from: "ORIENTATION_SCHEDULING"
+        to: "ORIENTATION_CONSENT"
+        trigger: "no_slots_in_session"
+        condition: "slots_not_found"
+        action: "reask_availability"
+    
+    tools: ["onboarding.parse_message", "slot.hold", "slot.book", "calendar.create_event", "wa.send_message"]
+
+  COMPLETE:
+    description: "Final confirmation with meeting link and completion message"
+    entry_trigger: "booking_complete"
+    
+    final_message: "DONE message with meeting link, date/time, and next steps"
+    tools: ["wa.send_message"]
+    
+    transitions:
+      - from: "COMPLETE"
+        to: "COMPLETE"
+        trigger: "any_message"
+        action: "acknowledge_completion"
+
+  DEFERRED:
+    description: "User deferred onboarding for later"
+    entry_trigger: "deferral_created"
+    
+    deferral_reasons:
+      - "ORIENTATION_LATER"
+      - "NO_DEVICE"
+      - "COMMITMENT_LATER"
+      - "GENERIC"
+    
+    tools: ["deferral.create"]
+    
+    transitions:
+      - from: "DEFERRED"
+        to: "<restored_state>"
+        trigger: "user_returns"
+        tools: ["state.get"]
+        action: "restore_previous_state"
+
+  OPTOUT:
+    description: "User opted out / stopped messages"
+    entry_trigger: "stop_detected"
+    
+    message: "Understood. I'll stop messages. If you change your mind, just say 'Hi' here anytime. 💛"
+    
+    transitions:
+      - from: "OPTOUT"
+        to: "WELCOME"
+        trigger: "user_says_hi"
+        condition: "user_restarts"
+        action: "restart_onboarding"
+
+  REJECTED:
+    description: "User ineligible (age < 18, insufficient commitment after persuasion)"
+    entry_trigger: "eligibility_failed"
+    
+    rejection_reasons:
+      - "AGE_UNDER_18"
+      - "COMMITMENT_INSUFFICIENT"
+      - "CONSENT_DECLINED"
+    
+    message_templates:
+      - age: "Thanks for your enthusiasm 💛 At the moment, SERVE is open to adults (18+)..."
+      - commitment: "Thanks for your interest! We'll keep you posted..."
+      - consent: "No problem... thank you for your time..."
+    
+    transitions:
+      - from: "REJECTED"
+        to: "REJECTED"
+        trigger: "any_message"
+        action: "acknowledge_rejection"
+
+# Global tools used across states
+tools:
+  - name: "wa.send_message"
+    description: "Send WhatsApp message to volunteer"
+  
+  - name: "onboarding.parse_message"
+    description: "LLM-powered message parsing and intent extraction"
+  
+  - name: "consent.record"
+    description: "Record consent with idempotency"
+  
+  - name: "eligibility.check"
+    description: "Authoritative eligibility validation on server"
+  
+  - name: "preferences.save"
+    description: "Save teaching preferences (v2 payload)"
+  
+  - name: "slots.propose"
+    description: "Propose orientation time slots"
+  
+  - name: "slot.hold"
+    description: "Temporarily hold a slot (2 min expiry)"
+  
+  - name: "slot.book"
+    description: "Confirm slot booking"
+  
+  - name: "calendar.create_event"
+    description: "Create calendar event with Meet link"
+  
+  - name: "deferral.create"
+    description: "Create deferral record"
+  
+  - name: "state.get"
+    description: "Get current state from server"
+  
+  - name: "state.advance"
+    description: "Advance state machine on server"
+  
+  - name: "knowledge.search"
+    description: "Search FAQ knowledge base (RAG)"
+  
+  - name: "llm.qa"
+    description: "Generate FAQ answer using LLM + RAG"
+  
+  - name: "llm.classify_response"
+    description: "Classify user intent"
+  
+  - name: "time.parse_options"
+    description: "Parse time expressions to ISO datetime"
+  
+  - name: "policy.scheduling"
+    description: "Fetch scheduling policy (weekend gates, etc.)"
+  
+  - name: "telemetry.emit"
+    description: "Emit telemetry events"
+
+# Telemetry events
+telemetry_events:
+  - "onboarding.greet_shown"
+  - "onboarding.consent_yes"
+  - "onboarding.consent_no"
+  - "onboarding.age_decline"
+  - "onboarding.qa_answered"
+  - "onboarding.qa_deferral"
+  - "onboarding.qa_stop"
+  - "onboarding.complete"
+
