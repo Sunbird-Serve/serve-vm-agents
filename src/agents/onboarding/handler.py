@@ -31,7 +31,7 @@ class OnboardingHandler:
             "ELIGIBILITY_PART2": self.handle_eligibility_part2,
             "PREFS_DAYTIME": self.handle_prefs_daytime,
             "QA_WINDOW": self.handle_qa_window,
-            "ORIENTATION_CONSENT": self.handle_orientation_consent,
+            "ORIENTATION_SLOT": self.handle_orientation_slot,
             "ORIENTATION_SCHEDULING": self.handle_orientation_scheduling,
             "COMPLETE": self.handle_complete,
             "DEFERRED": self.handle_deferred,
@@ -154,16 +154,16 @@ class OnboardingHandler:
         await _handle(phone, text)
         return {"action": "qa_window"}
     
-    async def handle_orientation_consent(
+    async def handle_orientation_slot(
         self,
         phone: str,
         text: str,
         sess: Dict,
         profile: Dict
     ) -> Dict[str, Any]:
-        """Handle ORIENTATION_CONSENT: ask for orientation availability."""
+        """Handle ORIENTATION_SLOT: collect orientation availability and share options."""
         await _handle(phone, text)
-        return {"action": "orientation_consent"}
+        return {"action": "orientation_slot"}
     
     async def handle_orientation_scheduling(
         self,

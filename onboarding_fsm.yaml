@@ -212,7 +212,7 @@ states:
     
     transitions:
       - from: "QA_WINDOW"
-        to: "ORIENTATION_CONSENT"
+        to: "ORIENTATION_SLOT"
         trigger: "user_ready_to_schedule"
         condition: "qa_count < 2 && user_says_yes_to_scheduling"
         tools: ["consent.record", "state.advance"]
@@ -238,11 +238,11 @@ states:
     
     tools: ["knowledge.search", "llm.qa", "deferral.create", "state.get", "consent.record"]
 
-  ORIENTATION_CONSENT:
-    description: "Ask for orientation availability (separate from teaching preferences)"
+  ORIENTATION_SLOT:
+    description: "Capture orientation availability and propose slots"
     entry_trigger: "__kick__"
     
-    entry_message: "Before your first class, we'll do a short orientation (about 30 mins). Could you share 2-3 time slots that work for you?"
+    entry_message: "One last step: a short 30-minute orientation so you feel fully ready. Please share 2-3 slots that work for you in the next few days."
     
     parsing:
       - tool: "onboarding.parse_message"
@@ -259,14 +259,14 @@ states:
       - display: "format_slot_options"
     
     transitions:
-      - from: "ORIENTATION_CONSENT"
+      - from: "ORIENTATION_SLOT"
         to: "ORIENTATION_SCHEDULING"
         trigger: "slots_proposed"
         condition: "slots.count > 0"
         action: "display_slot_options"
       
-      - from: "ORIENTATION_CONSENT"
-        to: "ORIENTATION_CONSENT"
+      - from: "ORIENTATION_SLOT"
+        to: "ORIENTATION_SLOT"
         trigger: "parse_failed"
         condition: "no_slots_parsed"
         action: "ask_for_clarification"
@@ -324,7 +324,7 @@ states:
         action: "ask_for_alternative_slot"
       
       - from: "ORIENTATION_SCHEDULING"
-        to: "ORIENTATION_CONSENT"
+        to: "ORIENTATION_SLOT"
         trigger: "no_slots_in_session"
         condition: "slots_not_found"
         action: "reask_availability"

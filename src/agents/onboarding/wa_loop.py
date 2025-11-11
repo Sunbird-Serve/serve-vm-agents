@@ -12,26 +12,50 @@ import json
 import time
 import uuid
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 import httpx
 
 from .config import settings
 from .messages import (
     WELCOME, WELCOME_MAYBE_LATER,
+    WELCOME_INTRO, WELCOME_SERVE_OVERVIEW, WELCOME_CONSENT_ACK,
     ELIGIBILITY_INTRO, ELIGIBILITY_Q1, ELIGIBILITY_Q2, ELIGIBILITY_Q3,
     ELIGIBILITY_INVALID_RESPONSE, REJECTED, ELIGIBILITY_PASSED,
+    ELIGIBILITY_AGE_PROMPT, ELIGIBILITY_AGE_UNCLEAR, ELIGIBILITY_UNDERAGE_DECLINE,
+    ELIGIBILITY_DEVICE_PROMPT, ELIGIBILITY_DEVICE_CLARIFY,
+    ELIGIBILITY_DEVICE_DEFERRAL, ELIGIBILITY_DEVICE_DEFERRAL_CONFIRM,
+    ELIGIBILITY_DEVICE_DEFERRAL_FALLBACK, ELIGIBILITY_DEVICE_REASK,
+    ELIGIBILITY_DEVICE_OK,
     ASK_TEACHING_PREF, CONFIRM_TEACHING_PREF, EDIT_TEACHING_PREF, TEACHING_PREF_UNCLEAR,
     ASK_AVAILABILITY, CONSTRAINTS_ANNOUNCE, AVAILABILITY_PARSE_FAILED,
-    CONFIRM_SLOT_TEMPLATE, CONFIRM_SLOT_INVALID, SLOT_NONE_OF_ABOVE,
-    CONFIRM_BOOKING, CONFIRM_BOOKING_INVALID, BOOKING_IN_PROGRESS,
-    DONE, ALREADY_DONE, RESTARTING, PERSUADE_COMMITMENT, PERSUADE_WEEKEND_ONLY,
+    BOOKING_IN_PROGRESS, DONE, ALREADY_DONE, RESTARTING,
+    PERSUADE_COMMITMENT, PERSUADE_WEEKEND_ONLY, ELIGIBILITY_COMMIT_PROMPT,
+    ELIGIBILITY_COMMIT_CLARIFY, ELIGIBILITY_COMMIT_POLICY, ELIGIBILITY_COMMIT_SUCCESS,
+    ELIGIBILITY_PREFERENCES_PROMPT, ELIGIBILITY_PREFERENCES_WEEKEND_NOTE,
+    ELIGIBILITY_COMMIT_PERSUADE, ELIGIBILITY_COMMIT_DEFERRAL, ELIGIBILITY_COMMIT_DEFERRAL_CONFIRM,
+    ELIGIBILITY_DECLINE_REQUIREMENTS, ELIGIBILITY_DECLINE_GENERIC,
+    PREFS_PROMPT, PREFS_WEEKEND_NOTE, PREFS_COMBINED_CLARIFIER, PREFS_ASK_TIME,
+    PREFS_ASK_DAYS, PREFS_CONFIRM_WITH_WEEKEND, PREFS_CONFIRM_DEFAULT,
+    PREFS_SAVE_FALLBACK_NO_DAYS, PREFS_SAVE_FALLBACK_NO_TIME,
+    QA_ENTRY_PROMPT, QA_MANDATORY_ORIENT, QA_CONTINUE_PROMPT, QA_NUDGE,
+    QA_DEFERRAL_PROMPT, QA_STOP_ACK,
+    QA_FAQ_ABOUT_SERVE, QA_FAQ_TIME_PROCESS, QA_FAQ_SUPPORT,
+    QA_FAQ_CERTIFICATE, QA_FAQ_SUBJECTS_GRADES, QA_FAQ_TECH,
+    ORIENT_INTRO, ORIENT_SHOW_OPTIONS, ORIENT_CONFIRM,
+    ORIENT_INVALID_PICK, ORIENT_LATER_NOTE,
+    ORIENT_AVAILABILITY_ACK, ORIENT_PROPOSAL_NO_SLOTS,
+    ORIENT_PROPOSAL_ERROR, ORIENT_SLOT_UNAVAILABLE,
+    ORIENT_BOOKING_CONFIRM, ORIENT_BOOKING_FAILURE,
     YES_WORDS, NO_WORDS, MAYBE_LATER, CONFIRM_WORDS, EDIT_WORDS,
-    format_message, format_slot_options, format_subjects_list
+    format_message, format_subjects_list, PREFS_EVENING_POLICY, PREFS_EVENING_DEFERRAL
 )
 from .validators import is_yes_response, is_no_response, normalize_phone
-from .humanizer import humanize_weekday_confirmation
 from .faq import looks_like_question, retrieve, compose_answer
+from .prompts.master_prompt import MASTER_SYSTEM_PROMPT
+from .prompts.state_prompts import STATE_TASK_PROMPTS, DEFAULT_TASK_PROMPT
+from .prompts.few_shots import FEW_SHOT_EXAMPLES
+from .prompts.context import build_llm_context
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +65,39 @@ CONVERSATION_HISTORIES: dict[str, object] = {}  # {phone: ChatHistory()} - SK Me
 MCP_BASE = settings.MCP_BASE
 MCP_JSONRPC_ENDPOINT = f"{MCP_BASE}/mcp/v1/jsonrpc"
 MCP_INITIALIZED = False
+
+WELCOME_ALLOWED_INTENTS = {"CONSENT_YES", "CONSENT_NO", "QUERY", "DEFERRAL", "STOP", "RETURNING", "AMBIGUOUS"}
+ELIGIBILITY_PART1_ALLOWED_INTENTS = {
+    "AGE_OK",
+    "AGE_UNDER",
+    "AGE_UNCLEAR",
+    "DEVICE_OK",
+    "DEVICE_NO",
+    "DEVICE_UNCLEAR",
+    "DEFERRAL",
+    "QUERY",
+    "AMBIGUOUS",
+}
+ELIGIBILITY_PART2_ALLOWED_INTENTS = {
+    "COMMIT_OK",
+    "COMMIT_TOO_LOW",
+    "COMMIT_SAME_DAY_ONLY",
+    "COMMIT_UNSURE",
+    "DEFERRAL",
+    "COMMIT_NO",
+    "QUERY",
+    "AMBIGUOUS",
+}
+PREFS_DAYTIME_ALLOWED_INTENTS = {
+    "PREFS_DAYS_AND_TIME_OK",
+    "PREFS_DAYS_ONLY",
+    "PREFS_TIME_ONLY",
+    "PREFS_WEEKEND_ONLY",
+    "PREFS_EVENING_ONLY",
+    "PREFS_FAQ",
+    "PREFS_LATER_OR_DEFERRAL",
+    "PREFS_AMBIGUOUS",
+}
 
 # Semantic Kernel instance (lazy-loaded)
 _SK_KERNEL = None
@@ -641,7 +698,14 @@ def _detect_query(text: str) -> bool:
 
 def _detect_deferral(text: str) -> bool:
     """Detect DEFERRAL intent"""
-    pattern = r"\b(later|next\s+week|another\s+time|not\s+today|busy|travel(l)?ing|remind|maybe\s+later)\b"
+    pattern = (
+        r"\b("
+        r"later|next\s+week|another\s+(time|day)|tomorrow|"
+        r"not\s+today|not\s+now|not\s+right\s+now|not\s+sure|"
+        r"busy|travel(l)?ing|remind|maybe\s+later|do\s+this\s+later|"
+        r"come\s+back|check\s+back|ping\s+me\s+later"
+        r")\b"
+    )
     return bool(re.search(pattern, text.lower()))
 
 
@@ -735,40 +799,78 @@ async def mcp_state_advance(volunteer_id: str, intent: str, idempotency_key: str
 
 async def mcp_llm_classify_intent(text: str, state: str, context: dict) -> dict:
     """LLM fallback for intent classification when rules fail"""
-    system_prompt = f"""You are "Sia", SERVE's Volunteer Onboarding Assistant.
-Goal: Interpret the user's message at state={state} and return JSON:
-- A single intent label from: [CONSENT_YES, CONSENT_NO, QUERY, DEFERRAL, STOP, RETURNING, AMBIGUOUS]
-- A confidence score between 0 and 1
-- A short, warm, human reply ("tone_reply") that fits the inferred intent and current context.
-Important:
-- Do NOT promise payment; this is volunteer-only.
-- Do NOT perform state changes or bookings; you only generate text and intent.
-- Prefer brevity (2–4 lines) and clarity. Keep it supportive and human.
-
-Return ONLY valid JSON: {{"intent": "...", "confidence": 0.0, "tone_reply": "..."}}"""
+    task_prompt = STATE_TASK_PROMPTS.get(state)
+    if not task_prompt:
+        task_prompt = DEFAULT_TASK_PROMPT.format(state=state)
 
     user_prompt = f"""Context: {json.dumps(context, indent=2)}\nUser message: {text}"""
-    
+
     try:
-        result = await _mcp_call("llm.call", {
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "temperature": 0.2,
-            "max_tokens": 200
-        }, timeout=15)
-        
-        # Parse response (may be in content/message/text field)
+        few_shots = FEW_SHOT_EXAMPLES.get(state, [])
+        messages = [
+            {"role": "system", "content": MASTER_SYSTEM_PROMPT},
+            {"role": "system", "content": task_prompt},
+        ] + few_shots + [
+            {"role": "user", "content": user_prompt},
+        ]
+        result = await _mcp_call("llm.call", {"messages": messages, "temperature": 0.2, "max_tokens": 200}, timeout=15)
+
         content = result.get("content") or result.get("message") or result.get("text", "")
         if isinstance(content, str):
             try:
                 parsed = json.loads(content)
-                if isinstance(parsed, dict) and "intent" in parsed:
-                    return parsed
             except Exception:
-                pass
-        
+                parsed = None
+
+            if isinstance(parsed, dict):
+                intent = str(parsed.get("intent", "AMBIGUOUS") or "").upper()
+                confidence_raw = parsed.get("confidence", 0.0)
+                try:
+                    confidence = float(confidence_raw)
+                except (TypeError, ValueError):
+                    confidence = 0.0
+                confidence = max(0.0, min(1.0, confidence))
+
+                tone_reply = parsed.get("tone_reply")
+                if not isinstance(tone_reply, str):
+                    tone_reply = ""
+
+                if state == "WELCOME" and intent not in WELCOME_ALLOWED_INTENTS:
+                    intent = "AMBIGUOUS"
+
+                if state == "ELIGIBILITY_PART1" and intent not in ELIGIBILITY_PART1_ALLOWED_INTENTS:
+                    intent = "AMBIGUOUS"
+
+                if state == "ELIGIBILITY_PART1" and confidence < 0.6:
+                    if intent.startswith("AGE_"):
+                        intent = "AGE_UNCLEAR"
+                    elif intent.startswith("DEVICE_"):
+                        intent = "DEVICE_UNCLEAR"
+                    elif intent == "DEFERRAL":
+                        intent = "AMBIGUOUS"
+
+                if state == "ELIGIBILITY_PART2" and intent not in ELIGIBILITY_PART2_ALLOWED_INTENTS:
+                    intent = "AMBIGUOUS"
+
+                if state == "ELIGIBILITY_PART2" and confidence < 0.7:
+                    if intent == "COMMIT_OK":
+                        intent = "COMMIT_UNSURE"
+                    elif intent in {"COMMIT_TOO_LOW", "COMMIT_NO", "DEFERRAL"}:
+                        pass
+                    else:
+                        intent = "AMBIGUOUS"
+
+                if state == "PREFS_DAYTIME" and intent not in PREFS_DAYTIME_ALLOWED_INTENTS:
+                    intent = "PREFS_AMBIGUOUS"
+
+                if state == "PREFS_DAYTIME" and confidence < 0.5:
+                    intent = "PREFS_AMBIGUOUS"
+
+                if "intent" not in parsed:
+                    intent = "AMBIGUOUS"
+
+                return {"intent": intent, "confidence": confidence, "tone_reply": tone_reply}
+
         return {"intent": "AMBIGUOUS", "confidence": 0.0, "tone_reply": ""}
     except Exception as e:
         log.warning(f"[LLM] Intent classification failed: {e}")
@@ -795,25 +897,15 @@ async def mcp_knowledge_search(query: str, top_k: int = 5, policy_version: str |
 
 async def mcp_llm_qa(question: str, snippets: list[dict], policy_version: str | None = None, knowledge_version: str | None = None, user_profile: dict | None = None) -> str:
     """Generate FAQ answer using LLM with RAG context"""
-    system_prompt = """You are Sia, SERVE's Volunteer Onboarding Assistant. You're warm, friendly, and concise.
+    qa_task_prompt = """Guidelines for answering volunteer questions:
 
-TASK: Answer the volunteer's question in 2–4 short lines. Keep it natural, human, and policy-correct.
+1. Answer in 2–4 short lines using the provided snippets/policy context.
+2. Do NOT invent facts or promise payment (this role is volunteer-only).
+3. Keep the tone warm, supportive, and clear.
+4. If the snippets don't fully cover the question, invite them to ask the coordinator during orientation.
+5. Always end with: "Shall we schedule your orientation?"
+6. Output plain text only (no JSON/markdown)."""
 
-GUIDELINES:
-1. Use ONLY the provided snippets/policy context. Do NOT invent facts or make promises.
-2. Do NOT promise payment — this is a volunteer role (no pay).
-3. Keep tone warm and supportive. Use simple, clear language.
-4. If the question isn't fully covered by snippets, acknowledge it briefly and suggest asking the coordinator in orientation.
-5. ALWAYS end with: "Shall we schedule your orientation?" (this is required).
-6. Be concise: 2–4 lines maximum. No long explanations.
-
-TONE EXAMPLES:
-✅ "Yes! You'll attend a 30-min online orientation, and a local coordinator supports you during classes. Shall we schedule your orientation?"
-✅ "Most volunteers teach English, Math or Science for grades 5–8. We'll align your preferences during scheduling. Shall we schedule your orientation?"
-❌ Avoid: Long paragraphs, technical jargon, or promises about payment/certificates not in snippets.
-
-Return ONLY plain text (no JSON, no markdown, no code blocks)."""
-    
     context_obj = {
         "policy_version": policy_version,
         "knowledge_version": knowledge_version,
@@ -829,14 +921,14 @@ User question: {question}
 Generate a warm, concise answer (2-4 lines) using the snippets above. End with 'Shall we schedule your orientation?'"""
     
     try:
-        result = await _mcp_call("llm.call", {
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "temperature": 0.3,
-            "max_tokens": 300
-        }, timeout=15)
+        few_shots = FEW_SHOT_EXAMPLES.get("FAQ", [])
+        messages = (
+            [{"role": "system", "content": MASTER_SYSTEM_PROMPT},
+             {"role": "system", "content": qa_task_prompt}]
+            + few_shots
+            + [{"role": "user", "content": user_prompt}]
+        )
+        result = await _mcp_call("llm.call", {"messages": messages, "temperature": 0.3, "max_tokens": 300}, timeout=15)
         
         content = result.get("content") or result.get("message") or result.get("text", "")
         if isinstance(content, str) and content.strip():
@@ -1073,7 +1165,41 @@ async def parse_teaching_preferences_hybrid(text: str) -> dict:
 
 
 # ---------- Helper Functions ----------
-async def _book_slot_and_finish(phone: str, chosen_slot: dict, profile: dict, name: str):
+async def _reask_pending_question(phone: str, state: str, sess: dict) -> bool:
+    """Re-send the outstanding question after handling an FAQ reply."""
+    prompt_text: str | None = None
+
+    if state == "WELCOME":
+        prompt_text = WELCOME_CONSENT_REMINDER
+    elif state == "ELIGIBILITY_PART1":
+        step = sess.get("_eligibility_step", "age")
+        if step == "age":
+            prompt_text = ELIGIBILITY_AGE_PROMPT
+            sess["_eligibility_age_asked"] = True
+        elif step == "device":
+            prompt_text = ELIGIBILITY_DEVICE_PROMPT
+            sess["_eligibility_device_asked"] = True
+    elif state == "ELIGIBILITY_PART2":
+        prompt_text = ELIGIBILITY_COMMIT_PROMPT
+        sess["_eligibility_part2_sent"] = True
+    elif state == "PREFS_DAYTIME":
+        prompt_text = sess.get("_prefs_last_prompt_text")
+        if not prompt_text:
+            prompt_text = PREFS_COMBINED_CLARIFIER
+            sess["_prefs_last_prompt"] = "ask_days"
+            sess["_prefs_last_prompt_text"] = prompt_text
+
+    if not prompt_text:
+        return False
+
+    await mcp_wa_send(phone, prompt_text)
+    _add_to_history(phone, bot_msg=prompt_text)
+    sess["ts"] = time.time()
+    SESSIONS[phone] = sess
+    return True
+
+
+async def _book_slot_and_finish(phone: str, chosen_slot: dict, profile: dict, name: str, *, send_orientation_confirm: bool = False):
     """
     Book the orientation slot and send final confirmation
     
@@ -1097,22 +1223,17 @@ async def _book_slot_and_finish(phone: str, chosen_slot: dict, profile: dict, na
         profile["meeting_url"] = meet_url
         profile["meeting_start"] = start_iso
         
-        # Send "All done" message
-        await mcp_wa_send(phone, BOOKING_IN_PROGRESS)
-        _add_to_history(phone, bot_msg=BOOKING_IN_PROGRESS)
-        
-        # Send final confirmation
-        msg = format_message(
-            DONE,
-            name=name,
-            subjects=format_subjects_list(profile.get("subjects", [])),
-            grades=profile.get("grades", "N/A"),
-            language=profile.get("language", "N/A"),
-            slot_label=label,
-            meet_link=meet_url
-        )
-        await mcp_wa_send(phone, msg)
-        _add_to_history(phone, bot_msg=msg)
+        # Send final confirmation (keep quick acknowledgement + final details)
+        confirmation_lines = [
+            f"Orientation: {label}",
+            f"Meet link: {meet_url}",
+            "",
+            f"Welcome to the SERVE Volunteer Community, {name}!",
+            "Every hour you share helps a child learn better. See you at the orientation!"
+        ]
+        confirm_msg = "\n".join(confirmation_lines).strip()
+        await mcp_wa_send(phone, confirm_msg)
+        _add_to_history(phone, bot_msg=confirm_msg)
         
     except Exception as e:
         log.error(f"[BOOKING] Failed to book slot for {phone}: {e}", exc_info=True)
@@ -1250,7 +1371,9 @@ async def _handle(phone: str, text: str):
         ])
     
     # Lightweight FAQ intercept (strict: only explicit questions)
-    if text != "__kick__" and ("?" in text or re.search(r"^(what|how|when|why|where|who|which|can|could|do|does|is|are)\b", text, re.I)):
+    awaiting_simple_consent = state == "WELCOME" and sess.get("_greet_step") == "await_continue"
+    deferral_like = state == "WELCOME" and _detect_deferral(text)
+    if text != "__kick__" and not deferral_like and ("?" in text or re.search(r"^(what|how|when|why|where|who|which|can|could|do|does|is|are)\b", text, re.I)):
         # If we're in commitment (ELIGIBILITY_PART2) and the question is about "same day 2 hours",
         # skip FAQ so the commitment handler can respond with the correct policy clarification.
         same_day_commitment = (
@@ -1267,6 +1390,8 @@ async def _handle(phone: str, text: str):
                     if ans:
                         await mcp_wa_send(phone, ans)
                         _add_to_history(phone, bot_msg=ans)
+                        if await _reask_pending_question(phone, state, sess):
+                            return
                         # Pause progression after FAQ; resume on next user message
                         sess["ts"] = time.time()
                         SESSIONS[phone] = sess
@@ -1301,20 +1426,12 @@ async def _handle(phone: str, text: str):
     # ========== WELCOME & CONSENT STATE ==========
     if state == "WELCOME":
         if text == "__kick__" or not sess.get("_greet_sent"):
-            # First time: send 3 messages
-            log.info(f"[GREET] Sending welcome messages to {phone}")
-            
-            # Message 1: Personal greeting
-            msg1 = f"Hey {name}! I'm Sia from the SERVE team — thank you for registering with us. It's really nice to see you here! 🌸\n\nI help amazing people like you start their journey as volunteer teachers with SERVE."
-            await mcp_wa_send(phone, msg1)
-            _add_to_history(phone, bot_msg=msg1)
-            await asyncio.sleep(1.5)  # Natural pause
-            
-            # Message 2: Ask to continue
-            msg2 = "Before we move ahead, let me quickly share what SERVE is about, just so we're on the same page. Shall we continue?"
-            await mcp_wa_send(phone, msg2)
-            _add_to_history(phone, bot_msg=msg2)
-            # Now wait for the volunteer to reply before continuing
+            log.info(f"[GREET] Sending welcome message to {phone}")
+
+            intro_msg = format_message(WELCOME_INTRO, name=name)
+            await mcp_wa_send(phone, intro_msg)
+            _add_to_history(phone, bot_msg=intro_msg)
+
             sess["_greet_sent"] = True
             sess["_greet_step"] = "await_continue"
             sess["ts"] = time.time()
@@ -1334,15 +1451,12 @@ async def _handle(phone: str, text: str):
                             proceed = True
                     except Exception:
                         pass
+
                 if proceed:
-                    # Share SERVE info and then consent ask
-                    msg3 = "SERVE has helped thousands of children learn English, Science, and Maths through volunteers like you.\nYou teach online — they learn in school — and our local coordinators make sure everything runs smoothly."
-                    await mcp_wa_send(phone, msg3)
-                    _add_to_history(phone, bot_msg=msg3)
+                    overview_msg = WELCOME_SERVE_OVERVIEW
+                    await mcp_wa_send(phone, overview_msg)
+                    _add_to_history(phone, bot_msg=overview_msg)
                     await asyncio.sleep(1.0)
-                    msg4 = f"Just to be clear — this is a volunteer opportunity, not a paid role. Your time makes a real difference to children's learning. 💛\n\nDoes that sound good, {name}?\nWould you like me to take you through the onboarding steps now?"
-                    await mcp_wa_send(phone, msg4)
-                    _add_to_history(phone, bot_msg=msg4)
                     sess["_greet_step"] = "shared_info"
                     sess["ts"] = time.time(); SESSIONS[phone] = sess
                     return
@@ -1354,7 +1468,6 @@ async def _handle(phone: str, text: str):
                     sess["ts"] = time.time(); SESSIONS[phone] = sess
                     return
                 else:
-                    # Try unified parse consent again, then LLM classifier to avoid rigid loops
                     try:
                         cobj = (parsed.get("consent") or {}) if parsed else {}
                         cval = (cobj.get("value") or "").lower()
@@ -1362,52 +1475,16 @@ async def _handle(phone: str, text: str):
                             proceed = True
                     except Exception:
                         pass
+
                     if proceed:
-                        msg3 = "SERVE has helped thousands of children learn English, Science, and Maths through volunteers like you.\nYou teach online — they learn in school — and our local coordinators make sure everything runs smoothly."
-                        await mcp_wa_send(phone, msg3)
-                        _add_to_history(phone, bot_msg=msg3)
+                        overview_msg = WELCOME_SERVE_OVERVIEW
+                        await mcp_wa_send(phone, overview_msg)
+                        _add_to_history(phone, bot_msg=overview_msg)
                         await asyncio.sleep(1.0)
-                        msg4 = f"Just to be clear — this is a volunteer opportunity, not a paid role. Your time makes a real difference to children's learning. 💛\n\nDoes that sound good, {name}?\nWould you like me to take you through the onboarding steps now?"
-                        await mcp_wa_send(phone, msg4)
-                        _add_to_history(phone, bot_msg=msg4)
                         sess["_greet_step"] = "shared_info"
                         sess["ts"] = time.time(); SESSIONS[phone] = sess
                         return
-
-                    # LLM classify as final fallback
-                    try:
-                        llm_ctx = {"last_prompt": "Shall we continue?", "state": "WELCOME"}
-                        cls = await mcp_llm_classify_intent(text, "WELCOME", llm_ctx)
-                        if isinstance(cls, dict):
-                            label = (cls.get("intent") or cls.get("label") or "").upper()
-                            conf = float(cls.get("confidence") or 0)
-                            if label in ["CONSENT_YES", "YES"] and conf >= 0.6:
-                                # proceed
-                                msg3 = "SERVE has helped thousands of children learn English, Science, and Maths through volunteers like you.\nYou teach online — they learn in school — and our local coordinators make sure everything runs smoothly."
-                                await mcp_wa_send(phone, msg3)
-                                _add_to_history(phone, bot_msg=msg3)
-                                await asyncio.sleep(1.0)
-                                msg4 = f"Just to be clear — this is a volunteer opportunity, not a paid role. Your time makes a real difference to children's learning. 💛\n\nDoes that sound good, {name}?\nWould you like me to take you through the onboarding steps now?"
-                                await mcp_wa_send(phone, msg4)
-                                _add_to_history(phone, bot_msg=msg4)
-                                sess["_greet_step"] = "shared_info"
-                                sess["ts"] = time.time(); SESSIONS[phone] = sess
-                                return
-                            if label in ["CONSENT_NO", "NO"] and conf >= 0.6:
-                                decline_msg = f"No problem, {name}. Totally understand — thank you for your time and interest. If you ever wish to volunteer later, I'll be right here to help."
-                                await mcp_wa_send(phone, decline_msg)
-                                _add_to_history(phone, bot_msg=decline_msg)
-                                sess["state"] = "REJECTED"
-                                sess["ts"] = time.time(); SESSIONS[phone] = sess
-                                return
-                    except Exception:
-                        pass
-
-                    clarify = "Just a quick yes or no — shall we continue?"
-                    await mcp_wa_send(phone, clarify)
-                    _add_to_history(phone, bot_msg=clarify)
-                    sess["ts"] = time.time(); SESSIONS[phone] = sess
-                    return
+                    # Fall through to comprehensive intent handling below for deferrals, queries, etc.
 
             # User replied to consent question - comprehensive intent handling
             text_lower = text.lower().strip()
@@ -1416,18 +1493,18 @@ async def _handle(phone: str, text: str):
             llm_called = False
             llm_result = None
             
-            # 1) CONSENT_YES
-            if _detect_consent_yes(text) or is_yes_response(text):
+            # 1) DEFERRAL (check first to avoid "not sure"/"later" being treated as consent)
+            if _detect_deferral(text):
+                intent_detected = "DEFERRAL"
+            # 2) CONSENT_YES
+            elif _detect_consent_yes(text) or is_yes_response(text):
                 intent_detected = "CONSENT_YES"
-            # 2) CONSENT_NO
+            # 3) CONSENT_NO
             elif _detect_consent_no(text) or is_no_response(text):
                 intent_detected = "CONSENT_NO"
-            # 3) QUERY (FAQ)
+            # 4) QUERY (FAQ)
             elif _detect_query(text):
                 intent_detected = "QUERY"
-            # 4) DEFERRAL
-            elif _detect_deferral(text):
-                intent_detected = "DEFERRAL"
             # 5) RETURNING
             elif _detect_returning(text):
                 intent_detected = "RETURNING"
@@ -1453,18 +1530,21 @@ async def _handle(phone: str, text: str):
             if intent_detected is None or intent_detected == "AMBIGUOUS":
                 log.info(f"[GREET] Calling LLM fallback for intent classification")
                 llm_called = True
-                context = {
-                    "state": "WELCOME",
-                    "user_profile": {"name": name, "locale": "en-IN"},
-                    "last_agent_prompt": "Just to be clear — this is a volunteer opportunity, not a paid role. Your time makes a real difference to children's learning. Does that sound good, {name}? Would you like me to take you through the onboarding steps now?"
-                }
-                llm_result = await mcp_llm_classify_intent(text, "WELCOME", context)
-                if llm_result.get("confidence", 0) >= 0.70:
-                    intent_detected = llm_result.get("intent", "AMBIGUOUS")
-                    log.info(f"[GREET] LLM classified intent: {intent_detected} (confidence: {llm_result.get('confidence', 0)})")
+                llm_context = build_llm_context("WELCOME", sess, last_prompt=WELCOME_SERVE_OVERVIEW)
+                llm_result = await mcp_llm_classify_intent(text, "WELCOME", llm_context)
+                llm_intent = (llm_result.get("intent") or "AMBIGUOUS").upper()
+                llm_conf = float(llm_result.get("confidence") or 0.0)
+
+                accept_llm = llm_conf >= 0.70
+                if not accept_llm and llm_intent == "DEFERRAL" and llm_conf >= 0.30:
+                    accept_llm = True
+
+                if accept_llm:
+                    intent_detected = llm_intent
+                    log.info(f"[GREET] LLM classified intent: {intent_detected} (confidence: {llm_conf})")
                 else:
                     intent_detected = "AMBIGUOUS"
-                    log.info(f"[GREET] LLM confidence too low, treating as AMBIGUOUS")
+                    log.info(f"[GREET] LLM confidence ({llm_conf}) too low for intent={llm_intent}, treating as AMBIGUOUS")
             
             # Generate idempotency key for this turn
             idempotency_key = f"{volunteer_id}_{intent_detected}_{int(time.time())}"
@@ -1488,13 +1568,13 @@ async def _handle(phone: str, text: str):
                 log.info(f"[GREET] Consent recorded, moving to ELIGIBILITY_PART1")
                 
                 # Send acknowledgment
-                ack_msg = f"That's wonderful, {name}! Let's start with a few quick questions to get you ready."
+                ack_msg = WELCOME_CONSENT_ACK
                 await mcp_wa_send(phone, ack_msg)
                 _add_to_history(phone, bot_msg=ack_msg)
                 await asyncio.sleep(1.0)  # Small pause
                 
                 # Send first eligibility question (age only)
-                age_msg = "First, to make sure you meet our policy — may I check if you're 18 or older?"
+                age_msg = ELIGIBILITY_AGE_PROMPT
                 await mcp_wa_send(phone, age_msg)
                 _add_to_history(phone, bot_msg=age_msg)
                 sess["_eligibility_age_asked"] = True
@@ -1570,7 +1650,6 @@ async def _handle(phone: str, text: str):
                 
             elif intent_detected == "DEFERRAL":
                 # Parse deferral time or default to 3-7 days
-                from datetime import timezone
                 until_date = datetime.now(timezone.utc) + timedelta(days=5)  # Default 5 days
                 until_iso = until_date.isoformat()  # Will produce: 2025-11-06T19:33:08.334000+00:00
                 
@@ -1590,6 +1669,8 @@ async def _handle(phone: str, text: str):
                     defer_msg = f"No worries, {name}! I'll remind you in a few days. Ping me anytime if you want to start earlier."
                     await mcp_wa_send(phone, defer_msg)
                     _add_to_history(phone, bot_msg=defer_msg)
+                    sess["_deferred_prev_state"] = state
+                    sess["_deferred_reason"] = "WELCOME_USER_LATER"
                     sess["state"] = "DEFERRED"
                     sess["ts"] = time.time()
                     SESSIONS[phone] = sess
@@ -1600,6 +1681,8 @@ async def _handle(phone: str, text: str):
                     defer_msg = f"No worries, {name}! Feel free to come back whenever you're ready."
                     await mcp_wa_send(phone, defer_msg)
                     _add_to_history(phone, bot_msg=defer_msg)
+                    sess["_deferred_prev_state"] = state
+                    sess["_deferred_reason"] = "WELCOME_USER_LATER"
                     sess["state"] = "DEFERRED"
                     sess["ts"] = time.time()
                     SESSIONS[phone] = sess
@@ -1686,7 +1769,7 @@ async def _handle(phone: str, text: str):
             if not sess.get("_eligibility_age_asked"):
                 # First time: ask age question
                 log.info(f"[ELIG] Sending age question to {phone}")
-                msg = "First, to make sure you meet our policy — may I check if you're 18 or older?"
+                msg = ELIGIBILITY_AGE_PROMPT
                 await mcp_wa_send(phone, msg)
                 _add_to_history(phone, bot_msg=msg)
                 sess["_eligibility_age_asked"] = True
@@ -1695,54 +1778,78 @@ async def _handle(phone: str, text: str):
                 return
             else:
                 # User replied to age question
-                # TRUST LLM-FIRST: Use onboarding.parse_message results (already called above)
                 age_ok = None
                 age_value = None
-                
+                age_ack_reply = None
+
                 # Primary source: onboarding.parse_message (LLM extraction)
                 try:
                     hints = parsed.get("eligibility") or {} if parsed else {}
                     age_ok = hints.get("age_ok")
-                    age_value = hints.get("age")  # Get numeric age if available
+                    age_value = hints.get("age")
                     if age_ok is not None or age_value is not None:
                         log.info(f"[ELIG] LLM extracted age: ok={age_ok}, value={age_value}")
-                        # If we have numeric age but not age_ok, derive it
                         if age_value is not None and age_ok is None:
                             age_ok = age_value >= 18
                 except Exception as e:
                     log.warning(f"[ELIG] Failed to parse age from LLM: {e}")
-                
+
                 # Fallback: Simple yes/no for trivial responses only
                 if age_ok is None:
-                    # Simple yes (very obvious cases only)
                     if is_yes_response(text):
                         age_ok = True
                         log.info(f"[ELIG] Simple yes detected for age")
-                    
-                    # Simple no (very obvious cases only)
                     elif is_no_response(text):
                         age_ok = False
                         log.info(f"[ELIG] Simple no detected for age")
-                
+
+                # LLM fallback classifier if still unclear
+                if age_ok is None:
+                    try:
+                        llm_context = build_llm_context(
+                            "ELIGIBILITY_PART1",
+                            sess,
+                            last_prompt=ELIGIBILITY_AGE_PROMPT,
+                        )
+                        llm_result = await mcp_llm_classify_intent(text, "ELIGIBILITY_PART1", llm_context)
+                        llm_intent = (llm_result.get("intent") or "").upper()
+                        llm_tone = llm_result.get("tone_reply") or ""
+
+                        if llm_intent == "AGE_OK":
+                            age_ok = True
+                            age_ack_reply = llm_tone
+                        elif llm_intent == "AGE_UNDER":
+                            age_ok = False
+                        elif llm_intent in {"AGE_UNCLEAR", "AMBIGUOUS", "QUERY"}:
+                            if llm_tone:
+                                await mcp_wa_send(phone, llm_tone)
+                                _add_to_history(phone, bot_msg=llm_tone)
+                            unclear_msg = ELIGIBILITY_AGE_UNCLEAR
+                            await mcp_wa_send(phone, unclear_msg)
+                            _add_to_history(phone, bot_msg=unclear_msg)
+                            sess["ts"] = time.time()
+                            SESSIONS[phone] = sess
+                            return
+                    except Exception as e:
+                        log.warning(f"[ELIG] Age LLM fallback failed: {e}")
+
                 # Handle unclear responses
                 if age_ok is None:
-                    unclear_msg = "I didn't quite catch that. Could you confirm: are you 18 or older? (Yes/No)"
+                    unclear_msg = ELIGIBILITY_AGE_UNCLEAR
                     await mcp_wa_send(phone, unclear_msg)
                     _add_to_history(phone, bot_msg=unclear_msg)
                     sess["ts"] = time.time()
                     SESSIONS[phone] = sess
                     return
-                
+
                 # HARD RULE: Age < 18 → immediate decline (no persuasion)
                 if age_ok is False or (age_value is not None and age_value < 18):
-                    decline_msg = f"Thanks for your enthusiasm 💛\nAt the moment, SERVE is open to adults (18+). Once you turn 18, I'll be happy to help you start your volunteering journey. 🌟"
+                    decline_msg = format_message(ELIGIBILITY_UNDERAGE_DECLINE)
                     await mcp_wa_send(phone, decline_msg)
                     _add_to_history(phone, bot_msg=decline_msg)
                     sess["state"] = "REJECTED"
                     sess["ts"] = time.time()
                     SESSIONS[phone] = sess
-                    
-                    # Telemetry
                     try:
                         await mcp_telemetry_emit("onboarding.age_decline", {
                             "conversation_id": phone,
@@ -1752,27 +1859,29 @@ async def _handle(phone: str, text: str):
                     except Exception:
                         pass
                     return
-                
-                # Age OK → Store and move to device question
+
+                # Age OK → optional acknowledgement then move to device question
+                if age_ack_reply:
+                    await mcp_wa_send(phone, age_ack_reply)
+                    _add_to_history(phone, bot_msg=age_ack_reply)
+
                 sess["elig.age"] = True
                 sess["elig.age_value"] = age_value if age_value else 18
                 sess["_eligibility_step"] = "device"
-                sess["_eligibility_device_asked"] = True  # Mark as asked (we're about to send it)
+                sess["_eligibility_device_asked"] = True
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
-                
-                # Send device question immediately
-                await asyncio.sleep(0.5)  # Small pause
-                device_msg = "Thank you! Do you have a smartphone or laptop and a stable internet connection to join the live classes?"
+
+                await asyncio.sleep(0.5)
+                device_msg = ELIGIBILITY_DEVICE_PROMPT
                 await mcp_wa_send(phone, device_msg)
                 _add_to_history(phone, bot_msg=device_msg)
                 return
-        
+
         # Q2 - Device check (second question)
         elif elig_step == "device":
             if not sess.get("_eligibility_device_asked"):
-                # Shouldn't reach here, but handle just in case
-                device_msg = "Thank you! Do you have a smartphone or laptop and a stable internet connection to join the live classes?"
+                device_msg = ELIGIBILITY_DEVICE_PROMPT
                 await mcp_wa_send(phone, device_msg)
                 _add_to_history(phone, bot_msg=device_msg)
                 sess["_eligibility_device_asked"] = True
@@ -1780,11 +1889,10 @@ async def _handle(phone: str, text: str):
                 SESSIONS[phone] = sess
                 return
             else:
-                # User replied to device question
-                # TRUST LLM-FIRST: Use onboarding.parse_message results (already called above)
                 has_device = None
-                
-                # Primary source: onboarding.parse_message (LLM extraction)
+                device_ack_reply = None
+                llm_suggests_deferral = False
+
                 try:
                     hints = parsed.get("eligibility") or {} if parsed else {}
                     has_device = hints.get("has_device") or hints.get("device_ok")
@@ -1792,96 +1900,104 @@ async def _handle(phone: str, text: str):
                         log.info(f"[ELIG] LLM extracted device: {has_device}")
                 except Exception as e:
                     log.warning(f"[ELIG] Failed to parse device from LLM: {e}")
-                
-                # Fallback: Simple yes/no for trivial responses only
+
                 if has_device is None:
-                    # Simple yes (very obvious cases only)
                     if is_yes_response(text):
                         has_device = True
                         log.info(f"[ELIG] Simple yes detected for device")
-                    
-                    # Simple no (very obvious cases only)
                     elif is_no_response(text):
                         has_device = False
                         log.info(f"[ELIG] Simple no detected for device")
-                
-                # Handle unclear responses
+
                 if has_device is None:
-                    followup_msg = f"Could you clarify, {name}? Do you have a smartphone or laptop with internet access?"
+                    text_lower = text.lower()
+                    negative_device_patterns = [
+                        r"no\s+(proper|stable|good)\s+(net|network|internet|wifi)",
+                        r"no\s+(internet|wifi|broadband)",
+                        r"not\s+able\s+to\s+(join|connect)",
+                        r"poor\s+(internet|network)",
+                        r"bad\s+(internet|network)",
+                        r"unstable\s+(internet|network|wifi)",
+                    ]
+                    if any(re.search(pat, text_lower) for pat in negative_device_patterns):
+                        has_device = False
+                        log.info("[ELIG] Detected unreliable internet phrasing; treating as no device")
+
+                if has_device is None:
+                    try:
+                        llm_context = build_llm_context(
+                            "ELIGIBILITY_PART1",
+                            sess,
+                            last_prompt=ELIGIBILITY_DEVICE_PROMPT,
+                        )
+                        llm_result = await mcp_llm_classify_intent(text, "ELIGIBILITY_PART1", llm_context)
+                        llm_intent = (llm_result.get("intent") or "").upper()
+                        llm_tone = llm_result.get("tone_reply") or ""
+
+                        if llm_intent == "DEVICE_OK":
+                            has_device = True
+                            device_ack_reply = llm_tone
+                        elif llm_intent == "DEVICE_NO":
+                            has_device = False
+                        elif llm_intent == "DEFERRAL":
+                            has_device = False
+                            llm_suggests_deferral = True
+                            device_ack_reply = llm_tone
+                        elif llm_intent in {"DEVICE_UNCLEAR", "AMBIGUOUS", "QUERY"}:
+                            if llm_tone:
+                                await mcp_wa_send(phone, llm_tone)
+                                _add_to_history(phone, bot_msg=llm_tone)
+                            followup_msg = format_message(ELIGIBILITY_DEVICE_CLARIFY, name=name)
+                            await mcp_wa_send(phone, followup_msg)
+                            _add_to_history(phone, bot_msg=followup_msg)
+                            sess["ts"] = time.time()
+                            SESSIONS[phone] = sess
+                            return
+                    except Exception as e:
+                        log.warning(f"[ELIG] Device LLM fallback failed: {e}")
+
+                if has_device is None:
+                    followup_msg = format_message(ELIGIBILITY_DEVICE_CLARIFY, name=name)
                     await mcp_wa_send(phone, followup_msg)
                     _add_to_history(phone, bot_msg=followup_msg)
                     sess["ts"] = time.time()
                     SESSIONS[phone] = sess
                     return
-                
-                # Store device status
-                sess["elig.device"] = has_device
-                
-                # If no device → offer deferral
+
                 if has_device is False:
-                    deferral_msg = f"No worries, {name} 😊 You'll just need a phone/laptop and steady internet to teach.\nI can check back once you have access — would you like me to remind you next week?"
+                    if device_ack_reply:
+                        await mcp_wa_send(phone, device_ack_reply)
+                        _add_to_history(phone, bot_msg=device_ack_reply)
+
+                    deferral_msg = format_message(ELIGIBILITY_DEVICE_DEFERRAL, name=name)
                     await mcp_wa_send(phone, deferral_msg)
                     _add_to_history(phone, bot_msg=deferral_msg)
-                    
-                    # Wait for response (user will reply yes/no to deferral)
                     sess["_eligibility_device_deferral_asked"] = True
                     sess["ts"] = time.time()
                     SESSIONS[phone] = sess
+
+                    if llm_suggests_deferral:
+                        sess["_eligibility_from_llm_deferral"] = True
                     return
-                
-                # Device OK → Both age and device confirmed, move to commitment
-                ok_msg = "Great! 👍"
+
+                if device_ack_reply:
+                    await mcp_wa_send(phone, device_ack_reply)
+                    _add_to_history(phone, bot_msg=device_ack_reply)
+
+                sess["elig.device"] = True
+                ok_msg = ELIGIBILITY_DEVICE_OK
                 await mcp_wa_send(phone, ok_msg)
                 _add_to_history(phone, bot_msg=ok_msg)
-                
+
                 sess["state"] = "ELIGIBILITY_PART2"
-                sess["_eligibility_part2_sent"] = True  # Mark as sent (we're about to send it)
+                sess["_eligibility_part2_sent"] = True
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
-                
-                # Send commitment question immediately
-                await asyncio.sleep(0.5)  # Small pause
-                commitment_msg = "Great 👍 Last quick one — would you be able to give about 2 hours a week for teaching?"
+
+                await asyncio.sleep(0.5)
+                commitment_msg = ELIGIBILITY_COMMIT_PROMPT
                 await mcp_wa_send(phone, commitment_msg)
                 _add_to_history(phone, bot_msg=commitment_msg)
-                return
-        
-        # Handle deferral response for device
-        if sess.get("_eligibility_device_deferral_asked"):
-            if is_yes_response(text):
-                # Create deferral
-                from datetime import timezone
-                until_date = datetime.now(timezone.utc) + timedelta(days=7)
-                until_iso = until_date.isoformat()
-                idempotency_key = f"{volunteer_id}_DEFERRAL_DEVICE_{int(time.time())}"
-                
-                try:
-                    await mcp_deferral_create(volunteer_id, "NO_DEVICE", until_iso, idempotency_key)
-                    defer_msg = f"Perfect! I'll remind you next week, {name}. Feel free to ping me anytime when you're ready."
-                    await mcp_wa_send(phone, defer_msg)
-                    _add_to_history(phone, bot_msg=defer_msg)
-                    sess["state"] = "DEFERRED"
-                    sess["ts"] = time.time()
-                    SESSIONS[phone] = sess
-                    return
-                except Exception as e:
-                    log.warning(f"[ELIG] Failed to create device deferral: {e}")
-                    # Fallback
-                    defer_msg = f"Got it, {name}! I'll check back with you later when you're ready."
-                    await mcp_wa_send(phone, defer_msg)
-                    _add_to_history(phone, bot_msg=defer_msg)
-                    sess["state"] = "DEFERRED"
-                    sess["ts"] = time.time()
-                    SESSIONS[phone] = sess
-                    return
-            else:
-                # User declined deferral, ask device again
-                device_msg = "No problem. Could you confirm if you have a smartphone or laptop with internet?"
-                await mcp_wa_send(phone, device_msg)
-                _add_to_history(phone, bot_msg=device_msg)
-                sess["_eligibility_device_deferral_asked"] = False
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
                 return
     
     # ========== ELIGIBILITY (PART 2: commitment with persuasion) ==========
@@ -1892,7 +2008,7 @@ async def _handle(phone: str, text: str):
         if not sess.get("_eligibility_part2_sent"):
             # First time: send commitment question
             log.info(f"[ELIG] Sending commitment question to {phone}")
-            msg = "Last quick one — would you be able to give about 2 hours a week for teaching?"
+            msg = ELIGIBILITY_COMMIT_PROMPT
             await mcp_wa_send(phone, msg)
             _add_to_history(phone, bot_msg=msg)
             sess["_eligibility_part2_sent"] = True
@@ -1901,39 +2017,30 @@ async def _handle(phone: str, text: str):
             return
         else:
             # User replied to commitment question
-            # TRUST LLM-FIRST: Use onboarding.parse_message results (already called above)
             commit_hours = None
             commit_ok = None
             same_day_request = False
+            llm_commit_intent = None
+            llm_commit_reply = ""
 
-            # Read parsed eligibility hints (from server prompt) and log for visibility
             try:
                 hints = parsed.get("eligibility") or {} if parsed else {}
-                # same_day_request from server
                 if isinstance(hints.get("same_day_request"), bool):
                     same_day_request = hints.get("same_day_request")
-                # Optional: quick log of parsed payload
-                log.info(f"[ELIG] Parsed hints: hours={hints.get('weekly_commitment_hours')}, same_day_request={same_day_request}, confidence={hints.get('confidence')}")
             except Exception:
                 pass
 
-            # Broadened same-day detection (client guard) as a backup to server flag
             if not same_day_request and re.search(r"\b(same\s*day|same-day|sameday|today)\b", text, re.I):
                 same_day_request = True
 
-            # Commitment policy clarification takes precedence if same-day was requested
             if same_day_request:
-                clarify_policy = (
-                    "Thanks for checking. The 2 hours need to be split across different weekdays during school hours (8–15), "
-                    "not all on the same day. Would two short weekday slots work for you—say 30–45 minutes each on different days?"
-                )
+                clarify_policy = ELIGIBILITY_COMMIT_POLICY
                 await mcp_wa_send(phone, clarify_policy)
                 _add_to_history(phone, bot_msg=clarify_policy)
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
                 return
-            
-            # Primary source: onboarding.parse_message (LLM extraction)
+
             try:
                 hints = parsed.get("eligibility") or {} if parsed else {}
                 commit_hours_raw = hints.get("weekly_commitment_hours")
@@ -1943,294 +2050,287 @@ async def _handle(phone: str, text: str):
                     log.info(f"[ELIG] LLM extracted commitment: {commit_hours} hours, ok={commit_ok}")
             except Exception as e:
                 log.warning(f"[ELIG] Failed to parse commitment from LLM: {e}")
-            
-            # Fallback 1: Minimal numeric extraction (when LLM fails but text contains obvious hours)
+
             if commit_hours is None:
                 extracted_hours = _extract_simple_hours(text)
                 if extracted_hours is not None:
                     commit_hours = extracted_hours
                     commit_ok = extracted_hours >= 2.0
                     log.info(f"[ELIG] Minimal fallback extracted: {commit_hours} hours, ok={commit_ok}")
-            
-            # Fallback 2: Simple yes/no for trivial responses only (avoid LLM cost for obvious cases)
+
             if commit_hours is None and commit_ok is None:
                 text_lower = text.lower().strip()
-                
-                # Simple yes (very obvious cases only)
+
                 if is_yes_response(text):
                     commit_ok = True
                     commit_hours = 2.0
                     log.info(f"[ELIG] Simple yes detected, defaulting to 2.0 hours")
-                
-                # Simple no (very obvious cases only)
                 elif is_no_response(text):
                     commit_ok = False
                     log.info(f"[ELIG] Simple no detected")
-            
-            # If still unclear, ask for clarification (max 2 times to prevent loops)
+
+            llm_result = None
             if commit_hours is None and commit_ok is None:
-                clarification_count = sess.get("_commitment_clarification_count", 0)
-                
-                if clarification_count >= 2:
-                    # Too many clarifications → treat as hesitant and offer deferral/persuasion
-                    log.warning(f"[ELIG] Max clarifications reached for commitment, treating as hesitant")
-                    commit_ok = False
-                    sess["elig.commitment"] = False
-                    # Will trigger persuasion logic below
-                else:
-                    sess["_commitment_clarification_count"] = clarification_count + 1
-                    clarifier = "Could you confirm: can you spare around 2 hours per week for teaching?"
-                    await mcp_wa_send(phone, clarifier)
-                    _add_to_history(phone, bot_msg=clarifier)
+                try:
+                    llm_context = build_llm_context(
+                        "ELIGIBILITY_PART2",
+                        sess,
+                        last_prompt=ELIGIBILITY_COMMIT_PROMPT,
+                    )
+                    llm_result = await mcp_llm_classify_intent(text, "ELIGIBILITY_PART2", llm_context)
+                    llm_commit_intent = (llm_result.get("intent") or "").upper()
+                    llm_commit_reply = llm_result.get("tone_reply") or ""
+                except Exception as e:
+                    log.warning(f"[ELIG] Commitment LLM fallback failed: {e}")
+
+            if llm_commit_intent == "COMMIT_OK":
+                commit_ok = True
+                if commit_hours is None:
+                    commit_hours = 2.0
+            elif llm_commit_intent == "COMMIT_TOO_LOW":
+                commit_ok = False
+                if commit_hours is None:
+                    commit_hours = 1.0
+            elif llm_commit_intent == "COMMIT_SAME_DAY_ONLY":
+                clarify_policy = ELIGIBILITY_COMMIT_POLICY
+                await mcp_wa_send(phone, clarify_policy)
+                _add_to_history(phone, bot_msg=clarify_policy)
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            elif llm_commit_intent == "COMMIT_UNSURE":
+                commit_ok = False
+            elif llm_commit_intent == "DEFERRAL":
+                commit_ok = False
+                sess["_commitment_llm_deferral"] = True
+            elif llm_commit_intent == "COMMIT_NO":
+                commit_ok = False
+            elif llm_commit_intent == "QUERY":
+                if llm_commit_reply:
+                    await mcp_wa_send(phone, llm_commit_reply)
+                    _add_to_history(phone, bot_msg=llm_commit_reply)
+                clarifier = ELIGIBILITY_COMMIT_CLARIFY
+                await mcp_wa_send(phone, clarifier)
+                _add_to_history(phone, bot_msg=clarifier)
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            elif llm_commit_intent == "AMBIGUOUS":
+                if llm_commit_reply:
+                    await mcp_wa_send(phone, llm_commit_reply)
+                    _add_to_history(phone, bot_msg=llm_commit_reply)
+                clarifier = ELIGIBILITY_COMMIT_CLARIFY
+                await mcp_wa_send(phone, clarifier)
+                _add_to_history(phone, bot_msg=clarifier)
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+
+            if commit_ok is False:
+                if llm_commit_intent == "COMMIT_NO":
+                    decline_msg = ELIGIBILITY_DECLINE_REQUIREMENTS
+                    await mcp_wa_send(phone, decline_msg)
+                    _add_to_history(phone, bot_msg=decline_msg)
+                    sess["state"] = "REJECTED"
                     sess["ts"] = time.time()
                     SESSIONS[phone] = sess
                     return
-            
-            # If we have hours but commit_ok wasn't set, set it based on hours
-            if commit_hours is not None and commit_ok is None:
-                commit_ok = commit_hours >= 2.0
-                log.info(f"[ELIG] Commit_ok set from hours: {commit_hours} >= 2.0 = {commit_ok}")
-            
-            # Store commitment
-            sess["elig.commitment"] = commit_ok
-            sess["elig.commitment_hours"] = commit_hours if commit_hours else (2.0 if commit_ok else None)
-            
-            # POSITIVE: All three collected → Call eligibility.check
-            if commit_ok is True:
-                # All eligibility info collected: age, device, commitment
-                age_val = sess.get("elig.age_value", 18)
-                device_ok = sess.get("elig.device", True)
-                
-                # Call server with all three answers
-                try:
-                    idempotency_key = f"{volunteer_id}_ELIG_CHECK_{int(time.time())}"
-                    elig = await mcp_eligibility_check(
-                        age_years=int(age_val) if age_val else 18,
-                        has_device=bool(device_ok),
-                        weekly_commitment_hours=float(commit_hours) if commit_hours else 2.0
-                    )
-                    
-                    eligible = bool(elig.get("eligible", False))
-                    reasons = elig.get("reasons", [])
-                    
-                    if eligible:
-                        # All eligible → Advance to next stage
-                        ok_msg = "Awesome! 🎉"
-                        await mcp_wa_send(phone, ok_msg)
-                        _add_to_history(phone, bot_msg=ok_msg)
-                        # Move to Day & Time Preferences state
-                        sess["state"] = "PREFS_DAYTIME"
-                        sess["_prefs_init_done"] = True  # we'll send M1/M2 now
-                        # Fetch scheduling policy and send M1/M2 immediately
-                        weekend_gate = False
-                        policy_version = None
-                        try:
-                            pol = await mcp_policy_scheduling(profile.get("region_id"))
-                            weekend_gate = bool(pol.get("weekend_gate", False)) if isinstance(pol, dict) else False
-                            policy_version = pol.get("policy_version") if isinstance(pol, dict) else None
-                        except Exception:
-                            weekend_gate = False
-                            policy_version = None
-                        sess["_weekend_gate"] = weekend_gate
-                        sess["_policy_version"] = policy_version
-                        sess["ts"] = time.time()
-                        SESSIONS[phone] = sess
-                        # Outbound M1 and M2
-                        m1 = (
-                            "What days usually work for you to take class?\n"
-                            "You can pick 2–3 days (e.g., Mon, Wed, Sat) — or just type what suits you."
-                        )
-                        if weekend_gate:
-                            m1 += "\n\nNote: Weekends are reserved — weekdays are best."
-                        await mcp_wa_send(phone, m1)
-                        _add_to_history(phone, bot_msg=m1)
-                        # Wait for volunteer's reply before asking time
-                        sess["_prefs_last_prompt"] = "ask_days"
-                        SESSIONS[phone] = sess
-                        
-                        # Telemetry
-                        try:
-                            await mcp_telemetry_emit("onboarding.eligibility_passed", {
-                                "conversation_id": phone,
-                                "user_id": volunteer_id,
-                                "age": age_val,
-                                "device": device_ok,
-                                "commitment_hours": commit_hours
-                            })
-                        except Exception:
-                            pass
-                        return
-                    else:
-                        # Server says not eligible → Decline with reasons
-                        decline_msg = "Thanks for your interest! Right now, the teaching program needs volunteers who can meet these requirements. We will keep you posted on other ways to contribute."
-                        await mcp_wa_send(phone, decline_msg)
-                        _add_to_history(phone, bot_msg=decline_msg)
-                        sess["state"] = "REJECTED"
-                        sess["ts"] = time.time()
-                        SESSIONS[phone] = sess
-                        return
-                        
-                except Exception as e:
-                    log.warning(f"[ELIG] MCP eligibility.check failed: {e}")
-                    # Fallback: if we have all three positive, assume eligible
-                    if age_val and device_ok and commit_ok:
-                        ok_msg = "Awesome! 🎉"
-                        await mcp_wa_send(phone, ok_msg)
-                        _add_to_history(phone, bot_msg=ok_msg)
-                        sess["state"] = "DONE"  # Temporary
-                        sess["ts"] = time.time()
-                        SESSIONS[phone] = sess
-                        return
-                    else:
-                        # Fallback decline
-                        decline_msg = "Thanks for your interest! Right now, we need volunteers who meet all requirements."
-                        await mcp_wa_send(phone, decline_msg)
-                        _add_to_history(phone, bot_msg=decline_msg)
-                        sess["state"] = "REJECTED"
-                        sess["ts"] = time.time()
-                        SESSIONS[phone] = sess
-                        return
-            
-            # HESITANT/NEGATIVE: Persuasion logic (max 2 attempts)
-            if commit_ok is False:
-                if persuasion_attempts == 0:
-                    # First hesitant response detected → send persuasion
-                    sess["_commitment_persuasion_attempts"] = 1
-                    persuasion_msg = f"I understand, {name} 😊 Even 2 hours a week can make a big difference for the children — and you can pick times that suit you!\nDo you think that might work?"
+
+                if llm_commit_intent == "COMMIT_TOO_LOW":
+                    sess["_commitment_persuasion_attempts"] = persuasion_attempts + 1
+                    persuasion_msg = format_message(ELIGIBILITY_COMMIT_PERSUADE, name=name)
                     await mcp_wa_send(phone, persuasion_msg)
                     _add_to_history(phone, bot_msg=persuasion_msg)
                     sess["ts"] = time.time()
                     SESSIONS[phone] = sess
                     return
-                
+
+                if persuasion_attempts == 0 and llm_commit_intent in {"COMMIT_UNSURE", None}:
+                    sess["_commitment_persuasion_attempts"] = 1
+                    persuasion_msg = format_message(ELIGIBILITY_COMMIT_PERSUADE, name=name)
+                    await mcp_wa_send(phone, persuasion_msg)
+                    _add_to_history(phone, bot_msg=persuasion_msg)
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+                    return
+
                 elif persuasion_attempts == 1:
-                    # User replied to first persuasion → check if they said yes now
-                    # Re-check their response after persuasion
                     if is_yes_response(text):
-                        # They agreed after persuasion → treat as positive, call eligibility.check
                         commit_ok = True
                         if commit_hours is None:
                             commit_hours = 2.0
-                        sess["elig.commitment"] = True
-                        sess["elig.commitment_hours"] = commit_hours
-                        
-                        # All eligibility info collected: age, device, commitment
-                        age_val = sess.get("elig.age_value", 18)
-                        device_ok = sess.get("elig.device", True)
-                        
-                        # Call server with all three answers
-                        try:
-                            idempotency_key = f"{volunteer_id}_ELIG_CHECK_{int(time.time())}"
-                            elig = await mcp_eligibility_check(
-                                age_years=int(age_val) if age_val else 18,
-                                has_device=bool(device_ok),
-                                weekly_commitment_hours=float(commit_hours) if commit_hours else 2.0
-                            )
-                            
-                            eligible = bool(elig.get("eligible", False))
-                            
-                            if eligible:
-                                # All eligible → Advance to next stage
-                                ok_msg = "Awesome! 🎉"
-                                await mcp_wa_send(phone, ok_msg)
-                                _add_to_history(phone, bot_msg=ok_msg)
-                                
-                                # TODO: Move to next section (TIME_PREF)
-                                sess["state"] = "DONE"  # Temporary - will be TIME_PREF later
-                                sess["ts"] = time.time()
-                                SESSIONS[phone] = sess
-                                
-                                # Telemetry
-                                try:
-                                    await mcp_telemetry_emit("onboarding.eligibility_passed", {
-                                        "conversation_id": phone,
-                                        "user_id": volunteer_id,
-                                        "age": age_val,
-                                        "device": device_ok,
-                                        "commitment_hours": commit_hours,
-                                        "persuaded": True
-                                    })
-                                except Exception:
-                                    pass
-                                return
-                            else:
-                                # Server says not eligible → Decline
-                                decline_msg = "Thanks for your interest! Right now, the teaching program needs volunteers who can meet these requirements. We will keep you posted on other ways to contribute."
-                                await mcp_wa_send(phone, decline_msg)
-                                _add_to_history(phone, bot_msg=decline_msg)
-                                sess["state"] = "REJECTED"
-                                sess["ts"] = time.time()
-                                SESSIONS[phone] = sess
-                                return
-                                
-                        except Exception as e:
-                            log.warning(f"[ELIG] MCP eligibility.check failed after persuasion: {e}")
-                            # Fallback: if we have all three positive, assume eligible
-                            if age_val and device_ok:
-                                ok_msg = "Awesome! 🎉"
-                                await mcp_wa_send(phone, ok_msg)
-                                _add_to_history(phone, bot_msg=ok_msg)
-                                sess["state"] = "DONE"  # Temporary
-                                sess["ts"] = time.time()
-                                SESSIONS[phone] = sess
-                                return
                     else:
-                        # Still hesitant/no after persuasion → Stop persuading, offer deferral
-                        deferral_msg = f"Totally fine, {name} 💛 I'll note that you'd like to start later and remind you in a few days."
+                        deferral_msg = format_message(ELIGIBILITY_COMMIT_DEFERRAL, name=name)
                         await mcp_wa_send(phone, deferral_msg)
                         _add_to_history(phone, bot_msg=deferral_msg)
-                        
-                        # Create deferral
-                        from datetime import timezone
+
                         until_date = datetime.now(timezone.utc) + timedelta(days=5)
                         until_iso = until_date.isoformat()
                         idempotency_key = f"{volunteer_id}_DEFERRAL_COMMITMENT_{int(time.time())}"
-                        
+
                         try:
                             await mcp_deferral_create(volunteer_id, "NO_COMMITMENT", until_iso, idempotency_key)
+                            defer_confirm = format_message(ELIGIBILITY_COMMIT_DEFERRAL_CONFIRM, name=name)
+                            await mcp_wa_send(phone, defer_confirm)
+                            _add_to_history(phone, bot_msg=defer_confirm)
+                            sess["_deferred_prev_state"] = state
+                            sess["_deferred_reason"] = "COMMITMENT_INSUFFICIENT"
                             sess["state"] = "DEFERRED"
                         except Exception as e:
                             log.warning(f"[ELIG] Failed to create commitment deferral: {e}")
-                            sess["state"] = "DEFERRED"  # Set state anyway
-                        
+                            sess["_deferred_prev_state"] = state
+                            sess["_deferred_reason"] = "COMMITMENT_INSUFFICIENT"
+                            sess["state"] = "DEFERRED"
+
                         sess["ts"] = time.time()
                         SESSIONS[phone] = sess
                         return
-            
-            
-            # Should not reach here
-            log.warning(f"[ELIG] Unexpected state in ELIGIBILITY_PART2 for {phone}")
+
+            if commit_hours is None and commit_ok is None:
+                clarification_count = sess.get("_commitment_clarification_count", 0)
+
+                if clarification_count >= 2:
+                    log.warning(f"[ELIG] Max clarifications reached for commitment, treating as hesitant")
+                    commit_ok = False
+                    sess["elig.commitment"] = False
+                else:
+                    sess["_commitment_clarification_count"] = clarification_count + 1
+                    clarifier = ELIGIBILITY_COMMIT_CLARIFY
+                    await mcp_wa_send(phone, clarifier)
+                    _add_to_history(phone, bot_msg=clarifier)
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+                    return
+
+            if commit_hours is not None and commit_ok is None:
+                commit_ok = commit_hours >= 2.0
+                log.info(f"[ELIG] Commit_ok set from hours: {commit_hours} >= 2.0 = {commit_ok}")
+
+            if commit_ok is False and llm_commit_reply and llm_commit_intent in {"COMMIT_TOO_LOW", "COMMIT_UNSURE"}:
+                await mcp_wa_send(phone, llm_commit_reply)
+                _add_to_history(phone, bot_msg=llm_commit_reply)
+
+            if llm_commit_intent == "DEFERRAL" or sess.get("_commitment_llm_deferral"):
+                deferral_msg = format_message(ELIGIBILITY_COMMIT_DEFERRAL, name=name)
+                await mcp_wa_send(phone, deferral_msg)
+                _add_to_history(phone, bot_msg=deferral_msg)
+                until_date = datetime.now(timezone.utc) + timedelta(days=5)
+                until_iso = until_date.isoformat()
+                idempotency_key = f"{volunteer_id}_DEFERRAL_COMMITMENT_{int(time.time())}"
+
+                try:
+                    await mcp_deferral_create(volunteer_id, "NO_COMMITMENT", until_iso, idempotency_key)
+                    defer_confirm = format_message(ELIGIBILITY_COMMIT_DEFERRAL_CONFIRM, name=name)
+                    await mcp_wa_send(phone, defer_confirm)
+                    _add_to_history(phone, bot_msg=defer_confirm)
+                    sess["_deferred_prev_state"] = state
+                    sess["_deferred_reason"] = "COMMITMENT_INSUFFICIENT"
+                    sess["state"] = "DEFERRED"
+                except Exception as e:
+                    log.warning(f"[ELIG] Failed to create commitment deferral: {e}")
+                    sess["_deferred_prev_state"] = state
+                    sess["_deferred_reason"] = "COMMITMENT_INSUFFICIENT"
+                    sess["state"] = "DEFERRED"
+
+                sess.pop("_commitment_llm_deferral", None)
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+
+            if commit_ok is True:
+                if commit_hours is None:
+                    commit_hours = 2.0
+
+                # Send acknowledgement tone before moving ahead
+                if llm_commit_reply:
+                    await mcp_wa_send(phone, llm_commit_reply)
+                    _add_to_history(phone, bot_msg=llm_commit_reply)
+
+                sess["elig.commitment"] = True
+                sess["elig.commitment_hours"] = commit_hours
+                age_val = sess.get("elig.age_value", 18)
+                device_ok = sess.get("elig.device", True)
+
+                eligible = True
+                try:
+                    elig = await mcp_eligibility_check(
+                        age_years=int(age_val) if age_val else 18,
+                        has_device=bool(device_ok),
+                        weekly_commitment_hours=float(commit_hours)
+                    )
+                    eligible = bool(elig.get("eligible", True))
+                except Exception as e:
+                    log.warning(f"[ELIG] eligibility.check failed (proceeding optimistically): {e}")
+
+                if eligible:
+                    success_msg = ELIGIBILITY_COMMIT_SUCCESS
+                    await mcp_wa_send(phone, success_msg)
+                    _add_to_history(phone, bot_msg=success_msg)
+
+                    # Mark profile eligibility snapshot
+                    profile.setdefault("eligibility", {})
+                    profile["eligibility"]["q1_commitment"] = True
+                    profile["eligibility"]["passed"] = True
+                    sess["elig.age"] = sess.get("elig.age", True)
+                    sess["elig.device"] = sess.get("elig.device", True)
+                    sess["elig.commitment"] = True
+                    sess["elig.commitment_hours"] = commit_hours
+
+                    sess["state"] = "PREFS_DAYTIME"
+                    sess.pop("_commitment_persuasion_attempts", None)
+                    sess.pop("_commitment_clarification_count", None)
+                    sess["_prefs_last_prompt"] = None
+                    sess["_prefs_last_prompt_text"] = None
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+
+                    try:
+                        await mcp_telemetry_emit("onboarding.eligibility_passed", {
+                            "conversation_id": phone,
+                            "user_id": volunteer_id,
+                            "age": age_val,
+                            "device": device_ok,
+                            "commitment_hours": commit_hours,
+                            "persuaded": persuasion_attempts > 0
+                        })
+                    except Exception:
+                        pass
+
+                    await asyncio.sleep(0.5)
+                    await _handle(phone, "__kick__")
+                    return
+
+                decline_msg = ELIGIBILITY_DECLINE_REQUIREMENTS
+                await mcp_wa_send(phone, decline_msg)
+                _add_to_history(phone, bot_msg=decline_msg)
+                sess["state"] = "REJECTED"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+
+            sess["elig.commitment"] = commit_ok
+            sess["elig.commitment_hours"] = commit_hours if commit_hours else (2.0 if commit_ok else None)
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             return
-    
+
     # ========== PREFS_DAYTIME (Day & Time Preferences) ==========
     elif state == "PREFS_DAYTIME":
-        volunteer_id = profile.get("uuid") or phone
-        # One-time initialization
-        if not sess.get("_prefs_init_done"):
+        prefs_intent = None
+        tone_reply = ""
+        if text != "__kick__":
             try:
-                pol = await mcp_policy_scheduling(profile.get("region_id"))
-                sess["_weekend_gate"] = bool(pol.get("weekend_gate", False)) if isinstance(pol, dict) else False
-                sess["_policy_version"] = pol.get("policy_version") if isinstance(pol, dict) else None
-            except Exception:
-                sess["_weekend_gate"] = False
-                sess["_policy_version"] = None
-            sess["_prefs_init_done"] = True
-            SESSIONS[phone] = sess
-            # M1 only (wait for reply before asking time)
-            m1 = (
-                "What days usually work for you to take class?\n"
-                "You can pick 2–3 days (e.g., Mon, Wed, Sat) — or just type what suits you."
-            )
-            if sess.get("_weekend_gate"):
-                m1 += "\n\nNote: Weekends are reserved — weekdays are best."
-            await mcp_wa_send(phone, m1)
-            _add_to_history(phone, bot_msg=m1)
-            sess["_prefs_last_prompt"] = "ask_days"
-            SESSIONS[phone] = sess
-            return
-        
+                llm_context = build_llm_context(
+                    "PREFS_DAYTIME",
+                    sess,
+                    last_prompt=sess.get("_prefs_last_prompt_text")
+                )
+                llm_result = await mcp_llm_classify_intent(text, "PREFS_DAYTIME", llm_context)
+                prefs_intent = (llm_result.get("intent") or "").upper()
+                tone_reply = llm_result.get("tone_reply") or ""
+            except Exception as e:
+                log.debug(f"[PREFS] LLM classify failed: {e}")
+
         # Parse user reply for days and times (LLM-first merge)
         text_lower = text.lower()
         llm_days = []
@@ -2260,7 +2360,7 @@ async def _handle(phone: str, text: str):
                 if iso not in days_found:
                     days_found.append(iso)
         days_capped = days_found[:3] if days_found else []
-        
+
         # Time bands and exact time
         time_windows = list(llm_windows) if llm_windows else []
         def add_window(start:str, end:str):
@@ -2284,81 +2384,258 @@ async def _handle(phone: str, text: str):
         elif m24:
             h = int(m24.group(1)); mm = int(m24.group(2) or 0)
             s,e = expand_around(h, mm); add_window(s,e)
-        # Merge with any partial session choices
+
         prev_days = sess.get("_prefs_days") or []
         prev_windows = sess.get("_prefs_windows") or []
         merged_days = days_capped or prev_days or []
         merged_windows = time_windows or prev_windows or []
+        have_days = bool(merged_days)
+        have_windows = bool(merged_windows)
+        weekend_only = have_days and all(d in ["SAT","SUN"] for d in merged_days) and not any(d in ["MON","TUE","WED","THU","FRI"] for d in merged_days)
+        evening_only = False
+        window_hours: list[int] = []
+        for w in time_windows:
+            start_raw = w.get("start") or w.get("start_iso")
+            if not start_raw:
+                continue
+            hour_val = None
+            try:
+                if "T" in start_raw:
+                    hour_val = datetime.fromisoformat(start_raw.replace("Z", "+00:00")).hour
+                else:
+                    parts = start_raw.split(":")
+                    if parts:
+                        hour_val = int(parts[0])
+            except Exception:
+                hour_val = None
+            if hour_val is not None:
+                window_hours.append(hour_val)
+
+        if window_hours and all(h >= 16 for h in window_hours):
+            evening_only = True
+        elif not window_hours:
+            if re.search(r"after\s*(4|5|6|7|8)\s*(pm)?", text_lower) or re.search(r"post\s*4\s*pm", text_lower) or "evening" in text_lower or "night" in text_lower:
+                evening_only = True
+
+        if prefs_intent == "PREFS_DAYS_AND_TIME_OK" and (not have_days or not have_windows):
+            prefs_intent = "PREFS_AMBIGUOUS"
+        if prefs_intent == "PREFS_DAYS_ONLY" and not have_days:
+            prefs_intent = "PREFS_AMBIGUOUS"
+        if prefs_intent == "PREFS_TIME_ONLY" and not have_windows:
+            prefs_intent = "PREFS_AMBIGUOUS"
+        if prefs_intent == "PREFS_WEEKEND_ONLY" and not weekend_only:
+            prefs_intent = "PREFS_AMBIGUOUS"
+        if prefs_intent == "PREFS_EVENING_ONLY" and not evening_only:
+            prefs_intent = "PREFS_AMBIGUOUS"
+        if evening_only and prefs_intent not in {"PREFS_EVENING_ONLY", "PREFS_LATER_OR_DEFERRAL"}:
+            prefs_intent = "PREFS_EVENING_ONLY"
+
+        if prefs_intent is None and text != "__kick__":
+            if have_days and have_windows:
+                prefs_intent = "PREFS_DAYS_AND_TIME_OK"
+            elif have_days:
+                prefs_intent = "PREFS_DAYS_ONLY"
+            elif have_windows:
+                prefs_intent = "PREFS_TIME_ONLY"
+            else:
+                prefs_intent = "PREFS_AMBIGUOUS"
+
+        if merged_days:
+            sess["_prefs_days"] = merged_days
+        if merged_windows:
+            sess["_prefs_windows"] = merged_windows
+
+        async def send_message(msg: str, last_key: str | None = None):
+            if not msg:
+                return
+            await mcp_wa_send(phone, msg)
+            _add_to_history(phone, bot_msg=msg)
+            if last_key:
+                sess["_prefs_last_prompt"] = last_key
+            sess["_prefs_last_prompt_text"] = msg
+
+        if prefs_intent == "PREFS_FAQ":
+            if tone_reply:
+                await send_message(tone_reply, sess.get("_prefs_last_prompt"))
+            outstanding_key = None
+            if not have_days:
+                outstanding_key = "ask_days"
+            elif not have_windows:
+                outstanding_key = "ask_time"
+            if not tone_reply and outstanding_key:
+                followup = PREFS_ASK_DAYS if outstanding_key == "ask_days" else PREFS_ASK_TIME
+                await send_message(followup, outstanding_key)
+            elif outstanding_key:
+                sess["_prefs_last_prompt"] = outstanding_key
+            sess["ts"] = time.time(); SESSIONS[phone] = sess
+            return
+
+        if prefs_intent == "PREFS_LATER_OR_DEFERRAL":
+            message = tone_reply or "Absolutely 😊 Share your preferred days and timings whenever you're ready, and I'll pick it up from there."
+            await send_message(message, None)
+            sess["_prefs_followup_pending"] = True
+            sess["ts"] = time.time(); SESSIONS[phone] = sess
+            return
+
+        if prefs_intent == "PREFS_WEEKEND_ONLY":
+            message = tone_reply or "Thanks for letting me know 🙏 Most school sessions run on weekdays so the children have support during class hours. Could you share 1–2 weekday slots that might work?"
+            await send_message(message, "ask_days")
+            sess["ts"] = time.time(); SESSIONS[phone] = sess
+            return
+
+        if prefs_intent == "PREFS_DAYS_ONLY":
+            message = tone_reply or PREFS_ASK_TIME
+            await send_message(message, "ask_time")
+            sess["ts"] = time.time(); SESSIONS[phone] = sess
+            return
+
+        if prefs_intent == "PREFS_TIME_ONLY":
+            message = tone_reply or PREFS_ASK_DAYS
+            await send_message(message, "ask_days")
+            sess["ts"] = time.time(); SESSIONS[phone] = sess
+            return
+
+        if prefs_intent == "PREFS_AMBIGUOUS" and text != "__kick__":
+            message = tone_reply or PREFS_COMBINED_CLARIFIER
+            await send_message(message, "ask_days")
+            sess["ts"] = time.time(); SESSIONS[phone] = sess
+            return
+
+        if prefs_intent == "PREFS_EVENING_ONLY":
+            attempts = sess.get("_prefs_evening_attempts", 0)
+            if attempts == 0:
+                message = tone_reply or PREFS_EVENING_POLICY
+                await send_message(message, "ask_days")
+                sess["_prefs_evening_attempts"] = 1
+                sess["ts"] = time.time(); SESSIONS[phone] = sess
+                return
+
+            message = tone_reply or PREFS_EVENING_DEFERRAL
+            await send_message(message, None)
+            sess["_prefs_evening_attempts"] = attempts + 1
+
+            until_date = datetime.now(timezone.utc) + timedelta(days=14)
+            until_iso = until_date.isoformat()
+            deferral_key = f"{phone}_EVENING_ONLY_{int(time.time())}"
+            sess["_deferred_prev_state"] = state
+            sess["_deferred_reason"] = "EVENING_ONLY"
+            try:
+                await mcp_deferral_create(profile.get("uuid") or phone, "EVENING_ONLY", until_iso, deferral_key)
+            except Exception as e:
+                log.warning(f"[PREFS] Failed to create evening-only deferral: {e}")
+
+            sess["state"] = "DEFERRED"
+            sess["ts"] = time.time(); SESSIONS[phone] = sess
+            return
 
         # If neither present, ask combined clarifier
         if not merged_days and not merged_windows:
-            clar = "Could you pick 2–3 days (e.g., Mon, Wed) and a time band — Morning (8–11), Afternoon (12–4), or Evening (5–8) in IST?"
-            await mcp_wa_send(phone, clar)
-            _add_to_history(phone, bot_msg=clar)
+            clar = PREFS_COMBINED_CLARIFIER
+            await send_message(clar, "ask_days")
             sess["ts"] = time.time(); SESSIONS[phone] = sess
             return
 
         # If only days present, ask time once (suppress duplicates)
         if merged_days and not merged_windows:
             if sess.get("_prefs_last_prompt") != "ask_time":
-                ask_time = "Great. Do mornings (8AM –11AM) or afternoons (12PM–3PM) work best in IST?"
-                await mcp_wa_send(phone, ask_time)
-                _add_to_history(phone, bot_msg=ask_time)
-                sess["_prefs_last_prompt"] = "ask_time"
-            sess["_prefs_days"] = merged_days
+                await send_message(PREFS_ASK_TIME, "ask_time")
             sess["ts"] = time.time(); SESSIONS[phone] = sess
             return
 
         # If only windows present, ask days once (suppress duplicates)
         if merged_windows and not merged_days:
             if sess.get("_prefs_last_prompt") != "ask_days":
-                ask_days = "Could you pick two weekdays (Mon–Fri)?"
-                await mcp_wa_send(phone, ask_days)
-                _add_to_history(phone, bot_msg=ask_days)
-                sess["_prefs_last_prompt"] = "ask_days"
-            sess["_prefs_windows"] = merged_windows
+                await send_message(PREFS_ASK_DAYS, "ask_days")
             sess["ts"] = time.time(); SESSIONS[phone] = sess
             return
 
-        # Both present → confirm and save
-        prefs = {
-            "days": merged_days,
-            "time_windows": merged_windows,
-            "timezone": profile.get("tz","Asia/Kolkata")
+        # Prepare final confirmation details
+        confirmed_days = merged_days[:3] if merged_days else []
+        day_label_map = {
+            "MON": "Monday",
+            "TUE": "Tuesday",
+            "WED": "Wednesday",
+            "THU": "Thursday",
+            "FRI": "Friday",
+            "SAT": "Saturday",
+            "SUN": "Sunday",
         }
-        days_str = ", ".join([d.title()[:3] for d in prefs["days"]])
-        tw = merged_windows[0]; band_str = f"{tw['start'][:-3]}–{tw['end'][:-3]}"
-        if sess.get("_weekend_gate") and any(d in ["SAT","SUN"] for d in prefs["days"]):
-            confirm = f"I’ve noted {days_str}, though weekends are limited in your region. I’ll prioritize weekdays in {band_str} IST. 👍"
+        human_days = [day_label_map.get(code, code.title()) for code in confirmed_days]
+        if not human_days:
+            days_str = "the days you shared"
+        elif len(human_days) == 1:
+            days_str = human_days[0]
+        elif len(human_days) == 2:
+            days_str = f"{human_days[0]} & {human_days[1]}"
         else:
-            confirm = f"Noted 👍 I’ll look for {days_str} in {band_str} IST."
+            days_str = ", ".join(human_days[:-1]) + f" & {human_days[-1]}"
+
+        def _infer_band_code(windows: list[dict]) -> str | None:
+            for w in windows:
+                start_raw = w.get("start") or w.get("start_iso")
+                if not start_raw:
+                    continue
+                hour = None
+                try:
+                    if "T" in start_raw:
+                        hour = datetime.fromisoformat(start_raw.replace("Z", "+00:00")).hour
+                    else:
+                        parts = start_raw.split(":")
+                        if parts:
+                            hour = int(parts[0])
+                except Exception:
+                    hour = None
+                if hour is None:
+                    continue
+                if 8 <= hour < 12:
+                    return "MORNING"
+                if 12 <= hour < 16:
+                    return "AFTERNOON"
+                if 16 <= hour < 21:
+                    return "EVENING"
+            return None
+
+        time_band_code = _infer_band_code(merged_windows)
+        if time_band_code is None and evening_only:
+            time_band_code = "EVENING"
+        if time_band_code is None:
+            time_band_code = "MORNING"
+
+        band_label_map = {
+            "MORNING": "mornings (8–11 AM)",
+            "AFTERNOON": "afternoons (12–4 PM)",
+            "EVENING": "evenings (5–8 PM)",
+        }
+        band_str = band_label_map.get(time_band_code, "your preferred time")
+
+        # Persist preferences to session/profile
+        sess["prefs.days"] = merged_days
+        sess["prefs.time_windows"] = merged_windows
+        sess["prefs.time_band"] = time_band_code
+        profile.setdefault("preferences", {})
+        profile["preferences"]["days"] = merged_days
+        profile["preferences"]["time_windows"] = merged_windows
+        profile["preferences"]["time_band"] = time_band_code
+
+        # Send confirmation with appropriate template
+        weekend_only_selection = merged_days and all(d in ["SAT", "SUN"] for d in merged_days)
+        if sess.get("_weekend_gate") and weekend_only_selection:
+            confirm = format_message(PREFS_CONFIRM_WITH_WEEKEND, days=days_str, band=band_str)
+        else:
+            confirm = format_message(PREFS_CONFIRM_DEFAULT, days=days_str, band=band_str)
         await mcp_wa_send(phone, confirm)
         _add_to_history(phone, bot_msg=confirm)
+        sess["_prefs_last_intent"] = prefs_intent
 
-        try:
-            idk = f"{volunteer_id}_PREFS_{int(time.time())}"
-            await mcp_preferences_save_v2(volunteer_id, prefs, sess.get("_policy_version"), idk)
-            # Clear partials (teaching preferences are separate from orientation scheduling)
-            sess.pop("_prefs_days", None)
-            sess.pop("_prefs_windows", None)
-            sess.pop("_prefs_last_prompt", None)
-            sess["state"] = "QA_WINDOW"
-            sess["ts"] = time.time()
-            SESSIONS[phone] = sess
-            log.info(f"[PREFS] Preferences saved, transitioning to QA_WINDOW for {phone}")
-            # Immediately trigger QA_WINDOW entry message
-            await _handle(phone, "__kick__")
-            return
-        except Exception as e:
-            log.warning(f"[PREFS] preferences.save failed: {e}")
-            msg = "Could you pick two weekdays (Mon–Fri)?" if not prefs["days"] else "Do mornings (8–11), afternoons (12–4), or evenings (5–8) work best?"
-            await mcp_wa_send(phone, msg)
-            _add_to_history(phone, bot_msg=msg)
-            # Persist partials for next turn
-            sess["_prefs_days"] = prefs.get("days")
-            sess["_prefs_windows"] = prefs.get("time_windows")
-            sess["ts"] = time.time(); SESSIONS[phone] = sess
-            return
+        # Advance to QA window
+        sess["state"] = "QA_WINDOW"
+        sess["_qa_count"] = 0
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+
+        await asyncio.sleep(0.5)
+        await _handle(phone, "__kick__")
+        return
 
     # ========== QA_WINDOW (Questions & Answers) ==========
     elif state == "QA_WINDOW":
@@ -2370,11 +2647,7 @@ async def _handle(phone: str, text: str):
         # Entry: send initial QA prompt
         if text == "__kick__":
             log.info(f"[QA] Sending QA entry message to {phone}")
-            entry_msg = (
-                f"Before we wrap up, do you have any quick questions for me? "
-                f"(training, certificate, subjects, tech setup…)\n\n"
-                f"I'll keep it short and clear. 🙂"
-            )
+            entry_msg = QA_ENTRY_PROMPT
             await mcp_wa_send(phone, entry_msg)
             _add_to_history(phone, bot_msg=entry_msg)
             sess["_qa_count"] = 0
@@ -2389,67 +2662,19 @@ async def _handle(phone: str, text: str):
         faq_bucket = None
         classifier_conf = None
         
-        # Check if user said "no" or "not now" to the QA entry question (before any schedule prompt)
-        if not sess.get("_qa_waiting_for_schedule_response"):
-            if is_no_response(text) or re.search(r"\b(not now|no questions|no questions?|nothing|no)\b", text_lower):
-                # User doesn't have questions - proceed to orientation scheduling
-                mandatory_msg = "This is the final segment — An orientation is mandatory for all volunteers. It's a quick 30-minute session to help you get started.\n\nShall we schedule your orientation?"
-                await mcp_wa_send(phone, mandatory_msg)
-                _add_to_history(phone, bot_msg=mandatory_msg)
-                sess["_qa_waiting_for_schedule_response"] = True
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
-                return
-        
-        # Check if user is responding to "Shall we schedule your orientation?" prompt
-        if sess.get("_qa_waiting_for_schedule_response"):
-            if is_yes_response(text):
-                # Transition to orientation consent
-                try:
-                    idk = f"{volunteer_id}_ORIENT_CONSENT_{int(time.time())}"
-                    await mcp_consent_record(volunteer_id, True)
-                    await mcp_state_advance(volunteer_id, "ORIENTATION_CONSENT", idk)
-                except Exception as e:
-                    log.warning(f"[QA] Orientation consent failed: {e}")
-                sess.pop("_qa_waiting_for_schedule_response", None)
-                sess["state"] = "ORIENTATION_CONSENT"
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
-                # Trigger next step
-                await _handle(phone, "__kick__")
-                return
-            elif is_no_response(text) or re.search(r"\b(not now|maybe later|later)\b", text_lower):
-                # User wants to defer orientation - but we should still note it's mandatory
-                # Defer orientation
-                until_date = datetime.now() + timedelta(days=5)
-                until_iso = until_date.isoformat()
-                idk = f"{volunteer_id}_QA_DEFER_{int(time.time())}"
-                try:
-                    await mcp_deferral_create(volunteer_id, "ORIENTATION_LATER", until_iso, idk)
-                    defer_msg = "No worries 😊 I can check back later. When should I remind you — Tue 10am, Thu 6pm, or Sat 10am?"
-                    await mcp_wa_send(phone, defer_msg)
-                    _add_to_history(phone, bot_msg=defer_msg)
-                    sess["state"] = "DEFERRED"
-                    sess.pop("_qa_waiting_for_schedule_response", None)
-                    sess["ts"] = time.time()
-                    SESSIONS[phone] = sess
-                    try:
-                        await mcp_telemetry_emit("onboarding.qa_deferral", {
-                            "conversation_id": phone,
-                            "user_id": volunteer_id,
-                            "qa_count": qa_count
-                        })
-                    except Exception:
-                        pass
-                    return
-                except Exception as e:
-                    log.warning(f"[QA] Deferral creation failed: {e}")
-                sess.pop("_qa_waiting_for_schedule_response", None)
-                # Fall through to treat as new question if deferral fails
+        # If user indicates they're done with questions, move directly to orientation scheduling
+        if is_no_response(text) or re.search(r"\b(not now|no questions|no questions?|nothing|no)\b", text_lower):
+            sess["state"] = "ORIENTATION_SLOT"
+            sess["ts"] = time.time()
+            sess.pop("_orientation_phase", None)
+            sess.pop("_orientation_slots", None)
+            SESSIONS[phone] = sess
+            await _handle(phone, "__kick__")
+            return
         
         # A) STOP / OPT-OUT
         if re.search(r"\b(stop|unsubscribe|don'?t message|no more messages)\b", text_lower):
-            ack = "Understood. I'll stop messages. If you change your mind, just say \"Hi\" here anytime. 💛"
+            ack = QA_STOP_ACK
             await mcp_wa_send(phone, ack)
             _add_to_history(phone, bot_msg=ack)
             sess["state"] = "OPTOUT"
@@ -2472,9 +2697,11 @@ async def _handle(phone: str, text: str):
             idk = f"{volunteer_id}_QA_DEFER_{int(time.time())}"
             try:
                 await mcp_deferral_create(volunteer_id, "ORIENTATION_LATER", until_iso, idk)
-                defer_msg = "No worries 😊 I can check back later. When should I remind you — Tue 10am, Thu 6pm, or Sat 10am?"
+                defer_msg = QA_DEFERRAL_PROMPT
                 await mcp_wa_send(phone, defer_msg)
                 _add_to_history(phone, bot_msg=defer_msg)
+                sess["_deferred_prev_state"] = state
+                sess["_deferred_reason"] = "ORIENTATION_LATER"
                 sess["state"] = "DEFERRED"
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
@@ -2510,42 +2737,27 @@ async def _handle(phone: str, text: str):
         faq_answers = {
             "about_serve": {
                 "pattern": r"\b(what is serve|who runs|government|ngo|organization)\b",
-                "answer": (
-                    "SERVE helps thousands of children learn English, Science, and Maths through volunteers like you. "
-                    "You teach online — they learn in school — and our local coordinators make sure everything runs smoothly."
-                )
+                "answer": QA_FAQ_ABOUT_SERVE
             },
             "time_process": {
                 "pattern": r"\b(hours?|time|how teach|online|travel|duration|how long)\b",
-                "answer": (
-                    "You'll teach live online while students sit in their school smart classroom.\n"
-                    "Usually ~2 hours/week."
-                )
+                "answer": QA_FAQ_TIME_PROCESS
             },
             "support": {
                 "pattern": r"\b(training|orientation|help|support|guidance|assistance)\b",
-                "answer": (
-                    "Yes! You'll attend a 30-min online orientation, and a local coordinator supports you during classes."
-                )
+                "answer": QA_FAQ_SUPPORT
             },
             "certificate": {
                 "pattern": r"\b(certificate|letter|proof|document|completion)\b",
-                "answer": (
-                    "We provide a volunteer certificate after you complete the required sessions as per policy."
-                )
+                "answer": QA_FAQ_CERTIFICATE
             },
             "subjects_grades": {
                 "pattern": r"\b(subject|grade|class|what (teach|teach)|math|english|science)\b",
-                "answer": (
-                    "Most volunteers teach English, Math or Science for grades 5–8 (varies by school).\n"
-                    "We'll align your preferences during scheduling."
-                )
+                "answer": QA_FAQ_SUBJECTS_GRADES
             },
             "tech": {
                 "pattern": r"\b(internet|wifi|laptop|phone|meet|zoom|google meet|tech|technical|device)\b",
-                "answer": (
-                    "A phone or laptop with stable internet is enough. We'll share the Meet link for sessions."
-                )
+                "answer": QA_FAQ_TECH
             }
         }
         
@@ -2562,20 +2774,15 @@ async def _handle(phone: str, text: str):
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
                 
-                # Timebox check: if >= 2 QAs, nudge forward
-                if qa_count >= 2:
-                    nudge = "Happy to answer more in orientation too 🙂\n\nBefore we proceed — orientation is mandatory for all volunteers. It's a quick 30-minute session to help you get started.\n\nShall we pick a slot now?"
-                    await mcp_wa_send(phone, nudge)
-                    _add_to_history(phone, bot_msg=nudge)
-                    sess["_qa_waiting_for_schedule_response"] = True
-                else:
-                    # Ask if they want to continue or schedule
-                    await asyncio.sleep(0.5)  # Small pause between FAQ answer and scheduling prompt
-                    continue_prompt = "Before we proceed — orientation is mandatory for all volunteers. It's a quick 30-minute session to help you get started.\n\nShall we schedule your orientation?"
-                    await mcp_wa_send(phone, continue_prompt)
-                    _add_to_history(phone, bot_msg=continue_prompt)
-                    sess["_qa_waiting_for_schedule_response"] = True
-                
+                await asyncio.sleep(0.5)
+                sess["state"] = "ORIENTATION_SLOT"
+                sess["ts"] = time.time()
+                sess.pop("_orientation_phase", None)
+                sess.pop("_orientation_slots", None)
+                SESSIONS[phone] = sess
+                await _handle(phone, "__kick__")
+                return
+
                 try:
                     await mcp_telemetry_emit("onboarding.qa_answered", {
                         "conversation_id": phone,
@@ -2630,18 +2837,15 @@ async def _handle(phone: str, text: str):
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             
-            # Timebox check
-            if qa_count >= 2:
-                nudge = "Happy to answer more in orientation too 🙂\n\nBefore we proceed — orientation is mandatory for all volunteers. It's a quick 30-minute session to help you get started.\n\nShall we pick a slot now?"
-                await mcp_wa_send(phone, nudge)
-                _add_to_history(phone, bot_msg=nudge)
-                sess["_qa_waiting_for_schedule_response"] = True
-            else:
-                continue_prompt = "Before we proceed — orientation is mandatory for all volunteers. It's a quick 30-minute session to help you get started.\n\nShall we schedule your orientation?"
-                await mcp_wa_send(phone, continue_prompt)
-                _add_to_history(phone, bot_msg=continue_prompt)
-                sess["_qa_waiting_for_schedule_response"] = True
-            
+            await asyncio.sleep(0.5)
+            sess["state"] = "ORIENTATION_SLOT"
+            sess["ts"] = time.time()
+            sess.pop("_orientation_phase", None)
+            sess.pop("_orientation_slots", None)
+            SESSIONS[phone] = sess
+            await _handle(phone, "__kick__")
+            return
+
             try:
                 await mcp_telemetry_emit("onboarding.qa_answered", {
                     "conversation_id": phone,
@@ -2666,24 +2870,146 @@ async def _handle(phone: str, text: str):
         SESSIONS[phone] = sess
         return
 
-    # ========== ORIENTATION_CONSENT (Entry & Slot Proposal) ==========
-    elif state == "ORIENTATION_CONSENT":
+    # ========== ORIENTATION_SLOT (Availability Capture & Slot Proposal) ==========
+    elif state == "ORIENTATION_SLOT":
         volunteer_id = profile.get("uuid") or phone
         name = profile.get("name") or "there"
         
-        log.info(f"[ORIENT] ORIENTATION_CONSENT handler triggered for {phone}, text='{text[:30]}...'")
+        log.info(f"[ORIENT] ORIENTATION_SLOT handler triggered for {phone}, text='{text[:30]}...'")
         
         # Entry: send ASK_AVAILABILITY message
         if text == "__kick__":
-            log.info(f"[ORIENT] Sending orientation availability request to {phone}")
-            await mcp_wa_send(phone, ASK_AVAILABILITY)
-            _add_to_history(phone, bot_msg=ASK_AVAILABILITY)
+            log.info(f"[ORIENT] Sending orientation intro to {phone}")
+            await mcp_wa_send(phone, ORIENT_INTRO)
+            _add_to_history(phone, bot_msg=ORIENT_INTRO)
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             return
         
         # User provided time slots - parse and propose slots
         text_lower = text.lower()
+
+        # Handle stop/opt-out requests
+        if re.search(r"\b(stop|unsubscribe|don'?t message|no more messages)\b", text_lower):
+            ack = QA_STOP_ACK
+            await mcp_wa_send(phone, ack)
+            _add_to_history(phone, bot_msg=ack)
+            sess["state"] = "OPTOUT"
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+
+        # Handle orientation deferral requests (quick heuristic before LLM)
+        if re.search(r"\b(later|next week|not today|busy|remind|check back)\b", text_lower):
+            until_date = datetime.now() + timedelta(days=5)
+            until_iso = until_date.isoformat()
+            idk = f"{volunteer_id}_QA_DEFER_{int(time.time())}"
+            try:
+                await mcp_deferral_create(volunteer_id, "ORIENTATION_LATER", until_iso, idk)
+                defer_msg = ORIENT_LATER_NOTE
+                await mcp_wa_send(phone, defer_msg)
+                _add_to_history(phone, bot_msg=defer_msg)
+                sess["state"] = "DEFERRED"
+                sess["orientation_pending"] = True
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                try:
+                    await mcp_telemetry_emit("onboarding.qa_deferral", {
+                        "conversation_id": phone,
+                        "user_id": volunteer_id,
+                        "qa_count": sess.get("_qa_count", 0)
+                    })
+                except Exception:
+                    pass
+                return
+            except Exception as e:
+                log.warning(f"[ORIENT] Deferral creation failed: {e}")
+
+        # LLM classification for orientation intents
+        llm_intent = None
+        llm_conf = 0.0
+        llm_tone = ""
+        try:
+            llm_context = build_llm_context(
+                "ORIENTATION_SLOT",
+                sess,
+                last_prompt=ORIENT_INTRO,
+            )
+            llm_result = await mcp_llm_classify_intent(text, "ORIENTATION_SLOT", llm_context)
+            llm_intent = (llm_result.get("intent") or "").upper()
+            llm_conf = float(llm_result.get("confidence") or 0.0)
+            llm_tone = llm_result.get("tone_reply") or ""
+        except Exception as e:
+            log.warning(f"[ORIENT] LLM classification failed: {e}")
+
+        accept_llm = False
+        if llm_intent:
+            accept_llm = llm_conf >= 0.6
+            if not accept_llm and llm_intent == "ORIENT_LATER_OR_DEFERRAL" and llm_conf >= 0.35:
+                accept_llm = True
+
+        async def _send_and_track(message: str):
+            await mcp_wa_send(phone, message)
+            _add_to_history(phone, bot_msg=message)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+
+        if accept_llm and llm_intent:
+            if llm_intent == "ORIENT_LATER_OR_DEFERRAL":
+                reply = llm_tone or ORIENT_LATER_NOTE
+                await _send_and_track(reply)
+                until_date = datetime.now() + timedelta(days=5)
+                until_iso = until_date.isoformat()
+                idk = f"{volunteer_id}_ORIENT_DEFER_{int(time.time())}"
+                try:
+                    await mcp_deferral_create(volunteer_id, "ORIENTATION_LATER", until_iso, idk)
+                except Exception as e:
+                    log.warning(f"[ORIENT] Deferral creation via LLM intent failed: {e}")
+                sess["state"] = "DEFERRED"
+                sess["orientation_pending"] = True
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                try:
+                    await mcp_telemetry_emit("onboarding.qa_deferral", {
+                        "conversation_id": phone,
+                        "user_id": volunteer_id,
+                        "qa_count": sess.get("_qa_count", 0),
+                        "source": "llm"
+                    })
+                except Exception:
+                    pass
+                return
+
+            if llm_intent == "ORIENT_FAQ":
+                reply = llm_tone or QA_MANDATORY_ORIENT
+                await _send_and_track(reply)
+                return
+
+            if llm_intent == "ORIENT_INVALID_PICK":
+                reply = llm_tone or ORIENT_INVALID_PICK
+                await _send_and_track(reply)
+                return
+
+            if llm_intent == "ORIENT_AMBIGUOUS":
+                reply = llm_tone or "Would you like me to suggest a couple of slots based on your availability?"
+                await _send_and_track(reply)
+                return
+
+            if llm_intent == "ORIENT_PICK_OPTION":
+                if llm_tone:
+                    await _send_and_track(llm_tone)
+                sess["state"] = "ORIENTATION_SCHEDULING"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                await _handle(phone, text)
+                return
+
+            if llm_intent != "ORIENT_PROVIDE_PREFERENCES":
+                # Unknown intent even after acceptance – fall through to parsing
+                log.info(f"[ORIENT] Accepted LLM intent {llm_intent} but no handler; falling back to parsing.")
+            else:
+                if llm_tone:
+                    await _send_and_track(llm_tone)
         
         # Parse time slots from user input (LLM-first + deterministic), always include time.parse_options
         slots_parsed = []
@@ -2736,7 +3062,6 @@ async def _handle(phone: str, text: str):
             first_slot = slots_parsed[0] if isinstance(slots_parsed[0], dict) else {}
             start_time = (first_slot.get("start") or first_slot.get("start_iso") or "") if isinstance(first_slot, dict) else ""
             try:
-                from datetime import datetime
                 if start_time and "T" in start_time:
                     dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
                     inferred_hour = dt.hour
@@ -2785,7 +3110,6 @@ async def _handle(phone: str, text: str):
         unique_seed_days: list[str] = []
         for iso_str in (seed_times_iso or []):
             try:
-                from datetime import datetime
                 dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
                 iso_day = ["MON","TUE","WED","THU","FRI","SAT","SUN"][dt.weekday()]
                 if iso_day not in unique_seed_days:
@@ -2803,6 +3127,10 @@ async def _handle(phone: str, text: str):
 
         # Call slots.propose for orientation (seed takes precedence server-side)
         try:
+            ack_msg = ORIENT_AVAILABILITY_ACK
+            await mcp_wa_send(phone, ack_msg)
+            _add_to_history(phone, bot_msg=ack_msg)
+
             log.info(f"[ORIENT] Proposing orientation slots for {phone}, seeds={seed_times_iso or seed_time_iso}, days={days_whitelist}")
             slots_result = await mcp_slots_propose(
                 volunteer_id,
@@ -2815,27 +3143,34 @@ async def _handle(phone: str, text: str):
             
             if not slots_result or not isinstance(slots_result, dict):
                 log.warning(f"[ORIENT] slots_propose returned invalid result: {slots_result}")
-                await mcp_wa_send(phone, SLOT_NONE_OF_ABOVE)
-                _add_to_history(phone, bot_msg=SLOT_NONE_OF_ABOVE)
+                await mcp_wa_send(phone, ORIENT_PROPOSAL_ERROR)
+                _add_to_history(phone, bot_msg=ORIENT_PROPOSAL_ERROR)
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
                 return
             
             slots = slots_result.get("slots", [])
             if not slots:
-                await mcp_wa_send(phone, SLOT_NONE_OF_ABOVE)
-                _add_to_history(phone, bot_msg=SLOT_NONE_OF_ABOVE)
+                await mcp_wa_send(phone, ORIENT_PROPOSAL_NO_SLOTS)
+                _add_to_history(phone, bot_msg=ORIENT_PROPOSAL_NO_SLOTS)
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
                 return
+            
+            # Keep at most two options for a simple choice
+            slots = list(slots[:2])
             
             # Store slots in session for next state
             sess["_orientation_slots"] = slots
             sess["_orientation_slots_raw"] = slots_result
             
             # Format and send slot options
-            slot_options_text = format_slot_options(slots)
-            confirm_msg = format_message(CONFIRM_SLOT_TEMPLATE, slot_options=slot_options_text)
+            option_lines = []
+            for idx, slot in enumerate(slots[:2], start=1):
+                label = slot.get("label", f"Option {idx}")
+                option_lines.append(f"{idx}️⃣ {label}")
+            options_text = "\n".join(option_lines) if option_lines else "1️⃣ Option 1"
+            confirm_msg = format_message(ORIENT_SHOW_OPTIONS, options=options_text)
             await mcp_wa_send(phone, confirm_msg)
             _add_to_history(phone, bot_msg=confirm_msg)
             
@@ -2848,11 +3183,27 @@ async def _handle(phone: str, text: str):
             
         except Exception as e:
             log.error(f"[ORIENT] Failed to propose slots: {e}", exc_info=True)
-            await mcp_wa_send(phone, "Sorry, I couldn't find available slots right now. Could you try again with different times?")
-            _add_to_history(phone, bot_msg="Sorry, I couldn't find available slots right now. Could you try again with different times?")
+            await mcp_wa_send(phone, ORIENT_PROPOSAL_ERROR)
+            _add_to_history(phone, bot_msg=ORIENT_PROPOSAL_ERROR)
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             return
+
+    # ========== DEFERRED (Waiting for volunteer to return) ==========
+    elif state == "DEFERRED":
+        prev_state = sess.pop("_deferred_prev_state", None) or "WELCOME"
+        reason = sess.pop("_deferred_reason", None)
+
+        if prev_state == "PREFS_DAYTIME":
+            sess.pop("_prefs_evening_attempts", None)
+
+        sess["state"] = prev_state
+        sess["ts"] = time.time()
+        sess.pop("_last_msg_text", None)
+        sess.pop("_last_msg_ts", None)
+        SESSIONS[phone] = sess
+        await _handle(phone, text)
+        return
 
     # ========== ORIENTATION_SCHEDULING (Slot Selection & Booking) ==========
     elif state == "ORIENTATION_SCHEDULING":
@@ -2864,7 +3215,7 @@ async def _handle(phone: str, text: str):
         slots = sess.get("_orientation_slots", [])
         if not slots:
             log.warning(f"[SCHED] No slots found in session for {phone}, asking for availability again")
-            sess["state"] = "ORIENTATION_CONSENT"
+            sess["state"] = "ORIENTATION_SLOT"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             await _handle(phone, "__kick__")
@@ -2900,7 +3251,6 @@ async def _handle(phone: str, text: str):
                 # Check if user mentioned time that matches
                 if slot_start:
                     try:
-                        from datetime import datetime
                         dt = datetime.fromisoformat(slot_start.replace("Z", "+00:00"))
                         time_str = dt.strftime("%I:%M %p").lower()
                         if time_str.split()[0] in text_lower or time_str.split()[1] in text_lower:
@@ -2912,8 +3262,8 @@ async def _handle(phone: str, text: str):
         
         # If no slot selected, ask for clarification
         if not selected_slot:
-            await mcp_wa_send(phone, CONFIRM_SLOT_INVALID)
-            _add_to_history(phone, bot_msg=CONFIRM_SLOT_INVALID)
+            await mcp_wa_send(phone, ORIENT_INVALID_PICK)
+            _add_to_history(phone, bot_msg=ORIENT_INVALID_PICK)
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             return
@@ -2922,8 +3272,8 @@ async def _handle(phone: str, text: str):
         slot_id = selected_slot.get("slot_id") or selected_slot.get("id")
         if not slot_id:
             log.error(f"[SCHED] Selected slot has no ID: {selected_slot}")
-            await mcp_wa_send(phone, "Sorry, there was an issue with that slot. Please pick another one.")
-            _add_to_history(phone, bot_msg="Sorry, there was an issue with that slot. Please pick another one.")
+            await mcp_wa_send(phone, ORIENT_SLOT_UNAVAILABLE)
+            _add_to_history(phone, bot_msg=ORIENT_SLOT_UNAVAILABLE)
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             return
@@ -2937,23 +3287,23 @@ async def _handle(phone: str, text: str):
             
             if not hold_id:
                 log.error(f"[SCHED] Failed to hold slot {slot_id}: {hold_result}")
-                await mcp_wa_send(phone, "Sorry, that slot is no longer available. Please pick another one.")
-                _add_to_history(phone, bot_msg="Sorry, that slot is no longer available. Please pick another one.")
+                await mcp_wa_send(phone, ORIENT_SLOT_UNAVAILABLE)
+                _add_to_history(phone, bot_msg=ORIENT_SLOT_UNAVAILABLE)
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
                 return
             
             # Book the slot
             log.info(f"[SCHED] Booking slot with hold_id {hold_id} for {phone}")
-            await mcp_wa_send(phone, CONFIRM_BOOKING)
-            _add_to_history(phone, bot_msg=CONFIRM_BOOKING)
+            await mcp_wa_send(phone, ORIENT_BOOKING_CONFIRM)
+            _add_to_history(phone, bot_msg=ORIENT_BOOKING_CONFIRM)
             
             booking_result = await mcp_slot_book(hold_id)
             
             if not booking_result or not isinstance(booking_result, dict):
                 log.error(f"[SCHED] Failed to book slot: {booking_result}")
-                await mcp_wa_send(phone, "Sorry, I couldn't complete the booking. Please try again or contact support.")
-                _add_to_history(phone, bot_msg="Sorry, I couldn't complete the booking. Please try again or contact support.")
+                await mcp_wa_send(phone, ORIENT_BOOKING_FAILURE)
+                _add_to_history(phone, bot_msg=ORIENT_BOOKING_FAILURE)
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
                 return
@@ -2970,7 +3320,7 @@ async def _handle(phone: str, text: str):
             sess.pop("_orientation_slots_raw", None)
             
             # Book and finish
-            await _book_slot_and_finish(phone, chosen_slot, profile, name)
+            await _book_slot_and_finish(phone, chosen_slot, profile, name, send_orientation_confirm=True)
             
             # Transition to final state (could be DONE or COMPLETE)
             sess["state"] = "COMPLETE"
