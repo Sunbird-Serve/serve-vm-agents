@@ -61,7 +61,7 @@ WELCOME_CONSENT_REMINDER = """Quick reminder — shall we continue with the onbo
 ELIGIBILITY_INTRO = """Lovely!
 Quick one — you're 18 or older, right?"""
 
-ELIGIBILITY_Q1 = """Perfect! And you have a smartphone or laptop with internet?"""
+ELIGIBILITY_Q1 = """Perfect! Since the classes are live online, do you have a smartphone or laptop with a fairly stable internet connection?"""
 
 ELIGIBILITY_Q2 = """Great — that's all we need. Most volunteers give about 2 hours a week; comfortable for you?"""
 
@@ -89,7 +89,9 @@ ELIGIBILITY_AGE_UNCLEAR = """I didn't quite catch that. Could you confirm: are y
 ELIGIBILITY_UNDERAGE_DECLINE = """Thanks for your enthusiasm 💛
 At the moment, SERVE is open to adults (18+). Once you turn 18, I'll be happy to help you start your volunteering journey. 🌟"""
 
-ELIGIBILITY_DEVICE_PROMPT = """Thank you! Do you have a smartphone or laptop and a stable internet connection to join the live classes?"""
+ELIGIBILITY_AGE_ACK = """Awesome! Thanks for confirming, {name}! 😊"""
+
+ELIGIBILITY_DEVICE_PROMPT = """Since the classes are live online, do you have a smartphone or laptop with a fairly stable internet connection?"""
 
 ELIGIBILITY_DEVICE_CLARIFY = """Could you clarify, {name}? Do you have a smartphone or laptop with internet access?"""
 
@@ -104,7 +106,9 @@ ELIGIBILITY_DEVICE_REASK = """No problem. Could you confirm if you have a smartp
 
 ELIGIBILITY_DEVICE_OK = """Great! 👍"""
 
-ELIGIBILITY_COMMIT_PROMPT = """And would you be able to contribute around 2 hours a week for teaching? We're flexible with days, but a minimum of 2 hours weekly is needed to keep classes consistent for the children.
+ELIGIBILITY_DEVICE_ACK = """Great! Thanks for confirming your device is ready, {name}!"""
+
+ELIGIBILITY_COMMIT_PROMPT = """Children learn best when their teacher is consistent 😊 Can you give at least 2 hours a week so we can plan the kids' sessions well with you?
 """
 
 ELIGIBILITY_COMMIT_CLARIFY = """Could you confirm: can you spare around 2 hours per week for teaching?"""
@@ -129,6 +133,16 @@ ELIGIBILITY_DECLINE_REQUIREMENTS = """Thanks for your interest! Right now, the t
 
 ELIGIBILITY_DECLINE_GENERIC = """Thanks for your interest! Right now, we need volunteers who meet all requirements."""
 
+ELIGIBILITY_SUMMARY = """Lovely, thank you for sharing 💛
+
+So far I’ve noted: you’re {age_phrase}, have a working device & internet, and can give about {commitment_phrase} a week.
+
+Next, let’s find when you’re usually free on weekdays."""
+
+ELIGIBILITY_AGE_DEVICE_FALLBACK = """Awesome! Just one more quick check — do you have a smartphone or laptop with a fairly stable internet connection?"""
+
+ELIGIBILITY_DEVICE_COMMIT_FALLBACK = """Great! One last thing — can you spare about 2 hours a week so we can plan lessons with you?"""
+
 
 # ---------- Section 3: Teaching Preferences ----------
 ASK_TEACHING_PREF = """What would you love to teach? You can type it in one line, like "Math for Grade 6 in Hindi." """
@@ -150,24 +164,22 @@ Example: "Math for Grade 8 in Tamil" """
 
 
 # ---------- Section 4: Teaching Preferences (continued) ----------
-PREFS_PROMPT = """What days usually work for you to take class?
-You can pick 2–3 days (e.g., Mon, Wed, Sat) — or just type what suits you."""
+PREFS_INTRO_COLLAB = """Let’s find a rhythm that works for you and the students 🌱
 
-PREFS_WEEKEND_NOTE = """\n\nNote: Weekends are reserved — weekdays are best."""
+Which 2–3 weekdays usually suit you? And do mornings, lunch hours, or early afternoons feel better?"""
 
-PREFS_COMBINED_CLARIFIER = """Could you pick 2–3 days (e.g., Mon, Wed) and a time band — Morning (8–11) or Afternoon (12–4)?"""
+PREFS_FOLLOWUP_DAYS = """Beautiful. Which weekdays would you lean on? You can name 2–3 that feel realistic."""
 
-PREFS_ASK_TIME = """Great. Do mornings (8AM –11AM) or afternoons (12PM–3PM) work best in IST?"""
+PREFS_FOLLOWUP_TIME = """Lovely! Do mornings, lunchtime, or early afternoon fit you best on those days?"""
 
-PREFS_ASK_DAYS = """Could you pick two weekdays (Mon–Fri)?"""
+PREFS_WEEKEND_NOTE = """Got it! Weekends are mostly shut in schools. Could we try picking any weekday slots that might work?"""
 
-PREFS_CONFIRM_WITH_WEEKEND = """I’ve noted {days}, though weekends are limited in your region. I’ll prioritize weekdays in {band} IST. 👍"""
+PREFS_EVENING_NUDGE = """Thanks for sharing. Most classroom slots wrap by 4 PM — is there any morning, lunch, or early afternoon window that could fit you?"""
 
-PREFS_CONFIRM_DEFAULT = """Noted 👍 I’ll look for {days} in {band} IST."""
+PREFS_CONFIRM_DEFAULT = """Nice! I’ll note {days} in {band} and plan around that."""
 
-PREFS_SAVE_FALLBACK_NO_DAYS = """Could you pick two weekdays (Mon–Fri)?"""
+PREFS_SUMMARY_FALLBACK = """Brilliant — {days_label} in {band_label} should work well for the students."""
 
-PREFS_SAVE_FALLBACK_NO_TIME = """Do mornings (8–11), afternoons (12–4), or evenings (5–8) work best?"""
 
 PREFS_EVENING_POLICY = (
     "Most of our school sessions run between 8 AM and 4 PM IST. "
@@ -200,6 +212,10 @@ QA_NUDGE = QA_MANDATORY_ORIENT
 QA_DEFERRAL_PROMPT = """No worries 😊 I can check back later. When should I remind you — Tue 10am, Thu 6pm, or Sat 10am?"""
 
 QA_STOP_ACK = """Understood. I'll stop messages. If you change your mind, just say "Hi" here anytime. 💛"""
+
+QA_SUMMARY_WITH_QUESTIONS = """Loved your questions — I'm glad we could cover them. Next, let's fix your quick orientation slot so you're all set."""
+
+QA_SUMMARY_NO_QUESTIONS = """Perfect, you're all set. Let's get your quick orientation slot confirmed so you're ready to teach."""
 
 QA_FAQ_ABOUT_SERVE = """SERVE helps thousands of children learn English, Science, and Maths through volunteers like you. You teach online — they learn in school — and our local coordinators make sure everything runs smoothly."""
 

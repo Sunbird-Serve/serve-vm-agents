@@ -1,10 +1,10 @@
 """
-WhatsApp Onboarding Agent - MCP Orchestrator Client
+WhatsApp Onboarding Agent - client-led orchestrator
 
 This agent handles volunteer onboarding via WhatsApp with:
-- MCP server-led orchestration for all conversation flow
-- Pure orchestrator client: calls onboarding.next and executes returned instructions
-- No local fallback logic: server controls all conversation and business logic
+- Client-owned state machine, prompts, and branching
+- MCP tools for classification, retrieval, and scheduling support
+- No dependency on onboarding.next; all conversation logic lives in the client
 """
 import asyncio
 import re
@@ -15,6 +15,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 import httpx
+import jsonschema
+from jsonschema import ValidationError
 
 from .config import settings
 from .messages import (
@@ -23,10 +25,11 @@ from .messages import (
     ELIGIBILITY_INTRO, ELIGIBILITY_Q1, ELIGIBILITY_Q2, ELIGIBILITY_Q3,
     ELIGIBILITY_INVALID_RESPONSE, REJECTED, ELIGIBILITY_PASSED,
     ELIGIBILITY_AGE_PROMPT, ELIGIBILITY_AGE_UNCLEAR, ELIGIBILITY_UNDERAGE_DECLINE,
+    ELIGIBILITY_AGE_ACK,
     ELIGIBILITY_DEVICE_PROMPT, ELIGIBILITY_DEVICE_CLARIFY,
     ELIGIBILITY_DEVICE_DEFERRAL, ELIGIBILITY_DEVICE_DEFERRAL_CONFIRM,
     ELIGIBILITY_DEVICE_DEFERRAL_FALLBACK, ELIGIBILITY_DEVICE_REASK,
-    ELIGIBILITY_DEVICE_OK,
+    ELIGIBILITY_DEVICE_OK, ELIGIBILITY_DEVICE_ACK,
     ASK_TEACHING_PREF, CONFIRM_TEACHING_PREF, EDIT_TEACHING_PREF, TEACHING_PREF_UNCLEAR,
     ASK_AVAILABILITY, CONSTRAINTS_ANNOUNCE, AVAILABILITY_PARSE_FAILED,
     BOOKING_IN_PROGRESS, DONE, ALREADY_DONE, RESTARTING,
@@ -34,10 +37,11 @@ from .messages import (
     ELIGIBILITY_COMMIT_CLARIFY, ELIGIBILITY_COMMIT_POLICY, ELIGIBILITY_COMMIT_SUCCESS,
     ELIGIBILITY_PREFERENCES_PROMPT, ELIGIBILITY_PREFERENCES_WEEKEND_NOTE,
     ELIGIBILITY_COMMIT_PERSUADE, ELIGIBILITY_COMMIT_DEFERRAL, ELIGIBILITY_COMMIT_DEFERRAL_CONFIRM,
-    ELIGIBILITY_DECLINE_REQUIREMENTS, ELIGIBILITY_DECLINE_GENERIC,
-    PREFS_PROMPT, PREFS_WEEKEND_NOTE, PREFS_COMBINED_CLARIFIER, PREFS_ASK_TIME,
-    PREFS_ASK_DAYS, PREFS_CONFIRM_WITH_WEEKEND, PREFS_CONFIRM_DEFAULT,
-    PREFS_SAVE_FALLBACK_NO_DAYS, PREFS_SAVE_FALLBACK_NO_TIME,
+    ELIGIBILITY_DECLINE_REQUIREMENTS, ELIGIBILITY_DECLINE_GENERIC, ELIGIBILITY_SUMMARY,
+    PREFS_INTRO_COLLAB, PREFS_FOLLOWUP_DAYS, PREFS_FOLLOWUP_TIME,
+    PREFS_WEEKEND_NOTE, PREFS_EVENING_NUDGE, PREFS_CONFIRM_DEFAULT, PREFS_SUMMARY_FALLBACK,
+    QA_SUMMARY_WITH_QUESTIONS, QA_SUMMARY_NO_QUESTIONS,
+    PREFS_EVENING_POLICY, PREFS_EVENING_DEFERRAL,
     QA_ENTRY_PROMPT, QA_MANDATORY_ORIENT, QA_CONTINUE_PROMPT, QA_NUDGE,
     QA_DEFERRAL_PROMPT, QA_STOP_ACK,
     QA_FAQ_ABOUT_SERVE, QA_FAQ_TIME_PROCESS, QA_FAQ_SUPPORT,
@@ -48,7 +52,7 @@ from .messages import (
     ORIENT_PROPOSAL_ERROR, ORIENT_SLOT_UNAVAILABLE,
     ORIENT_BOOKING_CONFIRM, ORIENT_BOOKING_FAILURE,
     YES_WORDS, NO_WORDS, MAYBE_LATER, CONFIRM_WORDS, EDIT_WORDS,
-    format_message, format_subjects_list, PREFS_EVENING_POLICY, PREFS_EVENING_DEFERRAL
+    format_message, format_subjects_list
 )
 from .validators import is_yes_response, is_no_response, normalize_phone
 from .faq import looks_like_question, retrieve, compose_answer
@@ -257,6 +261,130 @@ async def _mcp_call(tool_name: str, arguments: dict, timeout: int = 15) -> dict:
         raise
 
 
+# ---------- LLM Helpers ----------
+async def _llm_call_messages(
+    messages: list[dict], *, temperature: float = 0.2, max_tokens: int = 200, timeout: int = 15
+) -> dict:
+    payload = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+    return await _mcp_call("llm.call", payload, timeout=timeout)
+
+
+INTENT_RESPONSE_SCHEMA = {
+    "type": "object",
+    "required": ["intent", "confidence"],
+    "properties": {
+        "intent": {"type": "string"},
+        "confidence": {"type": ["number", "string"]},
+        "tone_reply": {"type": ["string", "null"]},
+    },
+}
+
+PREFS_INTERPRET_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "preferred_days": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "preferred_time_band": {"type": ["string", "null"]},
+        "followup": {"type": ["string", "null"]},
+        "followup_tag": {"type": ["string", "null"]},
+        "deferral": {
+            "anyOf": [
+                {"type": "null"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string"},
+                        "until_iso": {"type": "string"},
+                    },
+                    "required": ["message", "until_iso"],
+                    "additionalProperties": False,
+                },
+            ]
+        },
+        "topics": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+async def _llm_call_structured(
+    messages: list[dict],
+    *,
+    schema: dict,
+    temperature: float = 0.2,
+    max_tokens: int = 200,
+    timeout: int = 15,
+) -> dict:
+    payload = {
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "response_format": "json",
+    }
+    result = await _mcp_call("llm.call", payload, timeout=timeout)
+    raw = _extract_llm_text(result)
+    if not raw:
+        raise ValueError("LLM returned empty response")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"LLM response is not valid JSON: {raw}") from exc
+    try:
+        jsonschema.validate(parsed, schema)
+    except ValidationError as exc:
+        if isinstance(parsed, dict) and schema.get("properties"):
+            allowed_keys = set(schema["properties"].keys())
+            pruned = {k: v for k, v in parsed.items() if k in allowed_keys}
+            if pruned != parsed:
+                try:
+                    jsonschema.validate(pruned, schema)
+                    parsed = pruned
+                except ValidationError as inner_exc:
+                    raise ValueError(f"LLM response failed schema validation after pruning: {inner_exc.message}") from inner_exc
+            else:
+                raise ValueError(f"LLM response failed schema validation: {exc.message}") from exc
+        else:
+            raise ValueError(f"LLM response failed schema validation: {exc.message}") from exc
+    return parsed
+
+
+def _extract_llm_text(result: dict) -> str:
+    if not isinstance(result, dict):
+        return ""
+    content = result.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
+                return item["text"]
+    for key in ("reply", "tone_reply", "text", "message"):
+        value = result.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def _sanitize_llm_message(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    cleaned = text.strip().strip('"').strip()
+    if "The enhanced reply" in cleaned:
+        cleaned = cleaned.split("The enhanced reply", 1)[0].strip()
+    lines: list[str] = []
+    for line in cleaned.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("-", "•", "*")):
+            continue
+        lines.append(stripped)
+    cleaned = " ".join(lines) if lines else cleaned
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
 # ---------- MCP Tool Wrappers ----------
 def _wa_sanitize(text: str) -> str:
     """Best-effort sanitize to avoid server-side encoding issues (temporary guard)."""
@@ -274,11 +402,6 @@ def _wa_sanitize(text: str) -> str:
 async def mcp_wa_send(to: str, text: str):
     """Send WhatsApp message via MCP"""
     return await _mcp_call("wa.send_message", {"to": to, "text": _wa_sanitize(text)}, timeout=10)
-
-async def mcp_llm_generate_reply(prompt: str, context: str = ""):
-    """Generate LLM reply via MCP"""
-    return await _mcp_call("llm.generate_reply", {"prompt": prompt, "context": context}, timeout=15)
-
 
 async def mcp_time_parse(text: str, duration=60, tz="Asia/Kolkata"):
     """Parse time options via MCP (fallback for complex parsing)"""
@@ -400,6 +523,182 @@ def _commitment_meets_thresholds(extracted_info: dict) -> tuple[bool, bool]:
     return False, near_miss
 
 
+def _format_weekly_hours(hours: float | int | None) -> str | None:
+    try:
+        if hours is None:
+            return None
+        value = float(hours)
+    except (TypeError, ValueError):
+        return None
+
+    if value <= 0:
+        return None
+
+    rounded = round(value)
+    if abs(value - rounded) < 0.01:
+        return f"{int(rounded)} hours"
+    return f"{value:.1f} hours"
+
+
+def _build_eligibility_summary(sess: dict, commitment_hours: float | int | None) -> str | None:
+    if not sess.get("elig.age") or not sess.get("elig.device"):
+        return None
+
+    age_val = sess.get("elig.age_value")
+    age_phrase = None
+    if isinstance(age_val, (int, float)) and age_val >= 18:
+        rounded_age = round(age_val)
+        if abs(age_val - rounded_age) < 0.5:
+            age_phrase = f"{int(rounded_age)}+"
+        else:
+            age_phrase = f"{age_val:.0f}+"
+
+    if not age_phrase:
+        age_phrase = "18+"
+
+    hours_phrase = _format_weekly_hours(commitment_hours or sess.get("elig.commitment_hours"))
+    if not hours_phrase:
+        return None
+
+    return format_message(
+        ELIGIBILITY_SUMMARY,
+        age_phrase=age_phrase,
+        commitment_phrase=hours_phrase,
+    )
+
+
+async def _generate_eligibility_summary_phone(
+    phone: str,
+    sess: dict,
+    profile: dict,
+    *,
+    commit_hours: float | int | None,
+    volunteer_name: str | None = None,
+) -> str | None:
+    """Deterministic eligibility summary renderer."""
+    return _build_eligibility_summary(sess, commit_hours)
+
+
+async def _generate_prefs_summary_phone(
+    phone: str,
+    sess: dict,
+    profile: dict,
+    *,
+    volunteer_name: str | None,
+    days: list[str],
+    time_band: str | None,
+    days_label: str,
+    band_label: str,
+) -> str | None:
+    """Deterministic acknowledgement of captured preferences."""
+    if not days or not time_band:
+        return None
+
+    fallback = format_message(
+        PREFS_SUMMARY_FALLBACK,
+        days_label=days_label,
+        band_label=band_label,
+    )
+    return fallback
+
+
+async def _generate_qa_summary_phone(
+    phone: str,
+    profile: dict,
+    *,
+    volunteer_name: str | None,
+    had_questions: bool,
+    topics: list[str],
+) -> str | None:
+    """Deterministic reflection before orientation."""
+    return QA_SUMMARY_WITH_QUESTIONS if had_questions else QA_SUMMARY_NO_QUESTIONS
+
+
+async def _send_orientation_summary(phone: str, sess: dict, profile: dict):
+    """Send summary before moving into orientation scheduling."""
+    if sess.get("_qa_summary_sent"):
+        return
+
+    topics = sess.get("_qa_topics") or []
+    had_questions = bool(topics) or bool(sess.get("_qa_count", 0))
+
+    summary_msg = await _generate_qa_summary_phone(
+        phone=phone,
+        profile=profile,
+        volunteer_name=profile.get("name"),
+        had_questions=had_questions,
+        topics=list(topics),
+    )
+
+    if summary_msg:
+        await asyncio.sleep(0.3)
+        await mcp_wa_send(phone, summary_msg)
+        _add_to_history(phone, bot_msg=summary_msg)
+
+    sess["_qa_summary_sent"] = True
+    sess.pop("_qa_topics", None)
+
+
+async def _generate_prefs_interpretation(
+    phone: str,
+    profile: dict,
+    volunteer_name: str | None,
+    text: str,
+    sess: dict,
+) -> dict:
+    """Use LLM to interpret availability reply; return structured hints + follow-up text."""
+    fallback = {
+        "days": [],
+        "time_band": None,
+        "followup": None,
+        "followup_tag": None,
+        "deferral": None,
+        "topics": [],
+    }
+
+    try:
+        messages: list[dict] = [
+            {"role": "system", "content": MASTER_SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": (
+                    "You interpret availability replies. Return strict JSON with keys: preferred_days (array of ISO weekday strings), "
+                    "preferred_time_band (MORNING/AFTERNOON/EVENING or null), followup (string or null), followup_tag (string or null), "
+                    "deferral (object with keys message and until_iso or null), topics (array)."
+                ),
+            },
+        ]
+        messages += FEW_SHOT_EXAMPLES.get("PREFS_INTERPRET", [])
+        user_prompt = json.dumps(
+            {
+                "volunteer_name": volunteer_name or profile.get("name") or "there",
+                "existing_days": sess.get("_prefs_days", []),
+                "existing_time_band": sess.get("_prefs_time_band"),
+                "user_text": text,
+            },
+            ensure_ascii=False,
+        )
+        payload = await _llm_call_structured(
+            messages + [{"role": "user", "content": user_prompt}],
+            schema=PREFS_INTERPRET_RESPONSE_SCHEMA,
+            temperature=0.2,
+            max_tokens=220,
+            timeout=12,
+        )
+        interpretation = {
+            "days": payload.get("preferred_days") or [],
+            "time_band": payload.get("preferred_time_band"),
+            "deferral": payload.get("deferral"),
+            "topics": payload.get("topics") or [],
+            "followup": payload.get("followup"),
+            "followup_tag": payload.get("followup_tag"),
+        }
+        return interpretation
+    except Exception as e:
+        log.warning(f"[PREFS_INTERPRET] LLM interpretation failed: {e}")
+    return fallback
+
+
 async def generate_persuasive_response(phone: str, user_input: str, context_type: str = "class_timing") -> str:
     """
     Generate a contextual, empathetic persuasion response using LLM via MCP.
@@ -496,35 +795,36 @@ async def handle_smart_welcome_from_registration(phone: str, registration_data: 
         source = registration_data.get('source', 'our platform')
         preferences = registration_data.get('preferences', 'none')
         
-        prompt = f"""Create a personalized welcome message for a new volunteer who just registered.
+        messages = [
+            {"role": "system", "content": MASTER_SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": (
+                    "Write a short (2-3 sentence) personalized WhatsApp welcome message for a new volunteer who just registered."
+                ),
+            },
+        ]
+        messages += FEW_SHOT_EXAMPLES.get("SMART_WELCOME", [])
 
-Registration Data:
-- Name: {name}
-- Registration source: {source}
-- Any preferences mentioned: {preferences}
+        user_prompt = json.dumps(
+            {
+                "name": name,
+                "source": source,
+                "preferences": preferences,
+            },
+            ensure_ascii=False,
+        )
 
-Create a warm welcome message that:
-1. Thanks them for registering and explicitly mentions this is the onboarding process
-2. Uses their name personally
-3. If they mentioned preferences, acknowledge them specifically
-4. Explains what happens next (onboarding steps)
-5. Sets positive expectations about teaching children
-6. Invites them to ask onboarding-related questions anytime (FAQ welcome)
+        result = await _llm_call_messages(messages + [{"role": "user", "content": user_prompt}], max_tokens=180, timeout=12)
 
-Tone: Warm, professional, encouraging
-Length: 2-3 sentences
-Keep it conversational and personal"""
-
-        result = await mcp_llm_generate_reply(prompt, "registration_welcome")
-        
-        if result and "content" in result and len(result["content"]) > 0:
-            welcome_msg = result["content"][0]["text"]
+        welcome_msg = _sanitize_llm_message(_extract_llm_text(result))
+        if welcome_msg:
             log.info(f"[SMART_WELCOME] Generated personalized welcome for {name}")
             return welcome_msg
-        else:
-            log.warning(f"[SMART_WELCOME] LLM response invalid, using default")
-            return format_message(WELCOME, name=name)
-            
+
+        log.warning(f"[SMART_WELCOME] LLM response invalid, using default")
+        return format_message(WELCOME, name=name)
+     
     except Exception as e:
         log.error(f"[SMART_WELCOME] Failed to generate personalized welcome: {e}")
         return format_message(WELCOME, name=registration_data.get('name', 'Volunteer'))
@@ -813,65 +1113,61 @@ async def mcp_llm_classify_intent(text: str, state: str, context: dict) -> dict:
         ] + few_shots + [
             {"role": "user", "content": user_prompt},
         ]
-        result = await _mcp_call("llm.call", {"messages": messages, "temperature": 0.2, "max_tokens": 200}, timeout=15)
+        parsed = await _llm_call_structured(
+            messages,
+            schema=INTENT_RESPONSE_SCHEMA,
+            temperature=0.2,
+            max_tokens=200,
+            timeout=15,
+        )
 
-        content = result.get("content") or result.get("message") or result.get("text", "")
-        if isinstance(content, str):
-            try:
-                parsed = json.loads(content)
-            except Exception:
-                parsed = None
+        intent = str(parsed.get("intent", "AMBIGUOUS") or "").upper()
+        confidence_raw = parsed.get("confidence", 0.0)
+        try:
+            confidence = float(confidence_raw)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
 
-            if isinstance(parsed, dict):
-                intent = str(parsed.get("intent", "AMBIGUOUS") or "").upper()
-                confidence_raw = parsed.get("confidence", 0.0)
-                try:
-                    confidence = float(confidence_raw)
-                except (TypeError, ValueError):
-                    confidence = 0.0
-                confidence = max(0.0, min(1.0, confidence))
+        tone_reply = parsed.get("tone_reply")
+        if not isinstance(tone_reply, str):
+            tone_reply = ""
 
-                tone_reply = parsed.get("tone_reply")
-                if not isinstance(tone_reply, str):
-                    tone_reply = ""
+        if state == "WELCOME" and intent not in WELCOME_ALLOWED_INTENTS:
+            intent = "AMBIGUOUS"
 
-                if state == "WELCOME" and intent not in WELCOME_ALLOWED_INTENTS:
-                    intent = "AMBIGUOUS"
+        if state == "ELIGIBILITY_PART1" and intent not in ELIGIBILITY_PART1_ALLOWED_INTENTS:
+            intent = "AMBIGUOUS"
 
-                if state == "ELIGIBILITY_PART1" and intent not in ELIGIBILITY_PART1_ALLOWED_INTENTS:
-                    intent = "AMBIGUOUS"
+        if state == "ELIGIBILITY_PART1" and confidence < 0.6:
+            if intent.startswith("AGE_"):
+                intent = "AGE_UNCLEAR"
+            elif intent.startswith("DEVICE_"):
+                intent = "DEVICE_UNCLEAR"
+            elif intent == "DEFERRAL":
+                intent = "AMBIGUOUS"
 
-                if state == "ELIGIBILITY_PART1" and confidence < 0.6:
-                    if intent.startswith("AGE_"):
-                        intent = "AGE_UNCLEAR"
-                    elif intent.startswith("DEVICE_"):
-                        intent = "DEVICE_UNCLEAR"
-                    elif intent == "DEFERRAL":
-                        intent = "AMBIGUOUS"
+        if state == "ELIGIBILITY_PART2" and intent not in ELIGIBILITY_PART2_ALLOWED_INTENTS:
+            intent = "AMBIGUOUS"
 
-                if state == "ELIGIBILITY_PART2" and intent not in ELIGIBILITY_PART2_ALLOWED_INTENTS:
-                    intent = "AMBIGUOUS"
+        if state == "ELIGIBILITY_PART2" and confidence < 0.7:
+            if intent == "COMMIT_OK":
+                intent = "COMMIT_UNSURE"
+            elif intent in {"COMMIT_TOO_LOW", "COMMIT_NO", "DEFERRAL"}:
+                pass
+            else:
+                intent = "AMBIGUOUS"
 
-                if state == "ELIGIBILITY_PART2" and confidence < 0.7:
-                    if intent == "COMMIT_OK":
-                        intent = "COMMIT_UNSURE"
-                    elif intent in {"COMMIT_TOO_LOW", "COMMIT_NO", "DEFERRAL"}:
-                        pass
-                    else:
-                        intent = "AMBIGUOUS"
+        if state == "PREFS_DAYTIME" and intent not in PREFS_DAYTIME_ALLOWED_INTENTS:
+            intent = "PREFS_AMBIGUOUS"
 
-                if state == "PREFS_DAYTIME" and intent not in PREFS_DAYTIME_ALLOWED_INTENTS:
-                    intent = "PREFS_AMBIGUOUS"
+        if state == "PREFS_DAYTIME" and confidence < 0.5:
+            intent = "PREFS_AMBIGUOUS"
 
-                if state == "PREFS_DAYTIME" and confidence < 0.5:
-                    intent = "PREFS_AMBIGUOUS"
+        if "intent" not in parsed:
+            intent = "AMBIGUOUS"
 
-                if "intent" not in parsed:
-                    intent = "AMBIGUOUS"
-
-                return {"intent": intent, "confidence": confidence, "tone_reply": tone_reply}
-
-        return {"intent": "AMBIGUOUS", "confidence": 0.0, "tone_reply": ""}
+        return {"intent": intent, "confidence": confidence, "tone_reply": tone_reply}
     except Exception as e:
         log.warning(f"[LLM] Intent classification failed: {e}")
         return {"intent": "AMBIGUOUS", "confidence": 0.0, "tone_reply": ""}
@@ -938,58 +1234,6 @@ Generate a warm, concise answer (2-4 lines) using the snippets above. End with '
         log.warning(f"[LLM] QA generation failed: {e}")
         return ""
 
-
-# ---------- MCP Orchestrator (Server-led policy) ----------
-def _build_session_snapshot(sess: dict) -> dict:
-    try:
-        return {
-            "state": sess.get("state"),
-            "profile": sess.get("profile", {}),
-            "ts": sess.get("ts"),
-        }
-    except Exception:
-        return {"state": sess.get("state"), "profile": {}}
-
-
-async def mcp_onboarding_next(session_snapshot: dict, user_text: str, locale: str = "en-IN") -> dict:
-    return await _mcp_call(
-        "onboarding.next",
-        {"session": session_snapshot, "user_text": user_text, "locale": locale},
-        timeout=15,
-    )
-
-
-async def _execute_mcp_calls(calls: list[dict]):
-    if not calls:
-        return
-    for c in calls:
-        try:
-            tool = (c.get("tool") or "").strip()
-            args = c.get("args") or {}
-            if tool == "consent.record":
-                await mcp_consent_record(args.get("volunteerId"), bool(args.get("consentGiven")))
-            elif tool == "eligibility.check":
-                await mcp_eligibility_check(args.get("ageYears"), args.get("hasDevice"), args.get("weeklyCommitmentHours"))
-            elif tool == "preferences.save":
-                await mcp_preferences_save(args.get("volunteerId"), args.get("timeBand"))
-            elif tool == "slots.propose":
-                await mcp_slots_propose(args.get("volunteerId"), args.get("timeBand"), args.get("daysWhitelist"), args.get("limit", 2))
-            elif tool == "slot.hold":
-                await mcp_slot_hold(args.get("slotId"))
-            elif tool == "slot.book":
-                await mcp_slot_book(args.get("holdId"))
-            elif tool == "reminder.create":
-                await mcp_reminder_create(args.get("when_ISO"), args.get("reason"), args.get("volunteerId"))
-            elif tool == "telemetry.emit":
-                await mcp_telemetry_emit(args.get("event", "onboarding.event"), args.get("payload") or {})
-            elif tool == "calendar.create_event":
-                await mcp_calendar_create(
-                    args.get("title"), args.get("start_iso"), args.get("end_iso"), args.get("attendees") or [], args.get("timezone", "Asia/Kolkata"), args.get("notes")
-                )
-            elif tool == "wa.send_message":
-                await mcp_wa_send(args.get("to"), args.get("text", ""))
-        except Exception as e:
-            log.warning(f"[ORCH] Failed call {c}: {e}")
 
 # ---------- SK Kernel Setup ----------
 async def _get_sk_kernel():
@@ -1185,8 +1429,8 @@ async def _reask_pending_question(phone: str, state: str, sess: dict) -> bool:
     elif state == "PREFS_DAYTIME":
         prompt_text = sess.get("_prefs_last_prompt_text")
         if not prompt_text:
-            prompt_text = PREFS_COMBINED_CLARIFIER
-            sess["_prefs_last_prompt"] = "ask_days"
+            prompt_text = PREFS_INTRO_COLLAB
+            sess["_prefs_last_prompt"] = "intro"
             sess["_prefs_last_prompt_text"] = prompt_text
 
     if not prompt_text:
@@ -1261,7 +1505,7 @@ async def start_onboarding(phone: str, name: str = "Volunteer", registration_dat
         "profile": {
             "name": name,
             "registration_data": registration_data,
-            "uuid": None,
+            "uuid": phone,
             "eligibility": {
                 "q1_commitment": None,
                 "q2_age": None,
@@ -1312,7 +1556,7 @@ async def _handle(phone: str, text: str):
             "profile": {
                 "name": "Volunteer",
                 "registration_data": None,
-                "uuid": None,
+                "uuid": phone,
                 "eligibility": {
                     "q1_commitment": None,
                     "q2_age": None,
@@ -1497,54 +1741,49 @@ async def _handle(phone: str, text: str):
             if _detect_deferral(text):
                 intent_detected = "DEFERRAL"
             # 2) CONSENT_YES
-            elif _detect_consent_yes(text) or is_yes_response(text):
-                intent_detected = "CONSENT_YES"
-            # 3) CONSENT_NO
-            elif _detect_consent_no(text) or is_no_response(text):
-                intent_detected = "CONSENT_NO"
-            # 4) QUERY (FAQ)
-            elif _detect_query(text):
-                intent_detected = "QUERY"
-            # 5) RETURNING
-            elif _detect_returning(text):
-                intent_detected = "RETURNING"
-            # 6) STOP / OPT-OUT
-            elif _detect_stop(text):
-                intent_detected = "STOP"
-            # 7) AMBIGUOUS
-            elif _detect_ambiguous(text):
-                intent_detected = "AMBIGUOUS"
-            # 8) Check unified parse as fallback
             else:
+                # 2) Check simple consent heuristics
+                if _detect_consent_yes(text) or is_yes_response(text):
+                    intent_detected = "CONSENT_YES"
+                elif _detect_consent_no(text) or is_no_response(text):
+                    intent_detected = "CONSENT_NO"
+                # 3) High-confidence parser consent
+                # 4) STOP / OPT-OUT
+                if intent_detected is None and _detect_stop(text):
+                    intent_detected = "STOP"
+                # 5) DEFERRAL
+                elif intent_detected is None and _detect_deferral(text):
+                    intent_detected = "DEFERRAL"
+                # 6) RETURNING
+                elif intent_detected is None and _detect_returning(text):
+                    intent_detected = "RETURNING"
+                # 7) QUERY (FAQ)
+                elif intent_detected is None and _detect_query(text):
+                    intent_detected = "QUERY"
+
+            # LLM fallback only if still unknown
+            if intent_detected is None:
                 try:
-                    cobj = (parsed.get("consent") or {}) if parsed else {}
-                    cval = (cobj.get("value") or "").lower()
-                    if cval in ["yes", "agreed", "okay", "sure"]:
-                        intent_detected = "CONSENT_YES"
-                    elif cval in ["no", "declined", "not interested"]:
-                        intent_detected = "CONSENT_NO"
-                except Exception:
-                    pass
-            
-            # LLM Fallback if still unclear
-            if intent_detected is None or intent_detected == "AMBIGUOUS":
-                log.info(f"[GREET] Calling LLM fallback for intent classification")
-                llm_called = True
-                llm_context = build_llm_context("WELCOME", sess, last_prompt=WELCOME_SERVE_OVERVIEW)
-                llm_result = await mcp_llm_classify_intent(text, "WELCOME", llm_context)
-                llm_intent = (llm_result.get("intent") or "AMBIGUOUS").upper()
-                llm_conf = float(llm_result.get("confidence") or 0.0)
+                    log.info(f"[GREET] Calling LLM fallback for intent classification")
+                    llm_context = build_llm_context("WELCOME", sess, last_prompt=WELCOME_SERVE_OVERVIEW)
+                    llm_result = await mcp_llm_classify_intent(text, "WELCOME", llm_context)
+                    llm_intent = (llm_result.get("intent") or "").upper()
+                    llm_conf = float(llm_result.get("confidence") or 0.0)
 
-                accept_llm = llm_conf >= 0.70
-                if not accept_llm and llm_intent == "DEFERRAL" and llm_conf >= 0.30:
-                    accept_llm = True
-
-                if accept_llm:
-                    intent_detected = llm_intent
-                    log.info(f"[GREET] LLM classified intent: {intent_detected} (confidence: {llm_conf})")
-                else:
+                    if llm_conf >= 0.7:
+                        intent_detected = llm_intent
+                        llm_called = True
+                        log.info(f"[GREET] LLM classified intent: {intent_detected} (confidence: {llm_conf})")
+                    elif llm_intent == "DEFERRAL" and llm_conf >= 0.3:
+                        intent_detected = "DEFERRAL"
+                        llm_called = True
+                    else:
+                        log.info(f"[GREET] LLM confidence ({llm_conf}) too low, treating as AMBIGUOUS")
+                        intent_detected = "AMBIGUOUS"
+                        llm_called = True
+                except Exception as e:
+                    log.warning(f"[GREET] LLM classification failed: {e}")
                     intent_detected = "AMBIGUOUS"
-                    log.info(f"[GREET] LLM confidence ({llm_conf}) too low for intent={llm_intent}, treating as AMBIGUOUS")
             
             # Generate idempotency key for this turn
             idempotency_key = f"{volunteer_id}_{intent_detected}_{int(time.time())}"
@@ -1554,9 +1793,8 @@ async def _handle(phone: str, text: str):
                 # Record consent and advance state
                 try:
                     await mcp_consent_record(volunteer_id, True)
-                    await mcp_state_advance(volunteer_id, "to_ELIGIBILITY_PART1", idempotency_key)
                 except Exception as e:
-                    log.warning(f"[GREET] Failed to record consent/advance state: {e}")
+                    log.warning(f"[GREET] Failed to record consent: {e}")
                 
                 # Move to eligibility and send question immediately
                 sess["state"] = "ELIGIBILITY_PART1"
@@ -1734,11 +1972,7 @@ async def _handle(phone: str, text: str):
                 return
                 
             else:  # AMBIGUOUS or unknown
-                # Use LLM tone_reply if available, else default
-                if llm_result and llm_result.get("tone_reply"):
-                    unclear = llm_result["tone_reply"]
-                else:
-                    unclear = f"I think you're leaning towards continuing. If you'd like, I can start your onboarding now — or I can check back later. What works for you, {name}?"
+                unclear = f"I think you're leaning towards continuing. If you'd like, I can start your onboarding now — or I can check back later. What works for you, {name}?"
                 
                 await mcp_wa_send(phone, unclear)
                 _add_to_history(phone, bot_msg=unclear)
@@ -1780,8 +2014,6 @@ async def _handle(phone: str, text: str):
                 # User replied to age question
                 age_ok = None
                 age_value = None
-                age_ack_reply = None
-
                 # Primary source: onboarding.parse_message (LLM extraction)
                 try:
                     hints = parsed.get("eligibility") or {} if parsed else {}
@@ -1813,17 +2045,11 @@ async def _handle(phone: str, text: str):
                         )
                         llm_result = await mcp_llm_classify_intent(text, "ELIGIBILITY_PART1", llm_context)
                         llm_intent = (llm_result.get("intent") or "").upper()
-                        llm_tone = llm_result.get("tone_reply") or ""
-
                         if llm_intent == "AGE_OK":
                             age_ok = True
-                            age_ack_reply = llm_tone
                         elif llm_intent == "AGE_UNDER":
                             age_ok = False
                         elif llm_intent in {"AGE_UNCLEAR", "AMBIGUOUS", "QUERY"}:
-                            if llm_tone:
-                                await mcp_wa_send(phone, llm_tone)
-                                _add_to_history(phone, bot_msg=llm_tone)
                             unclear_msg = ELIGIBILITY_AGE_UNCLEAR
                             await mcp_wa_send(phone, unclear_msg)
                             _add_to_history(phone, bot_msg=unclear_msg)
@@ -1860,22 +2086,25 @@ async def _handle(phone: str, text: str):
                         pass
                     return
 
-                # Age OK → optional acknowledgement then move to device question
-                if age_ack_reply:
-                    await mcp_wa_send(phone, age_ack_reply)
-                    _add_to_history(phone, bot_msg=age_ack_reply)
-
                 sess["elig.age"] = True
                 sess["elig.age_value"] = age_value if age_value else 18
+                profile_elig = profile.setdefault("eligibility", {})
+                profile_elig["q2_age"] = True
+                if age_value is not None:
+                    profile_elig["age_years"] = age_value
                 sess["_eligibility_step"] = "device"
                 sess["_eligibility_device_asked"] = True
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
 
+                name = profile.get("name") or "Volunteer"
+                ack_line = format_message(ELIGIBILITY_AGE_ACK, name=name).strip()
+                device_prompt = format_message(ELIGIBILITY_DEVICE_PROMPT, name=name).strip()
+                transition_msg = f"{ack_line}\n\n{device_prompt}"
+
                 await asyncio.sleep(0.5)
-                device_msg = ELIGIBILITY_DEVICE_PROMPT
-                await mcp_wa_send(phone, device_msg)
-                _add_to_history(phone, bot_msg=device_msg)
+                await mcp_wa_send(phone, transition_msg)
+                _add_to_history(phone, bot_msg=transition_msg)
                 return
 
         # Q2 - Device check (second question)
@@ -1890,7 +2119,6 @@ async def _handle(phone: str, text: str):
                 return
             else:
                 has_device = None
-                device_ack_reply = None
                 llm_suggests_deferral = False
 
                 try:
@@ -1932,21 +2160,15 @@ async def _handle(phone: str, text: str):
                         )
                         llm_result = await mcp_llm_classify_intent(text, "ELIGIBILITY_PART1", llm_context)
                         llm_intent = (llm_result.get("intent") or "").upper()
-                        llm_tone = llm_result.get("tone_reply") or ""
 
                         if llm_intent == "DEVICE_OK":
                             has_device = True
-                            device_ack_reply = llm_tone
                         elif llm_intent == "DEVICE_NO":
                             has_device = False
                         elif llm_intent == "DEFERRAL":
                             has_device = False
                             llm_suggests_deferral = True
-                            device_ack_reply = llm_tone
                         elif llm_intent in {"DEVICE_UNCLEAR", "AMBIGUOUS", "QUERY"}:
-                            if llm_tone:
-                                await mcp_wa_send(phone, llm_tone)
-                                _add_to_history(phone, bot_msg=llm_tone)
                             followup_msg = format_message(ELIGIBILITY_DEVICE_CLARIFY, name=name)
                             await mcp_wa_send(phone, followup_msg)
                             _add_to_history(phone, bot_msg=followup_msg)
@@ -1965,10 +2187,6 @@ async def _handle(phone: str, text: str):
                     return
 
                 if has_device is False:
-                    if device_ack_reply:
-                        await mcp_wa_send(phone, device_ack_reply)
-                        _add_to_history(phone, bot_msg=device_ack_reply)
-
                     deferral_msg = format_message(ELIGIBILITY_DEVICE_DEFERRAL, name=name)
                     await mcp_wa_send(phone, deferral_msg)
                     _add_to_history(phone, bot_msg=deferral_msg)
@@ -1980,24 +2198,25 @@ async def _handle(phone: str, text: str):
                         sess["_eligibility_from_llm_deferral"] = True
                     return
 
-                if device_ack_reply:
-                    await mcp_wa_send(phone, device_ack_reply)
-                    _add_to_history(phone, bot_msg=device_ack_reply)
-
                 sess["elig.device"] = True
-                ok_msg = ELIGIBILITY_DEVICE_OK
-                await mcp_wa_send(phone, ok_msg)
-                _add_to_history(phone, bot_msg=ok_msg)
+                profile_elig = profile.setdefault("eligibility", {})
+                profile_elig["q3_device"] = True
+                if has_device not in (None, True, False) and isinstance(has_device, str):
+                    profile_elig["device_type"] = has_device
 
                 sess["state"] = "ELIGIBILITY_PART2"
                 sess["_eligibility_part2_sent"] = True
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
 
+                name = profile.get("name") or "Volunteer"
+                ack_line = format_message(ELIGIBILITY_DEVICE_ACK, name=name).strip()
+                commit_prompt = ELIGIBILITY_COMMIT_PROMPT.strip()
+                transition_msg = f"{ack_line}\n\n{commit_prompt}"
+
                 await asyncio.sleep(0.5)
-                commitment_msg = ELIGIBILITY_COMMIT_PROMPT
-                await mcp_wa_send(phone, commitment_msg)
-                _add_to_history(phone, bot_msg=commitment_msg)
+                await mcp_wa_send(phone, transition_msg)
+                _add_to_history(phone, bot_msg=transition_msg)
                 return
     
     # ========== ELIGIBILITY (PART 2: commitment with persuasion) ==========
@@ -2021,7 +2240,6 @@ async def _handle(phone: str, text: str):
             commit_ok = None
             same_day_request = False
             llm_commit_intent = None
-            llm_commit_reply = ""
 
             try:
                 hints = parsed.get("eligibility") or {} if parsed else {}
@@ -2079,7 +2297,6 @@ async def _handle(phone: str, text: str):
                     )
                     llm_result = await mcp_llm_classify_intent(text, "ELIGIBILITY_PART2", llm_context)
                     llm_commit_intent = (llm_result.get("intent") or "").upper()
-                    llm_commit_reply = llm_result.get("tone_reply") or ""
                 except Exception as e:
                     log.warning(f"[ELIG] Commitment LLM fallback failed: {e}")
 
@@ -2106,9 +2323,6 @@ async def _handle(phone: str, text: str):
             elif llm_commit_intent == "COMMIT_NO":
                 commit_ok = False
             elif llm_commit_intent == "QUERY":
-                if llm_commit_reply:
-                    await mcp_wa_send(phone, llm_commit_reply)
-                    _add_to_history(phone, bot_msg=llm_commit_reply)
                 clarifier = ELIGIBILITY_COMMIT_CLARIFY
                 await mcp_wa_send(phone, clarifier)
                 _add_to_history(phone, bot_msg=clarifier)
@@ -2116,9 +2330,6 @@ async def _handle(phone: str, text: str):
                 SESSIONS[phone] = sess
                 return
             elif llm_commit_intent == "AMBIGUOUS":
-                if llm_commit_reply:
-                    await mcp_wa_send(phone, llm_commit_reply)
-                    _add_to_history(phone, bot_msg=llm_commit_reply)
                 clarifier = ELIGIBILITY_COMMIT_CLARIFY
                 await mcp_wa_send(phone, clarifier)
                 _add_to_history(phone, bot_msg=clarifier)
@@ -2206,10 +2417,6 @@ async def _handle(phone: str, text: str):
                 commit_ok = commit_hours >= 2.0
                 log.info(f"[ELIG] Commit_ok set from hours: {commit_hours} >= 2.0 = {commit_ok}")
 
-            if commit_ok is False and llm_commit_reply and llm_commit_intent in {"COMMIT_TOO_LOW", "COMMIT_UNSURE"}:
-                await mcp_wa_send(phone, llm_commit_reply)
-                _add_to_history(phone, bot_msg=llm_commit_reply)
-
             if llm_commit_intent == "DEFERRAL" or sess.get("_commitment_llm_deferral"):
                 deferral_msg = format_message(ELIGIBILITY_COMMIT_DEFERRAL, name=name)
                 await mcp_wa_send(phone, deferral_msg)
@@ -2241,10 +2448,29 @@ async def _handle(phone: str, text: str):
                 if commit_hours is None:
                     commit_hours = 2.0
 
-                # Send acknowledgement tone before moving ahead
-                if llm_commit_reply:
-                    await mcp_wa_send(phone, llm_commit_reply)
-                    _add_to_history(phone, bot_msg=llm_commit_reply)
+                # Parse any availability hints in the same message
+                eligibility_days = []
+                eligibility_windows = []
+                try:
+                    if parsed:
+                        if isinstance(parsed.get("days"), list):
+                            eligibility_days = [d for d in parsed["days"] if isinstance(d, str)]
+                        if isinstance(parsed.get("time_windows"), list):
+                            for w in parsed["time_windows"]:
+                                if isinstance(w, dict) and w.get("start") and w.get("end"):
+                                    eligibility_windows.append({"start": w["start"], "end": w["end"]})
+                except Exception:
+                    pass
+                if eligibility_days:
+                    sess.setdefault("_prefs_days", [])
+                    for d in eligibility_days:
+                        if d not in sess["_prefs_days"]:
+                            sess["_prefs_days"].append(d)
+                if eligibility_windows:
+                    sess.setdefault("_prefs_windows", [])
+                    for w in eligibility_windows:
+                        if w not in sess["_prefs_windows"]:
+                            sess["_prefs_windows"].append(w)
 
                 sess["elig.commitment"] = True
                 sess["elig.commitment_hours"] = commit_hours
@@ -2266,6 +2492,22 @@ async def _handle(phone: str, text: str):
                     success_msg = ELIGIBILITY_COMMIT_SUCCESS
                     await mcp_wa_send(phone, success_msg)
                     _add_to_history(phone, bot_msg=success_msg)
+
+                    summary_msg = None
+                    if not sess.get("_elig_summary_sent"):
+                        summary_msg = await _generate_eligibility_summary_phone(
+                            phone,
+                            sess,
+                            profile,
+                            commit_hours=commit_hours,
+                            volunteer_name=profile.get("name"),
+                        )
+
+                    if summary_msg:
+                        await asyncio.sleep(0.4)
+                        await mcp_wa_send(phone, summary_msg)
+                        _add_to_history(phone, bot_msg=summary_msg)
+                        sess["_elig_summary_sent"] = True
 
                     # Mark profile eligibility snapshot
                     profile.setdefault("eligibility", {})
@@ -2316,320 +2558,161 @@ async def _handle(phone: str, text: str):
 
     # ========== PREFS_DAYTIME (Day & Time Preferences) ==========
     elif state == "PREFS_DAYTIME":
-        prefs_intent = None
-        tone_reply = ""
-        if text != "__kick__":
-            try:
-                llm_context = build_llm_context(
-                    "PREFS_DAYTIME",
-                    sess,
-                    last_prompt=sess.get("_prefs_last_prompt_text")
-                )
-                llm_result = await mcp_llm_classify_intent(text, "PREFS_DAYTIME", llm_context)
-                prefs_intent = (llm_result.get("intent") or "").upper()
-                tone_reply = llm_result.get("tone_reply") or ""
-            except Exception as e:
-                log.debug(f"[PREFS] LLM classify failed: {e}")
-
-        # Parse user reply for days and times (LLM-first merge)
-        text_lower = text.lower()
-        llm_days = []
-        llm_windows = []
-        try:
-            if parsed:
-                if isinstance(parsed.get("days"), list):
-                    llm_days = [d for d in parsed.get("days") if isinstance(d, str)]
-                if isinstance(parsed.get("time_windows"), list):
-                    for w in parsed.get("time_windows"):
-                        if isinstance(w, dict) and w.get("start") and w.get("end"):
-                            llm_windows.append({"start": w.get("start"), "end": w.get("end")})
-        except Exception:
-            pass
-        day_map = {"mon":"MON","monday":"MON","tue":"TUE","tues":"TUE","tuesday":"TUE","wed":"WED","weds":"WED","wednesday":"WED","thu":"THU","thur":"THU","thurs":"THU","thursday":"THU","fri":"FRI","friday":"FRI","sat":"SAT","saturday":"SAT","sun":"SUN","sunday":"SUN"}
-        days_found = list(llm_days) if llm_days else []
-        for token, iso in day_map.items():
-            if re.search(rf"\b{re.escape(token)}\b", text_lower):
-                if iso not in days_found:
-                    days_found.append(iso)
-        if re.search(r"\bweekdays?\b", text_lower):
-            for iso in ["MON","TUE","WED","THU","FRI"]:
-                if iso not in days_found:
-                    days_found.append(iso)
-        if re.search(r"\bweekends?\b", text_lower):
-            for iso in ["SAT","SUN"]:
-                if iso not in days_found:
-                    days_found.append(iso)
-        days_capped = days_found[:3] if days_found else []
-
-        # Time bands and exact time
-        time_windows = list(llm_windows) if llm_windows else []
-        def add_window(start:str, end:str):
-            time_windows.append({"start": start, "end": end})
-        if re.search(r"\bmorn(ing)?\b", text_lower):
-            add_window("08:00","11:00")
-        if re.search(r"\bafternoon\b|\bnoon\b", text_lower):
-            add_window("12:00","16:00")
-        if re.search(r"\beve(ning)?\b", text_lower):
-            add_window("17:00","20:00")
-        m12 = re.search(r"\b(1[0-2]|0?[1-9]):?([0-5]?\d)?\s*(am|pm)\b", text_lower)
-        m24 = re.search(r"\b([01]?\d|2[0-3]):?([0-5]?\d)\b", text_lower)
-        def expand_around(hour:int, minute:int=0):
-            start_h = max(8, hour-1); end_h = min(20, hour+2)
-            return f"{start_h:02d}:{minute:02d}", f"{end_h:02d}:{minute:02d}"
-        if m12:
-            h = int(m12.group(1)); mm = int(m12.group(2) or 0); ap = m12.group(3)
-            if ap == "pm" and h != 12: h += 12
-            if ap == "am" and h == 12: h = 0
-            s,e = expand_around(h, mm); add_window(s,e)
-        elif m24:
-            h = int(m24.group(1)); mm = int(m24.group(2) or 0)
-            s,e = expand_around(h, mm); add_window(s,e)
-
-        prev_days = sess.get("_prefs_days") or []
-        prev_windows = sess.get("_prefs_windows") or []
-        merged_days = days_capped or prev_days or []
-        merged_windows = time_windows or prev_windows or []
-        have_days = bool(merged_days)
-        have_windows = bool(merged_windows)
-        weekend_only = have_days and all(d in ["SAT","SUN"] for d in merged_days) and not any(d in ["MON","TUE","WED","THU","FRI"] for d in merged_days)
-        evening_only = False
-        window_hours: list[int] = []
-        for w in time_windows:
-            start_raw = w.get("start") or w.get("start_iso")
-            if not start_raw:
-                continue
-            hour_val = None
-            try:
-                if "T" in start_raw:
-                    hour_val = datetime.fromisoformat(start_raw.replace("Z", "+00:00")).hour
-                else:
-                    parts = start_raw.split(":")
-                    if parts:
-                        hour_val = int(parts[0])
-            except Exception:
-                hour_val = None
-            if hour_val is not None:
-                window_hours.append(hour_val)
-
-        if window_hours and all(h >= 16 for h in window_hours):
-            evening_only = True
-        elif not window_hours:
-            if re.search(r"after\s*(4|5|6|7|8)\s*(pm)?", text_lower) or re.search(r"post\s*4\s*pm", text_lower) or "evening" in text_lower or "night" in text_lower:
-                evening_only = True
-
-        if prefs_intent == "PREFS_DAYS_AND_TIME_OK" and (not have_days or not have_windows):
-            prefs_intent = "PREFS_AMBIGUOUS"
-        if prefs_intent == "PREFS_DAYS_ONLY" and not have_days:
-            prefs_intent = "PREFS_AMBIGUOUS"
-        if prefs_intent == "PREFS_TIME_ONLY" and not have_windows:
-            prefs_intent = "PREFS_AMBIGUOUS"
-        if prefs_intent == "PREFS_WEEKEND_ONLY" and not weekend_only:
-            prefs_intent = "PREFS_AMBIGUOUS"
-        if prefs_intent == "PREFS_EVENING_ONLY" and not evening_only:
-            prefs_intent = "PREFS_AMBIGUOUS"
-        if evening_only and prefs_intent not in {"PREFS_EVENING_ONLY", "PREFS_LATER_OR_DEFERRAL"}:
-            prefs_intent = "PREFS_EVENING_ONLY"
-
-        if prefs_intent is None and text != "__kick__":
-            if have_days and have_windows:
-                prefs_intent = "PREFS_DAYS_AND_TIME_OK"
-            elif have_days:
-                prefs_intent = "PREFS_DAYS_ONLY"
-            elif have_windows:
-                prefs_intent = "PREFS_TIME_ONLY"
-            else:
-                prefs_intent = "PREFS_AMBIGUOUS"
-
-        if merged_days:
-            sess["_prefs_days"] = merged_days
-        if merged_windows:
-            sess["_prefs_windows"] = merged_windows
-
-        async def send_message(msg: str, last_key: str | None = None):
-            if not msg:
-                return
-            await mcp_wa_send(phone, msg)
-            _add_to_history(phone, bot_msg=msg)
-            if last_key:
-                sess["_prefs_last_prompt"] = last_key
-            sess["_prefs_last_prompt_text"] = msg
-
-        if prefs_intent == "PREFS_FAQ":
-            if tone_reply:
-                await send_message(tone_reply, sess.get("_prefs_last_prompt"))
-            outstanding_key = None
-            if not have_days:
-                outstanding_key = "ask_days"
-            elif not have_windows:
-                outstanding_key = "ask_time"
-            if not tone_reply and outstanding_key:
-                followup = PREFS_ASK_DAYS if outstanding_key == "ask_days" else PREFS_ASK_TIME
-                await send_message(followup, outstanding_key)
-            elif outstanding_key:
-                sess["_prefs_last_prompt"] = outstanding_key
+        if text == "__kick__" or not sess.get("_prefs_prompted"):
+            await mcp_wa_send(phone, PREFS_INTRO_COLLAB)
+            _add_to_history(phone, bot_msg=PREFS_INTRO_COLLAB)
+            sess["_prefs_prompted"] = True
+            sess.setdefault("_prefs_days", [])
+            sess.setdefault("_prefs_time_band", None)
+            sess["_prefs_evening_attempts"] = 0
+            sess["_prefs_last_prompt"] = "intro"
+            sess["_prefs_last_prompt_text"] = PREFS_INTRO_COLLAB
             sess["ts"] = time.time(); SESSIONS[phone] = sess
             return
 
-        if prefs_intent == "PREFS_LATER_OR_DEFERRAL":
-            message = tone_reply or "Absolutely 😊 Share your preferred days and timings whenever you're ready, and I'll pick it up from there."
-            await send_message(message, None)
-            sess["_prefs_followup_pending"] = True
-            sess["ts"] = time.time(); SESSIONS[phone] = sess
-            return
+        interpretation = await _generate_prefs_interpretation(
+            phone=phone,
+            profile=profile,
+            volunteer_name=profile.get("name"),
+            text=text,
+            sess=sess,
+        )
 
-        if prefs_intent == "PREFS_WEEKEND_ONLY":
-            message = tone_reply or "Thanks for letting me know 🙏 Most school sessions run on weekdays so the children have support during class hours. Could you share 1–2 weekday slots that might work?"
-            await send_message(message, "ask_days")
-            sess["ts"] = time.time(); SESSIONS[phone] = sess
-            return
+        days = sess.setdefault("_prefs_days", [])
+        time_band = sess.get("_prefs_time_band")
+        had_evening = time_band == "EVENING"
 
-        if prefs_intent == "PREFS_DAYS_ONLY":
-            message = tone_reply or PREFS_ASK_TIME
-            await send_message(message, "ask_time")
-            sess["ts"] = time.time(); SESSIONS[phone] = sess
-            return
+        if interpretation.get("days"):
+            for iso in interpretation["days"]:
+                if iso not in days:
+                    days.append(iso)
 
-        if prefs_intent == "PREFS_TIME_ONLY":
-            message = tone_reply or PREFS_ASK_DAYS
-            await send_message(message, "ask_days")
-            sess["ts"] = time.time(); SESSIONS[phone] = sess
-            return
+        if interpretation.get("time_band"):
+            time_band = interpretation["time_band"]
+            sess["_prefs_time_band"] = time_band
 
-        if prefs_intent == "PREFS_AMBIGUOUS" and text != "__kick__":
-            message = tone_reply or PREFS_COMBINED_CLARIFIER
-            await send_message(message, "ask_days")
-            sess["ts"] = time.time(); SESSIONS[phone] = sess
-            return
+        if interpretation.get("topics"):
+            topics = sess.setdefault("_qa_topics", [])
+            for topic in interpretation["topics"]:
+                if topic not in topics:
+                    topics.append(topic)
 
-        if prefs_intent == "PREFS_EVENING_ONLY":
-            attempts = sess.get("_prefs_evening_attempts", 0)
-            if attempts == 0:
-                message = tone_reply or PREFS_EVENING_POLICY
-                await send_message(message, "ask_days")
-                sess["_prefs_evening_attempts"] = 1
-                sess["ts"] = time.time(); SESSIONS[phone] = sess
-                return
+        if not interpretation.get("days"):
+            inferred_days: list[str] = []
+            text_lower_local = text.lower()
+            day_patterns = {
+                "monday": "MON",
+                "mon": "MON",
+                "tuesday": "TUE",
+                "tue": "TUE",
+                "wednesday": "WED",
+                "wed": "WED",
+                "thursday": "THU",
+                "thu": "THU",
+                "thur": "THU",
+                "friday": "FRI",
+                "fri": "FRI",
+                "saturday": "SAT",
+                "sat": "SAT",
+                "sunday": "SUN",
+                "sun": "SUN",
+            }
+            for token, iso in day_patterns.items():
+                if re.search(rf"\b{re.escape(token)}\b", text_lower_local):
+                    if iso not in inferred_days:
+                        inferred_days.append(iso)
+            if inferred_days:
+                for iso in inferred_days:
+                    if iso not in days:
+                        days.append(iso)
 
-            message = tone_reply or PREFS_EVENING_DEFERRAL
-            await send_message(message, None)
-            sess["_prefs_evening_attempts"] = attempts + 1
-
-            until_date = datetime.now(timezone.utc) + timedelta(days=14)
-            until_iso = until_date.isoformat()
-            deferral_key = f"{phone}_EVENING_ONLY_{int(time.time())}"
-            sess["_deferred_prev_state"] = state
-            sess["_deferred_reason"] = "EVENING_ONLY"
-            try:
-                await mcp_deferral_create(profile.get("uuid") or phone, "EVENING_ONLY", until_iso, deferral_key)
-            except Exception as e:
-                log.warning(f"[PREFS] Failed to create evening-only deferral: {e}")
-
+        if interpretation.get("deferral"):
+            await mcp_deferral_create(
+                profile.get("uuid") or phone,
+                "PREFS_LATER",
+                interpretation["deferral"]["until_iso"],
+                f"{phone}_PREFS_DEFER_{int(time.time())}"
+            )
+            await mcp_wa_send(phone, interpretation["deferral"]["message"])
+            _add_to_history(phone, bot_msg=interpretation["deferral"]["message"])
+            sess["_deferred_prev_state"] = "PREFS_DAYTIME"
+            sess["_deferred_reason"] = "PREFS_LATER"
             sess["state"] = "DEFERRED"
             sess["ts"] = time.time(); SESSIONS[phone] = sess
             return
-
-        # If neither present, ask combined clarifier
-        if not merged_days and not merged_windows:
-            clar = PREFS_COMBINED_CLARIFIER
-            await send_message(clar, "ask_days")
+        elif interpretation.get("followup"):
+            await mcp_wa_send(phone, interpretation["followup"])
+            _add_to_history(phone, bot_msg=interpretation["followup"])
+            sess["_prefs_last_prompt"] = interpretation.get("followup_tag")
+            sess["_prefs_last_prompt_text"] = interpretation["followup"]
             sess["ts"] = time.time(); SESSIONS[phone] = sess
             return
 
-        # If only days present, ask time once (suppress duplicates)
-        if merged_days and not merged_windows:
-            if sess.get("_prefs_last_prompt") != "ask_time":
-                await send_message(PREFS_ASK_TIME, "ask_time")
+        if not days:
+            followup = PREFS_FOLLOWUP_DAYS
+            await mcp_wa_send(phone, followup)
+            _add_to_history(phone, bot_msg=followup)
+            sess["_prefs_last_prompt"] = "days_followup"
+            sess["_prefs_last_prompt_text"] = followup
             sess["ts"] = time.time(); SESSIONS[phone] = sess
             return
 
-        # If only windows present, ask days once (suppress duplicates)
-        if merged_windows and not merged_days:
-            if sess.get("_prefs_last_prompt") != "ask_days":
-                await send_message(PREFS_ASK_DAYS, "ask_days")
-            sess["ts"] = time.time(); SESSIONS[phone] = sess
-            return
-
-        # Prepare final confirmation details
-        confirmed_days = merged_days[:3] if merged_days else []
         day_label_map = {
-            "MON": "Monday",
-            "TUE": "Tuesday",
-            "WED": "Wednesday",
-            "THU": "Thursday",
-            "FRI": "Friday",
-            "SAT": "Saturday",
-            "SUN": "Sunday",
+            "MON": "Monday", "TUE": "Tuesday", "WED": "Wednesday",
+            "THU": "Thursday", "FRI": "Friday", "SAT": "Saturday", "SUN": "Sunday"
         }
-        human_days = [day_label_map.get(code, code.title()) for code in confirmed_days]
-        if not human_days:
-            days_str = "the days you shared"
-        elif len(human_days) == 1:
+        human_days = [day_label_map.get(d, d) for d in days[:3]]
+        if len(human_days) == 1:
             days_str = human_days[0]
         elif len(human_days) == 2:
             days_str = f"{human_days[0]} & {human_days[1]}"
         else:
             days_str = ", ".join(human_days[:-1]) + f" & {human_days[-1]}"
 
-        def _infer_band_code(windows: list[dict]) -> str | None:
-            for w in windows:
-                start_raw = w.get("start") or w.get("start_iso")
-                if not start_raw:
-                    continue
-                hour = None
-                try:
-                    if "T" in start_raw:
-                        hour = datetime.fromisoformat(start_raw.replace("Z", "+00:00")).hour
-                    else:
-                        parts = start_raw.split(":")
-                        if parts:
-                            hour = int(parts[0])
-                except Exception:
-                    hour = None
-                if hour is None:
-                    continue
-                if 8 <= hour < 12:
-                    return "MORNING"
-                if 12 <= hour < 16:
-                    return "AFTERNOON"
-                if 16 <= hour < 21:
-                    return "EVENING"
-            return None
-
-        time_band_code = _infer_band_code(merged_windows)
-        if time_band_code is None and evening_only:
-            time_band_code = "EVENING"
-        if time_band_code is None:
-            time_band_code = "MORNING"
-
         band_label_map = {
-            "MORNING": "mornings (8–11 AM)",
-            "AFTERNOON": "afternoons (12–4 PM)",
-            "EVENING": "evenings (5–8 PM)",
+            "MORNING": "morning slots",
+            "AFTERNOON": "lunch or early-afternoon slots",
+            "EVENING": "evening slots"
         }
-        band_str = band_label_map.get(time_band_code, "your preferred time")
+        band_str = band_label_map.get(time_band, "your preferred time")
 
-        # Persist preferences to session/profile
-        sess["prefs.days"] = merged_days
-        sess["prefs.time_windows"] = merged_windows
-        sess["prefs.time_band"] = time_band_code
         profile.setdefault("preferences", {})
-        profile["preferences"]["days"] = merged_days
-        profile["preferences"]["time_windows"] = merged_windows
-        profile["preferences"]["time_band"] = time_band_code
+        profile["preferences"]["days"] = days
+        profile["preferences"]["time_band"] = time_band
 
-        # Send confirmation with appropriate template
-        weekend_only_selection = merged_days and all(d in ["SAT", "SUN"] for d in merged_days)
-        if sess.get("_weekend_gate") and weekend_only_selection:
-            confirm = format_message(PREFS_CONFIRM_WITH_WEEKEND, days=days_str, band=band_str)
-        else:
-            confirm = format_message(PREFS_CONFIRM_DEFAULT, days=days_str, band=band_str)
+        confirm = format_message(PREFS_CONFIRM_DEFAULT, days=days_str, band=band_str)
         await mcp_wa_send(phone, confirm)
         _add_to_history(phone, bot_msg=confirm)
-        sess["_prefs_last_intent"] = prefs_intent
+        sess["_prefs_last_prompt"] = None
+        sess["_prefs_last_prompt_text"] = None
+        sess.pop("_prefs_evening_attempts", None)
 
-        # Advance to QA window
+        vid = profile.get("uuid")
+        if vid and str(vid).upper() not in {"NONE", "UNKNOWN"}:
+            try:
+                await mcp_preferences_save(vid, time_band)
+            except Exception as e:
+                log.debug(f"[PREFS] preferences.save skipped: {e}")
+
+        summary_msg = await _generate_prefs_summary_phone(
+            phone=phone,
+            sess=sess,
+            profile=profile,
+            volunteer_name=profile.get("name"),
+            days=days,
+            time_band=time_band,
+            days_label=days_str,
+            band_label=band_str,
+        )
+        if summary_msg:
+            await asyncio.sleep(0.4)
+            await mcp_wa_send(phone, summary_msg)
+            _add_to_history(phone, bot_msg=summary_msg)
+
         sess["state"] = "QA_WINDOW"
         sess["_qa_count"] = 0
+        sess["_qa_topics"] = []
+        sess["_qa_summary_sent"] = False
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
 
@@ -2643,6 +2726,7 @@ async def _handle(phone: str, text: str):
         volunteer_id = profile.get("uuid") or phone
         name = profile.get("name") or "there"
         qa_count = sess.get("_qa_count", 0)
+        qa_topics = sess.setdefault("_qa_topics", [])
         
         # Entry: send initial QA prompt
         if text == "__kick__":
@@ -2664,6 +2748,7 @@ async def _handle(phone: str, text: str):
         
         # If user indicates they're done with questions, move directly to orientation scheduling
         if is_no_response(text) or re.search(r"\b(not now|no questions|no questions?|nothing|no)\b", text_lower):
+            await _send_orientation_summary(phone, sess, profile)
             sess["state"] = "ORIENTATION_SLOT"
             sess["ts"] = time.time()
             sess.pop("_orientation_phase", None)
@@ -2767,6 +2852,8 @@ async def _handle(phone: str, text: str):
                 matched_bucket = bucket_name
                 faq_bucket = bucket_name
                 answer = bucket_data["answer"]
+                if bucket_name not in qa_topics:
+                    qa_topics.append(bucket_name)
                 await mcp_wa_send(phone, answer)
                 _add_to_history(phone, bot_msg=answer)
                 qa_count += 1
@@ -2775,6 +2862,7 @@ async def _handle(phone: str, text: str):
                 SESSIONS[phone] = sess
                 
                 await asyncio.sleep(0.5)
+                await _send_orientation_summary(phone, sess, profile)
                 sess["state"] = "ORIENTATION_SLOT"
                 sess["ts"] = time.time()
                 sess.pop("_orientation_phase", None)
@@ -2830,6 +2918,8 @@ async def _handle(phone: str, text: str):
                     "I might not have the perfect answer right now. Our coordinator will cover this in orientation."
                 )
             
+            if "custom" not in qa_topics:
+                qa_topics.append("custom")
             await mcp_wa_send(phone, answer)
             _add_to_history(phone, bot_msg=answer)
             qa_count += 1
@@ -2838,6 +2928,7 @@ async def _handle(phone: str, text: str):
             SESSIONS[phone] = sess
             
             await asyncio.sleep(0.5)
+            await _send_orientation_summary(phone, sess, profile)
             sess["state"] = "ORIENTATION_SLOT"
             sess["ts"] = time.time()
             sess.pop("_orientation_phase", None)
@@ -2928,7 +3019,6 @@ async def _handle(phone: str, text: str):
         # LLM classification for orientation intents
         llm_intent = None
         llm_conf = 0.0
-        llm_tone = ""
         try:
             llm_context = build_llm_context(
                 "ORIENTATION_SLOT",
@@ -2938,7 +3028,6 @@ async def _handle(phone: str, text: str):
             llm_result = await mcp_llm_classify_intent(text, "ORIENTATION_SLOT", llm_context)
             llm_intent = (llm_result.get("intent") or "").upper()
             llm_conf = float(llm_result.get("confidence") or 0.0)
-            llm_tone = llm_result.get("tone_reply") or ""
         except Exception as e:
             log.warning(f"[ORIENT] LLM classification failed: {e}")
 
@@ -2956,7 +3045,7 @@ async def _handle(phone: str, text: str):
 
         if accept_llm and llm_intent:
             if llm_intent == "ORIENT_LATER_OR_DEFERRAL":
-                reply = llm_tone or ORIENT_LATER_NOTE
+                reply = ORIENT_LATER_NOTE
                 await _send_and_track(reply)
                 until_date = datetime.now() + timedelta(days=5)
                 until_iso = until_date.isoformat()
@@ -2981,23 +3070,22 @@ async def _handle(phone: str, text: str):
                 return
 
             if llm_intent == "ORIENT_FAQ":
-                reply = llm_tone or QA_MANDATORY_ORIENT
+                reply = QA_MANDATORY_ORIENT
                 await _send_and_track(reply)
                 return
 
             if llm_intent == "ORIENT_INVALID_PICK":
-                reply = llm_tone or ORIENT_INVALID_PICK
+                reply = ORIENT_INVALID_PICK
                 await _send_and_track(reply)
                 return
 
             if llm_intent == "ORIENT_AMBIGUOUS":
-                reply = llm_tone or "Would you like me to suggest a couple of slots based on your availability?"
+                reply = "Would you like me to suggest a couple of slots based on your availability?"
                 await _send_and_track(reply)
                 return
 
             if llm_intent == "ORIENT_PICK_OPTION":
-                if llm_tone:
-                    await _send_and_track(llm_tone)
+                await _send_and_track(ORIENT_BOOKING_CONFIRM)
                 sess["state"] = "ORIENTATION_SCHEDULING"
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
@@ -3008,8 +3096,7 @@ async def _handle(phone: str, text: str):
                 # Unknown intent even after acceptance – fall through to parsing
                 log.info(f"[ORIENT] Accepted LLM intent {llm_intent} but no handler; falling back to parsing.")
             else:
-                if llm_tone:
-                    await _send_and_track(llm_tone)
+                await _send_and_track(ORIENT_AVAILABILITY_ACK)
         
         # Parse time slots from user input (LLM-first + deterministic), always include time.parse_options
         slots_parsed = []
