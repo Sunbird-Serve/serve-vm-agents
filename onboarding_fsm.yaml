@@ -3,9 +3,11 @@
 
 metadata:
   name: "SERVE Volunteer Onboarding Agent"
-  version: "1.0"
+  version: "2.0"
   description: "WhatsApp-based onboarding conversation flow for volunteer teachers"
   entry_point: "WELCOME"
+  last_updated: "2025-01-01"
+  notes: "Updated to match actual implementation: INTENT, ELIGIBILITY (single), IDENTITY, PREFERENCES states"
 
 states:
   WELCOME:
@@ -41,7 +43,7 @@ states:
     
     transitions:
       - from: "WELCOME"
-        to: "ELIGIBILITY_PART1"
+        to: "INTENT"
         trigger: "CONSENT_YES"
         condition: "consent.value == 'yes'"
         tools: ["consent.record", "state.advance"]
@@ -70,100 +72,172 @@ states:
         tools: ["state.get"]
         action: "fast_forward_to_existing_state"
 
-  ELIGIBILITY_PART1:
-    description: "Two-part eligibility check: Age (Q1) and Device (Q2)"
+  INTENT:
+    description: "Commitment check - 2 hours/week comfort"
     entry_trigger: "consent_recorded"
     
-    substeps:
-      - name: "age_check"
-        question: "Are you 18 or older?"
-        parsing:
-          - llm_tool: "onboarding.parse_message"
-          - field: "eligibility.age_ok"
-          - fallback: ["is_yes_response", "is_no_response"]
-        validation:
-          - hard_rule: "age >= 18"
-          - on_fail: "REJECTED" (no_persuasion)
-        tools: ["onboarding.parse_message", "eligibility.check"]
-      
-      - name: "device_check"
-        question: "Do you have a smartphone or laptop and stable internet?"
-        parsing:
-          - llm_tool: "onboarding.parse_message"
-          - field: "eligibility.has_device"
-          - fallback: ["is_yes_response", "is_no_response"]
-        validation:
-          - on_fail: "offer_deferral"
-          - deferral_reason: "NO_DEVICE"
-        tools: ["onboarding.parse_message", "eligibility.check", "deferral.create"]
-    
-    transitions:
-      - from: "ELIGIBILITY_PART1"
-        to: "ELIGIBILITY_PART2"
-        trigger: "both_age_and_device_ok"
-        condition: "elig.age == true && elig.device == true"
-        action: "send_commitment_question"
-      
-      - from: "ELIGIBILITY_PART1"
-        to: "REJECTED"
-        trigger: "age_under_18"
-        condition: "age < 18"
-        action: "decline_age_politely"
-      
-      - from: "ELIGIBILITY_PART1"
-        to: "DEFERRED"
-        trigger: "no_device_deferred"
-        condition: "has_device == false && deferral_accepted"
-        tools: ["deferral.create"]
-        action: "create_device_deferral"
-
-  ELIGIBILITY_PART2:
-    description: "Commitment check with persuasion (max 2 attempts)"
-    entry_trigger: "eligibility_part1_complete"
-    
-    question: "Would you be able to give about 2 hours a week for teaching?"
+    question: "Would you be comfortable teaching around 2 hours a week?"
     parsing:
-      - llm_tool: "onboarding.parse_message"
-      - field: "eligibility.weekly_commitment_hours"
-      - fallback: "_extract_simple_hours"
+      - rule_based: ["classify_intent_rule_based"]
+      - llm_fallback: "mcp_llm_classify_intent" (only when needed)
     validation:
-      - policy_check: "same_day_request == false"
-      - on_policy_violation: "clarify_split_hours"
-      - persuasion:
-          - max_attempts: 2
-          - on_hesitant: "gently_persuade"
-          - on_insufficient: "offer_deferral"
-    tools: ["onboarding.parse_message", "eligibility.check"]
+      - rule_first: true
+      - llm_only_when: ["ambiguous", "mixed_signals", "long_message"]
+    tools: ["onboarding.parse_message", "llm.classify_intent"]
     
     transitions:
-      - from: "ELIGIBILITY_PART2"
-        to: "PREFS_DAYTIME"
-        trigger: "commitment_ok"
-        condition: "weekly_commitment_hours >= 2.0"
-        action: "send_day_preference_question"
+      - from: "INTENT"
+        to: "ELIGIBILITY"
+        trigger: "TIME_YES"
+        condition: "intent == TIME_YES"
+        action: "proceed_to_eligibility"
       
-      - from: "ELIGIBILITY_PART2"
+      - from: "INTENT"
+        to: "ELIGIBILITY"
+        trigger: "TIME_MAYBE"
+        condition: "intent == TIME_MAYBE"
+        action: "proceed_to_eligibility"
+      
+      - from: "INTENT"
+        to: "INTENT"
+        trigger: "TIME_NO"
+        condition: "intent == TIME_NO && !persuasion_sent"
+        action: "send_persuasion"
+      
+      - from: "INTENT"
         to: "REJECTED"
-        trigger: "persuasion_exhausted"
-        condition: "persuasion_attempts >= 2 && commitment_insufficient"
-        action: "decline_politely"
+        trigger: "TIME_NO_AFTER_PERSUASION"
+        condition: "intent == TIME_NO && persuasion_sent"
+        action: "exit_with_community_link"
       
-      - from: "ELIGIBILITY_PART2"
-        to: "DEFERRED"
-        trigger: "commitment_deferred"
-        condition: "deferral_requested"
-        tools: ["deferral.create"]
-        action: "create_commitment_deferral"
+      - from: "INTENT"
+        to: "REJECTED"
+        trigger: "DEFERRAL"
+        condition: "intent == DEFERRAL"
+        action: "exit_with_community_link"
+      
+      - from: "INTENT"
+        to: "INTENT"
+        trigger: "QUERY"
+        condition: "intent == QUERY"
+        action: "answer_faq_and_reask"
 
-  PREFS_DAYTIME:
-    description: "Collect teaching day and time preferences (separate from orientation)"
-    entry_trigger: "eligibility_complete"
+  ELIGIBILITY:
+    description: "Three non-negotiable requirements check: 18+, device+internet, unpaid understanding"
+    entry_trigger: "intent_confirmed"
+    
+    question: "Are all three okay for you?"
+    requirements:
+      - "18 or above"
+      - "Tablet or laptop with Internet"
+      - "Understands this is a voluntary role (no payment)"
+    parsing:
+      - rule_based: ["classify_eligibility_rule_based"]
+      - llm_fallback: "mcp_llm_classify_intent" (only when needed)
+    validation:
+      - strict: true
+      - no_persuasion: true
+      - any_fail: "REJECTED"
+    tools: ["onboarding.parse_message", "llm.classify_intent"]
+    
+    transitions:
+      - from: "ELIGIBILITY"
+        to: "IDENTITY"
+        trigger: "ELIGIBLE_YES"
+        condition: "intent == ELIGIBLE_YES"
+        action: "proceed_to_identity"
+      
+      - from: "ELIGIBILITY"
+        to: "REJECTED"
+        trigger: "ELIGIBLE_NO"
+        condition: "intent == ELIGIBLE_NO"
+        action: "exit_with_community_link"
+      
+      - from: "ELIGIBILITY"
+        to: "ELIGIBILITY"
+        trigger: "ELIGIBLE_UNCLEAR"
+        condition: "intent == ELIGIBLE_UNCLEAR"
+        action: "ask_clarification"
+      
+      - from: "ELIGIBILITY"
+        to: "ELIGIBILITY"
+        trigger: "QUERY"
+        condition: "intent == QUERY"
+        action: "answer_faq_and_reask"
+
+  IDENTITY:
+    description: "Collect name, phone number, and email"
+    entry_trigger: "eligibility_confirmed"
+    
+    substeps:
+      - name: "name_collection"
+        question: "btw, may I know your **name**? 🙂"
+        parsing:
+          - rule_based: ["extract_name", "classify_name_response"]
+          - llm_fallback: "mcp_llm_classify_intent" (only when needed)
+        validation:
+          - min_length: 2
+          - max_length: 100
+          - alphabetic: true
+        tools: ["onboarding.parse_message", "llm.classify_intent"]
+      
+      - name: "contacts_collection"
+        question: "Could you share your **phone number** and **email**?"
+        parsing:
+          - rule_based: ["extract_phone", "extract_email", "classify_contacts_response"]
+          - llm_fallback: "mcp_llm_classify_intent" (only when needed)
+        validation:
+          - phone_required: true
+          - email_required: true
+          - on_refusal: "nudge_once_then_exit"
+        tools: ["onboarding.parse_message", "llm.classify_intent", "saveProfile"]
+    
+    transitions:
+      - from: "IDENTITY"
+        to: "PREFERENCES"
+        trigger: "CONTACTS_OK"
+        condition: "phone && email && saveProfile_success"
+        action: "proceed_to_preferences"
+      
+      - from: "IDENTITY"
+        to: "IDENTITY"
+        trigger: "CONTACTS_PARTIAL"
+        condition: "phone || email (but not both)"
+        action: "ask_missing_field"
+      
+      - from: "IDENTITY"
+        to: "IDENTITY"
+        trigger: "REFUSE_CONTACTS"
+        condition: "refusal && !nudge_sent"
+        action: "send_nudge"
+      
+      - from: "IDENTITY"
+        to: "REJECTED"
+        trigger: "REFUSE_CONTACTS_AFTER_NUDGE"
+        condition: "refusal && nudge_sent"
+        action: "exit_with_community_link"
+      
+      - from: "IDENTITY"
+        to: "IDENTITY"
+        trigger: "QUERY"
+        condition: "intent == QUERY"
+        action: "answer_faq_and_reask"
+      
+      - from: "IDENTITY"
+        to: "IDENTITY"
+        trigger: "NAME_UNCLEAR"
+        condition: "intent == NAME_UNCLEAR"
+        action: "reask_name"
+
+  PREFERENCES:
+    description: "Collect teaching day and time preferences"
+    entry_trigger: "identity_complete"
     
     substeps:
       - name: "days_collection"
         question: "Which days work best for you?"
         parsing:
-          - llm_tool: "onboarding.parse_message"
+          - llm_tool: "_generate_prefs_interpretation"
           - field: "preferences.days"
           - expand: ["weekdays", "weekends"]
         validation:
@@ -173,7 +247,7 @@ states:
       - name: "time_collection"
         question: "What time works best?"
         parsing:
-          - llm_tool: "onboarding.parse_message"
+          - llm_tool: "_generate_prefs_interpretation"
           - field: "preferences.time_band"
           - expand: "time_bands_to_windows"
         validation:
@@ -182,10 +256,10 @@ states:
     tools: ["onboarding.parse_message", "preferences.save", "policy.scheduling"]
     
     transitions:
-      - from: "PREFS_DAYTIME"
+      - from: "PREFERENCES"
         to: "QA_WINDOW"
         trigger: "preferences_saved"
-        condition: "days && time_band saved"
+        condition: "days && time_band saved (or save failed but continue)"
         action: "transition_to_qa_with_kick"
 
   QA_WINDOW:
@@ -211,8 +285,16 @@ states:
       - nudge_message: "Happy to answer more in orientation... orientation is mandatory..."
     
     transitions:
+      # COMMENTED OUT: Orientation scheduling disabled
+      # - from: "QA_WINDOW"
+      #   to: "ORIENTATION_SLOT"
+      #   trigger: "user_ready_to_schedule"
+      #   condition: "qa_count < 2 && user_says_yes_to_scheduling"
+      #   tools: ["consent.record", "state.advance"]
+      #   action: "record_orientation_consent"
+      # Instead, transition to COMPLETE
       - from: "QA_WINDOW"
-        to: "ORIENTATION_SLOT"
+        to: "COMPLETE"
         trigger: "user_ready_to_schedule"
         condition: "qa_count < 2 && user_says_yes_to_scheduling"
         tools: ["consent.record", "state.advance"]
@@ -238,104 +320,105 @@ states:
     
     tools: ["knowledge.search", "llm.qa", "deferral.create", "state.get", "consent.record"]
 
-  ORIENTATION_SLOT:
-    description: "Capture orientation availability and propose slots"
-    entry_trigger: "__kick__"
-    
-    entry_message: "One last step: a short 30-minute orientation so you feel fully ready. Please share 2-3 slots that work for you in the next few days."
-    
-    parsing:
-      - tool: "onboarding.parse_message"
-      - tool: "time.parse_options"
-      - extract: ["availability", "start_iso", "days"]
-    
-    slot_proposal:
-      - tool: "slots.propose"
-      - parameters:
-          - "seedTimeIso": "from_time.parse_options"
-          - "seedTimesIso": "all_parsed_times"
-          - "daysWhitelist": "null_if_multiple_days"
-          - "timeBand": "omitted (server_infers)"
-      - display: "format_slot_options"
-    
-    transitions:
-      - from: "ORIENTATION_SLOT"
-        to: "ORIENTATION_SCHEDULING"
-        trigger: "slots_proposed"
-        condition: "slots.count > 0"
-        action: "display_slot_options"
-      
-      - from: "ORIENTATION_SLOT"
-        to: "ORIENTATION_SLOT"
-        trigger: "parse_failed"
-        condition: "no_slots_parsed"
-        action: "ask_for_clarification"
-    
-    tools: ["onboarding.parse_message", "time.parse_options", "slots.propose", "wa.send_message"]
-
-  ORIENTATION_SCHEDULING:
-    description: "Slot selection, hold, book, and calendar event creation"
-    entry_trigger: "slots_displayed"
-    
-    substeps:
-      - name: "slot_selection"
-        parsing:
-          - rule_based: ["number", "day_time_match", "yes_for_first"]
-          - llm_tool: "onboarding.parse_message"
-        validation:
-          - check: "slot_id in proposed_slots"
-      
-      - name: "slot_hold"
-        tool: "slot.hold"
-        parameters:
-          - "slotId": "selected_slot_id"
-        response_fields:
-          - "hold_id" | "holdId" | "id"
-        timeout: "~2 minutes"
-      
-      - name: "slot_book"
-        tool: "slot.book"
-        parameters:
-          - "holdId": "from_slot_hold"
-        response_fields:
-          - "meetingUrl"
-          - "startISO"
-          - "endISO"
-      
-      - name: "calendar_create"
-        tool: "calendar.create_event"
-        parameters:
-          - "title": "SERVE Orientation"
-          - "start_iso": "from_slot_book"
-          - "end_iso": "from_slot_book"
-          - "attendees": "[volunteer_email]"
-    
-    transitions:
-      - from: "ORIENTATION_SCHEDULING"
-        to: "COMPLETE"
-        trigger: "booking_complete"
-        condition: "calendar_event_created"
-        action: "send_final_confirmation"
-      
-      - from: "ORIENTATION_SCHEDULING"
-        to: "ORIENTATION_SCHEDULING"
-        trigger: "slot_unavailable"
-        condition: "hold_failed"
-        action: "ask_for_alternative_slot"
-      
-      - from: "ORIENTATION_SCHEDULING"
-        to: "ORIENTATION_SLOT"
-        trigger: "no_slots_in_session"
-        condition: "slots_not_found"
-        action: "reask_availability"
-    
-    tools: ["onboarding.parse_message", "slot.hold", "slot.book", "calendar.create_event", "wa.send_message"]
+  # COMMENTED OUT: Orientation scheduling disabled
+  # ORIENTATION_SLOT:
+  #   description: "Capture orientation availability and propose slots"
+  #   entry_trigger: "__kick__"
+  #   
+  #   entry_message: "One last step: a short 30-minute orientation so you feel fully ready. Please share 2-3 slots that work for you in the next few days."
+  #   
+  #   parsing:
+  #     - tool: "onboarding.parse_message"
+  #     - tool: "time.parse_options"
+  #     - extract: ["availability", "start_iso", "days"]
+  #   
+  #   slot_proposal:
+  #     - tool: "slots.propose"
+  #     - parameters:
+  #         - "seedTimeIso": "from_time.parse_options"
+  #         - "seedTimesIso": "all_parsed_times"
+  #         - "daysWhitelist": "null_if_multiple_days"
+  #         - "timeBand": "omitted (server_infers)"
+  #     - display: "format_slot_options"
+  #   
+  #   transitions:
+  #     - from: "ORIENTATION_SLOT"
+  #       to: "ORIENTATION_SCHEDULING"
+  #       trigger: "slots_proposed"
+  #       condition: "slots.count > 0"
+  #       action: "display_slot_options"
+  #     
+  #     - from: "ORIENTATION_SLOT"
+  #       to: "ORIENTATION_SLOT"
+  #       trigger: "parse_failed"
+  #       condition: "no_slots_parsed"
+  #       action: "ask_for_clarification"
+  #   
+  #   tools: ["onboarding.parse_message", "time.parse_options", "slots.propose", "wa.send_message"]
+  #
+  # ORIENTATION_SCHEDULING:
+  #   description: "Slot selection, hold, book, and calendar event creation"
+  #   entry_trigger: "slots_displayed"
+  #   
+  #   substeps:
+  #     - name: "slot_selection"
+  #       parsing:
+  #         - rule_based: ["number", "day_time_match", "yes_for_first"]
+  #         - llm_tool: "onboarding.parse_message"
+  #       validation:
+  #         - check: "slot_id in proposed_slots"
+  #     
+  #     - name: "slot_hold"
+  #       tool: "slot.hold"
+  #       parameters:
+  #         - "slotId": "selected_slot_id"
+  #       response_fields:
+  #         - "hold_id" | "holdId" | "id"
+  #       timeout: "~2 minutes"
+  #     
+  #     - name: "slot_book"
+  #       tool: "slot.book"
+  #       parameters:
+  #         - "holdId": "from_slot_hold"
+  #       response_fields:
+  #         - "meetingUrl"
+  #         - "startISO"
+  #         - "endISO"
+  #     
+  #     - name: "calendar_create"
+  #       tool: "calendar.create_event"
+  #       parameters:
+  #         - "title": "SERVE Orientation"
+  #         - "start_iso": "from_slot_book"
+  #         - "end_iso": "from_slot_book"
+  #         - "attendees": "[volunteer_email]"
+  #   
+  #   transitions:
+  #     - from: "ORIENTATION_SCHEDULING"
+  #       to: "COMPLETE"
+  #       trigger: "booking_complete"
+  #       condition: "calendar_event_created"
+  #       action: "send_final_confirmation"
+  #     
+  #     - from: "ORIENTATION_SCHEDULING"
+  #       to: "ORIENTATION_SCHEDULING"
+  #       trigger: "slot_unavailable"
+  #       condition: "hold_failed"
+  #       action: "ask_for_alternative_slot"
+  #     
+  #     - from: "ORIENTATION_SCHEDULING"
+  #       to: "ORIENTATION_SLOT"
+  #       trigger: "no_slots_in_session"
+  #       condition: "slots_not_found"
+  #       action: "reask_availability"
+  #   
+  #   tools: ["onboarding.parse_message", "slot.hold", "slot.book", "calendar.create_event", "wa.send_message"]
 
   COMPLETE:
-    description: "Final confirmation with meeting link and completion message"
-    entry_trigger: "booking_complete"
+    description: "Final confirmation - onboarding complete"
+    entry_trigger: "qa_complete_or_max_turns"
     
-    final_message: "DONE message with meeting link, date/time, and next steps"
+    final_message: "Completion message confirming onboarding is done"
     tools: ["wa.send_message"]
     
     transitions:

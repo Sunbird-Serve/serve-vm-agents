@@ -209,37 +209,38 @@ FEW_SHOT_EXAMPLES = {
         })},
     ],
     "FAQ": [],
-    "ORIENTATION_SLOT": [
-        {"role": "system", "content": "Example: volunteer shares two availability windows."},
-        {"role": "assistant", "content": _json_content({
-            "intent": "ORIENT_PROVIDE_PREFERENCES",
-            "confidence": 0.96,
-            "tone_reply": "Got it 👍 I’ll quickly check and suggest a couple of slots based on those timings."
-        })},
-        {"role": "system", "content": "Example: volunteer picks the first option number."},
-        {"role": "assistant", "content": _json_content({
-            "intent": "ORIENT_PICK_OPTION",
-            "confidence": 0.97,
-            "tone_reply": "Perfect ✅ I’ll confirm that slot for your orientation."
-        })},
-        {"role": "system", "content": "Example: volunteer asks for midnight after options were shown."},
-        {"role": "assistant", "content": _json_content({
-            "intent": "ORIENT_INVALID_PICK",
-            "confidence": 0.92,
-            "tone_reply": "I’m afraid I can’t match that time with the available slots 🙈 Could you pick one of the suggested options, or share another daytime slot?"
-        })},
-        {"role": "system", "content": "Example: volunteer says they’ll confirm later."},
-        {"role": "assistant", "content": _json_content({
-            "intent": "ORIENT_LATER_OR_DEFERRAL",
-            "confidence": 0.95,
-            "tone_reply": "Totally okay 😊 You can message me here anytime to fix orientation. We’ll keep your details ready."
-        })},
-        {"role": "system", "content": "Example: volunteer asks what happens in orientation."},
-        {"role": "assistant", "content": _json_content({
-            "intent": "ORIENT_FAQ",
-            "confidence": 0.96,
-            "tone_reply": "Great question 👍 It’s a short 30-minute walkthrough of the class flow, tech setup, and support. Ready to share 2–3 slots that fit you?"
-        })},
-    ],
+    # COMMENTED OUT: Orientation scheduling disabled
+    # "ORIENTATION_SLOT": [
+    #     {"role": "system", "content": "Example: volunteer shares two availability windows."},
+    #     {"role": "assistant", "content": _json_content({
+    #         "intent": "ORIENT_PROVIDE_PREFERENCES",
+    #         "confidence": 0.96,
+    #         "tone_reply": "Got it 👍 I'll quickly check and suggest a couple of slots based on those timings."
+    #     })},
+    #     {"role": "system", "content": "Example: volunteer picks the first option number."},
+    #     {"role": "assistant", "content": _json_content({
+    #         "intent": "ORIENT_PICK_OPTION",
+    #         "confidence": 0.97,
+    #         "tone_reply": "Perfect ✅ I'll confirm that slot for your orientation."
+    #     })},
+    #     {"role": "system", "content": "Example: volunteer asks for midnight after options were shown."},
+    #     {"role": "assistant", "content": _json_content({
+    #         "intent": "ORIENT_INVALID_PICK",
+    #         "confidence": 0.92,
+    #         "tone_reply": "I'm afraid I can't match that time with the available slots 🙈 Could you pick one of the suggested options, or share another daytime slot?"
+    #     })},
+    #     {"role": "system", "content": "Example: volunteer says they'll confirm later."},
+    #     {"role": "assistant", "content": _json_content({
+    #         "intent": "ORIENT_LATER_OR_DEFERRAL",
+    #         "confidence": 0.95,
+    #         "tone_reply": "Totally okay 😊 You can message me here anytime to fix orientation. We'll keep your details ready."
+    #     })},
+    #     {"role": "system", "content": "Example: volunteer asks what happens in orientation."},
+    #     {"role": "assistant", "content": _json_content({
+    #         "intent": "ORIENT_FAQ",
+    #         "confidence": 0.96,
+    #         "tone_reply": "Great question 👍 It's a short 30-minute walkthrough of the class flow, tech setup, and support. Ready to share 2–3 slots that fit you?"
+    #     })},
+    # ],
 }
 

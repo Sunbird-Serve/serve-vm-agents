@@ -40,6 +40,63 @@ async def start_onboarding_api(request: OnboardingRequest):
     await start_onboarding(phone, request.name, request.registration_data)
     return {"ok": True, "message": f"Onboarding started for {phone}"}
 
+
+class MessageRequest(BaseModel):
+    phone: str
+    text: str
+
+
+@app.post("/agents/onboarding/message")
+async def send_message_api(request: MessageRequest):
+    """Send a message to the onboarding agent"""
+    from agents.onboarding.wa_loop import _handle, SESSIONS
+    
+    phone = (request.phone or "").lstrip("+").strip()
+    if not phone:
+        return {"ok": False, "error": "phone required"}
+    
+    if not request.text:
+        return {"ok": False, "error": "text required"}
+    
+    try:
+        await _handle(phone, request.text)
+        
+        # Return current session state
+        session_info = None
+        if phone in SESSIONS:
+            sess = SESSIONS[phone]
+            session_info = {
+                "state": sess.get("state"),
+                "profile": sess.get("profile", {})
+            }
+        
+        return {
+            "ok": True,
+            "message": "Message processed",
+            "session": session_info
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/agents/onboarding/session/{phone}")
+async def get_session_api(phone: str):
+    """Get current session state for a phone number"""
+    from agents.onboarding.wa_loop import SESSIONS
+    
+    phone = phone.lstrip("+").strip()
+    if phone in SESSIONS:
+        sess = SESSIONS[phone]
+        return {
+            "ok": True,
+            "state": sess.get("state"),
+            "profile": sess.get("profile", {}),
+            "timestamp": sess.get("ts")
+        }
+    else:
+        return {"ok": False, "error": "Session not found"}
+
+
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}

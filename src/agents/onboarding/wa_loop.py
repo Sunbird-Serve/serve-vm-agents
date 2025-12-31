@@ -22,6 +22,8 @@ from .config import settings
 from .messages import (
     WELCOME, WELCOME_MAYBE_LATER,
     WELCOME_INTRO, WELCOME_SERVE_OVERVIEW, WELCOME_CONSENT_ACK,
+    INTENT_PROMPT, INTENT_PERSUASION, INTENT_EXIT,
+    ELIGIBILITY_PROMPT, ELIGIBILITY_EXIT,
     ELIGIBILITY_INTRO, ELIGIBILITY_Q1, ELIGIBILITY_Q2, ELIGIBILITY_Q3,
     ELIGIBILITY_INVALID_RESPONSE, REJECTED, ELIGIBILITY_PASSED,
     ELIGIBILITY_AGE_PROMPT, ELIGIBILITY_AGE_UNCLEAR, ELIGIBILITY_UNDERAGE_DECLINE,
@@ -60,6 +62,11 @@ from .prompts.master_prompt import MASTER_SYSTEM_PROMPT
 from .prompts.state_prompts import STATE_TASK_PROMPTS, DEFAULT_TASK_PROMPT
 from .prompts.few_shots import FEW_SHOT_EXAMPLES
 from .prompts.context import build_llm_context
+from .states.intent import handle_intent
+from .states.eligibility import handle_eligibility
+from .states.identity import handle_identity
+from .states.preferences import handle_preferences
+from .states.qa import handle_qa_window
 
 log = logging.getLogger(__name__)
 
@@ -1668,20 +1675,84 @@ async def _handle(phone: str, text: str):
         return
     
     # ========== WELCOME & CONSENT STATE ==========
+    # State 1: First outbound message - no question, just warm greeting
     if state == "WELCOME":
         if text == "__kick__" or not sess.get("_greet_sent"):
             log.info(f"[GREET] Sending welcome message to {phone}")
 
-            intro_msg = format_message(WELCOME_INTRO, name=name)
+            # Send the new State 1 message (no formatting needed, static message)
+            intro_msg = WELCOME_INTRO
             await mcp_wa_send(phone, intro_msg)
             _add_to_history(phone, bot_msg=intro_msg)
 
             sess["_greet_sent"] = True
-            sess["_greet_step"] = "await_continue"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             return
         else:
+            # User responded after State 1 message - transition to INTENT state
+            log.info(f"[GREET] User responded after State 1 message, transitioning to INTENT")
+            sess["state"] = "INTENT"
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            # Trigger INTENT state handler
+            await _handle(phone, "__kick__")
+            return
+    
+    # ========== INTENT STATE (State 2: Commitment Check) ==========
+    if state == "INTENT":
+        await handle_intent(phone, text, sess, profile)
+        return
+    
+    # ========== ELIGIBILITY STATE (State 3: Eligibility Check) ==========
+    if state == "ELIGIBILITY":
+        await handle_eligibility(phone, text, sess, profile)
+        return
+    
+    # ========== IDENTITY STATE (State 4: Name, Phone, Email Collection) ==========
+    if state == "IDENTITY":
+        await handle_identity(phone, text, sess, profile)
+        return
+    
+    # ========== PREFERENCES STATE (State 5: Day & Time Preferences) ==========
+    if state == "PREFERENCES":
+        await handle_preferences(phone, text, sess, profile)
+        return
+    
+    # ========== QA_WINDOW STATE (State 6: Questions & Answers) ==========
+    if state == "QA_WINDOW":
+        await handle_qa_window(phone, text, sess, profile)
+        return
+    
+    # ========== COMPLETE STATE (Final State) ==========
+    if state == "COMPLETE":
+        # Final state - just acknowledge any messages
+        if text == "__kick__":
+            # Send completion message if not already sent
+            if not sess.get("_complete_message_sent"):
+                complete_msg = (
+                    "Perfect! Your onboarding is complete. 🎉\n\n"
+                    "We've captured your preferences and you're all set. "
+                    "Our team will reach out soon with next steps.\n\n"
+                    "Thank you for volunteering with SERVE! 💛"
+                )
+                await mcp_wa_send(phone, complete_msg)
+                _add_to_history(phone, bot_msg=complete_msg)
+                sess["_complete_message_sent"] = True
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+            return
+        else:
+            # User sent a message after completion - just acknowledge
+            ack = "Thanks! Your onboarding is complete. If you have any questions, feel free to ask."
+            await mcp_wa_send(phone, ack)
+            _add_to_history(phone, bot_msg=ack)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+    
+    # Old WELCOME handler code (kept for reference, but should not be reached)
+    if False and state == "WELCOME":
             # If we're awaiting a simple continue, handle that first
             if sess.get("_greet_step") == "await_continue":
                 proceed = False
@@ -1992,8 +2063,15 @@ async def _handle(phone: str, text: str):
                     pass
                 return
     
+    # ============================================================================
+    # NOTE: All states below (ELIGIBILITY_PART1 onwards) are COMMENTED OUT
+    # They will be moved to separate files in states/ directory as we work on them.
+    # State 1 (WELCOME) remains active in this file.
+    # ============================================================================
+    
     # ========== ELIGIBILITY (PART 1: age, then device) ==========
-    elif state == "ELIGIBILITY_PART1":
+    # COMMENTED OUT - Will be moved to states/eligibility_part1.py
+    elif False and state == "ELIGIBILITY_PART1":  # Disabled - will be in separate file
         # Track which question we're on: "age" or "device"
         elig_step = sess.get("_eligibility_step", "age")
         volunteer_id = profile.get("uuid") or phone
@@ -2220,7 +2298,8 @@ async def _handle(phone: str, text: str):
                 return
     
     # ========== ELIGIBILITY (PART 2: commitment with persuasion) ==========
-    elif state == "ELIGIBILITY_PART2":
+    # COMMENTED OUT - Will be moved to states/eligibility_part2.py
+    elif False and state == "ELIGIBILITY_PART2":  # Disabled - will be in separate file
         volunteer_id = profile.get("uuid") or phone
         persuasion_attempts = sess.get("_commitment_persuasion_attempts", 0)
         
@@ -2557,7 +2636,8 @@ async def _handle(phone: str, text: str):
             return
 
     # ========== PREFS_DAYTIME (Day & Time Preferences) ==========
-    elif state == "PREFS_DAYTIME":
+    # COMMENTED OUT - Will be moved to states/prefs_daytime.py
+    elif False and state == "PREFS_DAYTIME":  # Disabled - will be in separate file
         if text == "__kick__" or not sess.get("_prefs_prompted"):
             await mcp_wa_send(phone, PREFS_INTRO_COLLAB)
             _add_to_history(phone, bot_msg=PREFS_INTRO_COLLAB)
@@ -2721,7 +2801,8 @@ async def _handle(phone: str, text: str):
         return
 
     # ========== QA_WINDOW (Questions & Answers) ==========
-    elif state == "QA_WINDOW":
+    # COMMENTED OUT - Will be moved to states/qa_window.py
+    elif False and state == "QA_WINDOW":  # Disabled - will be in separate file
         log.info(f"[QA] QA_WINDOW handler triggered for {phone}, text='{text[:30]}...'")
         volunteer_id = profile.get("uuid") or phone
         name = profile.get("name") or "there"
@@ -2747,12 +2828,20 @@ async def _handle(phone: str, text: str):
         classifier_conf = None
         
         # If user indicates they're done with questions, move directly to orientation scheduling
+        # COMMENTED OUT: Orientation scheduling disabled
+        # if is_no_response(text) or re.search(r"\b(not now|no questions|no questions?|nothing|no)\b", text_lower):
+        #     await _send_orientation_summary(phone, sess, profile)
+        #     sess["state"] = "ORIENTATION_SLOT"
+        #     sess["ts"] = time.time()
+        #     sess.pop("_orientation_phase", None)
+        #     sess.pop("_orientation_slots", None)
+        #     SESSIONS[phone] = sess
+        #     await _handle(phone, "__kick__")
+        #     return
+        # Instead, transition to COMPLETE when done with questions
         if is_no_response(text) or re.search(r"\b(not now|no questions|no questions?|nothing|no)\b", text_lower):
-            await _send_orientation_summary(phone, sess, profile)
-            sess["state"] = "ORIENTATION_SLOT"
+            sess["state"] = "COMPLETE"
             sess["ts"] = time.time()
-            sess.pop("_orientation_phase", None)
-            sess.pop("_orientation_slots", None)
             SESSIONS[phone] = sess
             await _handle(phone, "__kick__")
             return
@@ -2862,11 +2951,17 @@ async def _handle(phone: str, text: str):
                 SESSIONS[phone] = sess
                 
                 await asyncio.sleep(0.5)
-                await _send_orientation_summary(phone, sess, profile)
-                sess["state"] = "ORIENTATION_SLOT"
+                # COMMENTED OUT: Orientation scheduling disabled
+                # await _send_orientation_summary(phone, sess, profile)
+                # sess["state"] = "ORIENTATION_SLOT"
+                # sess["ts"] = time.time()
+                # sess.pop("_orientation_phase", None)
+                # sess.pop("_orientation_slots", None)
+                # SESSIONS[phone] = sess
+                # await _handle(phone, "__kick__")
+                # Instead, transition to COMPLETE
+                sess["state"] = "COMPLETE"
                 sess["ts"] = time.time()
-                sess.pop("_orientation_phase", None)
-                sess.pop("_orientation_slots", None)
                 SESSIONS[phone] = sess
                 await _handle(phone, "__kick__")
                 return
@@ -2928,11 +3023,16 @@ async def _handle(phone: str, text: str):
             SESSIONS[phone] = sess
             
             await asyncio.sleep(0.5)
-            await _send_orientation_summary(phone, sess, profile)
-            sess["state"] = "ORIENTATION_SLOT"
+            # COMMENTED OUT: Orientation scheduling disabled
+            # await _send_orientation_summary(phone, sess, profile)
+            # sess["state"] = "ORIENTATION_SLOT"
+            # sess["ts"] = time.time()
+            # sess.pop("_orientation_phase", None)
+            # sess.pop("_orientation_slots", None)
+            # SESSIONS[phone] = sess
+            # Instead, transition to COMPLETE
+            sess["state"] = "COMPLETE"
             sess["ts"] = time.time()
-            sess.pop("_orientation_phase", None)
-            sess.pop("_orientation_slots", None)
             SESSIONS[phone] = sess
             await _handle(phone, "__kick__")
             return
@@ -2962,7 +3062,8 @@ async def _handle(phone: str, text: str):
         return
 
     # ========== ORIENTATION_SLOT (Availability Capture & Slot Proposal) ==========
-    elif state == "ORIENTATION_SLOT":
+    # COMMENTED OUT - Will be moved to states/orientation_slot.py
+    elif False and state == "ORIENTATION_SLOT":  # Disabled - will be in separate file
         volunteer_id = profile.get("uuid") or phone
         name = profile.get("name") or "there"
         
@@ -3084,13 +3185,14 @@ async def _handle(phone: str, text: str):
                 await _send_and_track(reply)
                 return
 
-            if llm_intent == "ORIENT_PICK_OPTION":
-                await _send_and_track(ORIENT_BOOKING_CONFIRM)
-                sess["state"] = "ORIENTATION_SCHEDULING"
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
-                await _handle(phone, text)
-                return
+            # COMMENTED OUT: Orientation scheduling disabled
+            # if llm_intent == "ORIENT_PICK_OPTION":
+            #     await _send_and_track(ORIENT_BOOKING_CONFIRM)
+            #     sess["state"] = "ORIENTATION_SCHEDULING"
+            #     sess["ts"] = time.time()
+            #     SESSIONS[phone] = sess
+            #     await _handle(phone, text)
+            #     return
 
             if llm_intent != "ORIENT_PROVIDE_PREFERENCES":
                 # Unknown intent even after acceptance – fall through to parsing
@@ -3261,11 +3363,18 @@ async def _handle(phone: str, text: str):
             await mcp_wa_send(phone, confirm_msg)
             _add_to_history(phone, bot_msg=confirm_msg)
             
+            # COMMENTED OUT: Orientation scheduling disabled
             # Transition to ORIENTATION_SCHEDULING
-            sess["state"] = "ORIENTATION_SCHEDULING"
+            # sess["state"] = "ORIENTATION_SCHEDULING"
+            # sess["ts"] = time.time()
+            # SESSIONS[phone] = sess
+            # log.info(f"[ORIENT] Slot options sent, transitioning to ORIENTATION_SCHEDULING for {phone}")
+            # return
+            # Instead, transition to COMPLETE
+            sess["state"] = "COMPLETE"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
-            log.info(f"[ORIENT] Slot options sent, transitioning to ORIENTATION_SCHEDULING for {phone}")
+            log.info(f"[ORIENT] Orientation scheduling disabled, transitioning to COMPLETE for {phone}")
             return
             
         except Exception as e:
@@ -3277,7 +3386,8 @@ async def _handle(phone: str, text: str):
             return
 
     # ========== DEFERRED (Waiting for volunteer to return) ==========
-    elif state == "DEFERRED":
+    # COMMENTED OUT - Will be moved to states/deferred.py
+    elif False and state == "DEFERRED":  # Disabled - will be in separate file
         prev_state = sess.pop("_deferred_prev_state", None) or "WELCOME"
         reason = sess.pop("_deferred_reason", None)
 
@@ -3293,7 +3403,8 @@ async def _handle(phone: str, text: str):
         return
 
     # ========== ORIENTATION_SCHEDULING (Slot Selection & Booking) ==========
-    elif state == "ORIENTATION_SCHEDULING":
+    # COMMENTED OUT - Will be moved to states/orientation_scheduling.py
+    elif False and state == "ORIENTATION_SCHEDULING":  # Disabled - will be in separate file
         volunteer_id = profile.get("uuid") or phone
         name = profile.get("name") or "there"
         
@@ -3302,7 +3413,14 @@ async def _handle(phone: str, text: str):
         slots = sess.get("_orientation_slots", [])
         if not slots:
             log.warning(f"[SCHED] No slots found in session for {phone}, asking for availability again")
-            sess["state"] = "ORIENTATION_SLOT"
+            # COMMENTED OUT: Orientation scheduling disabled
+            # sess["state"] = "ORIENTATION_SLOT"
+            # sess["ts"] = time.time()
+            # SESSIONS[phone] = sess
+            # await _handle(phone, "__kick__")
+            # return
+            # Instead, transition to COMPLETE
+            sess["state"] = "COMPLETE"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             await _handle(phone, "__kick__")
@@ -3433,8 +3551,10 @@ async def _handle(phone: str, text: str):
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             return
+    # End of commented-out state handlers
+    # ============================================================================
 
-    # Default: unknown state
+    # Default: unknown state (only reached if state is not WELCOME and not in commented section)
     log.warning(f"[HANDLE] Unknown state: {state}")
     await mcp_wa_send(phone, "Sorry, something went wrong. Please type 'restart' to try again.")
     sess["ts"] = time.time()

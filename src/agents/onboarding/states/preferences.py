@@ -1,0 +1,202 @@
+"""
+PREFERENCES State Handler (State 5: Day & Time Preferences Collection)
+Reuses the old PREFS_DAYTIME logic
+"""
+import logging
+import time
+import re
+import asyncio
+from typing import Dict, Any
+from ..messages import (
+    PREFS_INTRO_COLLAB, PREFS_FOLLOWUP_DAYS, PREFS_FOLLOWUP_TIME,
+    PREFS_WEEKEND_NOTE, PREFS_EVENING_NUDGE, PREFS_CONFIRM_DEFAULT,
+    PREFS_SUMMARY_FALLBACK, format_message
+)
+
+log = logging.getLogger(__name__)
+
+
+async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profile: Dict[str, Any]) -> None:
+    """
+    Handle PREFERENCES state - collect day and time preferences
+    
+    Args:
+        phone: Phone number (session key)
+        text: User's message
+        sess: Session dict
+        profile: Profile dict
+    """
+    # Late import to avoid circular dependency
+    from ..wa_loop import (
+        mcp_wa_send, _add_to_history, _handle, SESSIONS,
+        _generate_prefs_interpretation, _generate_prefs_summary_phone,
+        mcp_preferences_save, mcp_deferral_create
+    )
+    
+    if text == "__kick__" or not sess.get("_prefs_prompted"):
+        await mcp_wa_send(phone, PREFS_INTRO_COLLAB)
+        _add_to_history(phone, bot_msg=PREFS_INTRO_COLLAB)
+        sess["_prefs_prompted"] = True
+        sess.setdefault("_prefs_days", [])
+        sess.setdefault("_prefs_time_band", None)
+        sess["_prefs_evening_attempts"] = 0
+        sess["_prefs_last_prompt"] = "intro"
+        sess["_prefs_last_prompt_text"] = PREFS_INTRO_COLLAB
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+        return
+
+    interpretation = await _generate_prefs_interpretation(
+        phone=phone,
+        profile=profile,
+        volunteer_name=profile.get("name"),
+        text=text,
+        sess=sess,
+    )
+
+    days = sess.setdefault("_prefs_days", [])
+    time_band = sess.get("_prefs_time_band")
+    had_evening = time_band == "EVENING"
+
+    if interpretation.get("days"):
+        for iso in interpretation["days"]:
+            if iso not in days:
+                days.append(iso)
+
+    if interpretation.get("time_band"):
+        time_band = interpretation["time_band"]
+        sess["_prefs_time_band"] = time_band
+
+    if interpretation.get("topics"):
+        topics = sess.setdefault("_qa_topics", [])
+        for topic in interpretation["topics"]:
+            if topic not in topics:
+                topics.append(topic)
+
+    if not interpretation.get("days"):
+        inferred_days: list[str] = []
+        text_lower_local = text.lower()
+        day_patterns = {
+            "monday": "MON",
+            "mon": "MON",
+            "tuesday": "TUE",
+            "tue": "TUE",
+            "wednesday": "WED",
+            "wed": "WED",
+            "thursday": "THU",
+            "thu": "THU",
+            "thur": "THU",
+            "friday": "FRI",
+            "fri": "FRI",
+            "saturday": "SAT",
+            "sat": "SAT",
+            "sunday": "SUN",
+            "sun": "SUN",
+        }
+        for token, iso in day_patterns.items():
+            if re.search(rf"\b{re.escape(token)}\b", text_lower_local):
+                if iso not in inferred_days:
+                    inferred_days.append(iso)
+        if inferred_days:
+            for iso in inferred_days:
+                if iso not in days:
+                    days.append(iso)
+
+    if interpretation.get("deferral"):
+        await mcp_deferral_create(
+            profile.get("uuid") or phone,
+            "PREFS_LATER",
+            interpretation["deferral"]["until_iso"],
+            f"{phone}_PREFS_DEFER_{int(time.time())}"
+        )
+        await mcp_wa_send(phone, interpretation["deferral"]["message"])
+        _add_to_history(phone, bot_msg=interpretation["deferral"]["message"])
+        sess["_deferred_prev_state"] = "PREFERENCES"
+        sess["_deferred_reason"] = "PREFS_LATER"
+        sess["state"] = "DEFERRED"
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+        return
+    elif interpretation.get("followup"):
+        await mcp_wa_send(phone, interpretation["followup"])
+        _add_to_history(phone, bot_msg=interpretation["followup"])
+        sess["_prefs_last_prompt"] = interpretation.get("followup_tag")
+        sess["_prefs_last_prompt_text"] = interpretation["followup"]
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+        return
+
+    if not days:
+        followup = PREFS_FOLLOWUP_DAYS
+        await mcp_wa_send(phone, followup)
+        _add_to_history(phone, bot_msg=followup)
+        sess["_prefs_last_prompt"] = "days_followup"
+        sess["_prefs_last_prompt_text"] = followup
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+        return
+
+    day_label_map = {
+        "MON": "Monday", "TUE": "Tuesday", "WED": "Wednesday",
+        "THU": "Thursday", "FRI": "Friday", "SAT": "Saturday", "SUN": "Sunday"
+    }
+    human_days = [day_label_map.get(d, d) for d in days[:3]]
+    if len(human_days) == 1:
+        days_str = human_days[0]
+    elif len(human_days) == 2:
+        days_str = f"{human_days[0]} & {human_days[1]}"
+    else:
+        days_str = ", ".join(human_days[:-1]) + f" & {human_days[-1]}"
+
+    band_label_map = {
+        "MORNING": "morning slots",
+        "AFTERNOON": "lunch or early-afternoon slots",
+        "EVENING": "evening slots"
+    }
+    band_str = band_label_map.get(time_band, "your preferred time")
+
+    profile.setdefault("preferences", {})
+    profile["preferences"]["days"] = days
+    profile["preferences"]["time_band"] = time_band
+
+    confirm = format_message(PREFS_CONFIRM_DEFAULT, days=days_str, band=band_str)
+    await mcp_wa_send(phone, confirm)
+    _add_to_history(phone, bot_msg=confirm)
+    sess["_prefs_last_prompt"] = None
+    sess["_prefs_last_prompt_text"] = None
+    sess.pop("_prefs_evening_attempts", None)
+
+    vid = profile.get("uuid")
+    if vid and str(vid).upper() not in {"NONE", "UNKNOWN"}:
+        try:
+            await mcp_preferences_save(vid, time_band)
+        except Exception as e:
+            # Non-blocking: log warning but continue flow
+            log.warning(f"[PREFS] preferences.save failed (continuing anyway): {e}")
+
+    summary_msg = await _generate_prefs_summary_phone(
+        phone=phone,
+        sess=sess,
+        profile=profile,
+        volunteer_name=profile.get("name"),
+        days=days,
+        time_band=time_band,
+        days_label=days_str,
+        band_label=band_str,
+    )
+    if summary_msg:
+        await asyncio.sleep(0.4)
+        await mcp_wa_send(phone, summary_msg)
+        _add_to_history(phone, bot_msg=summary_msg)
+
+    # Transition to QA_WINDOW state
+    sess["state"] = "QA_WINDOW"
+    sess["_qa_count"] = 0
+    sess["_qa_topics"] = []
+    sess["_qa_summary_sent"] = False
+    sess["ts"] = time.time()
+    SESSIONS[phone] = sess
+
+    await asyncio.sleep(0.5)
+    await _handle(phone, "__kick__")
+    return

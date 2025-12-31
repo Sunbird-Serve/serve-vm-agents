@@ -8,11 +8,11 @@ All conversational messages are defined here for easy modification and consisten
 YES_WORDS = {"yes", "y", "ok", "okay", "sure", "go ahead", "continue", "proceed", 
              "ya", "haan", "start", "begin", "let's start", "lets start", 
              "correct", "right", "yup", "yep", "that's right", "thats right",
-             "perfect", "exactly", "absolutely", "definitely", "of course",
-             "sounds good", "sounds great", "good", "great", "fine", "alright",
+             "perfect", "exactly", "absolutely", "definitely", "of course","ofcourse","of course yes","ofcourse yes",
+             "sounds good", "sounds great", "good", "great", "fine", "alright","yes ofcourse","yes of course",
              "sure thing", "why not", "i agree", "agreed", "true", "indeed",
              "should be fine", "i think so", "seems fine", "works", "works for me",
-             "fine by me"}
+             "fine by me","yes please","please proceed","Ofcourse","Ofcource yes"}
 
 NO_WORDS = {"no", "n", "nope", "nah", "not really", "no thanks", "not interested",
             "don't want", "dont want", "not now", "pass", "skip", "decline"}
@@ -23,7 +23,7 @@ CONFIRM_WORDS = {"yes", "correct", "right", "yup", "yep", "confirm", "confirmed"
                  "that's right", "thats right", "perfect", "exactly", "ok", "okay",
                  "absolutely", "definitely", "of course", "sounds good", "sounds great",
                  "good", "great", "fine", "alright", "sure", "sure thing", "agreed",
-                 "true", "indeed", "precisely", "spot on", "bingo", "exactly right"}
+                 "true", "indeed", "precisely", "spot on", "bingo", "exactly right", "of course","ofcourse","of course yes","ofcourse yes"}
 
 EDIT_WORDS = {"edit", "no", "wrong", "change", "incorrect", "not right", "not correct",
               "modify", "update", "fix", "redo", "start over", "try again"}
@@ -38,17 +38,17 @@ WELCOME_MAYBE_LATER = """No worries! You can come back anytime using this same l
 
 Just send 'start' whenever you're ready."""
 
-WELCOME_INTRO = """Hey {name}! I'm Sia from the SERVE team 😊
+WELCOME_INTRO = """Hi! 👋 I'm SIA from Sunbird SERVE. 💛
 
-Thank you for registering with us — it's wonderful to have you here.
+I'm genuinely happy you reached out.
 
-If it's okay with you, I'll quickly walk you through how SERVE works and get you onboarded. Shall we continue?"""
+A child's learning can change because one volunteer showed up — and that could be you."""
 
 WELCOME_SERVE_OVERVIEW = """Beautiful 🌼
 
 SERVE connects volunteers like you with students in government and rural schools. You teach online, students join from their classroom.
 
-This is a volunteer opportunity (not a paid role), but your time directly strengthens children’s learning.
+This is a volunteer opportunity (not a paid role), but your time directly strengthens children's learning.
 
 Shall I take you through a few quick questions to get you ready?"""
 
@@ -57,7 +57,82 @@ WELCOME_CONSENT_ACK = """Great, I'll keep it simple and quick."""
 WELCOME_CONSENT_REMINDER = """Quick reminder — shall we continue with the onboarding?"""
 
 
-# ---------- Section 2: Eligibility Screening ----------
+# ---------- Section 2: Intent (Commitment Check) ----------
+INTENT_PROMPT = """Before we go ahead —  
+
+would you be comfortable teaching around **2 hours a week**?  
+
+(We always try to work around your routine 😊)"""
+
+INTENT_PERSUASION = """That's completely okay — even small amounts of time can make a big difference. 🌱  
+
+Many volunteers try one session on Saturday and another during the week."""
+
+INTENT_EXIT = """I understand 💛  
+
+You're always welcome to stay connected with the SERVE community  
+
+and explore volunteering or contribution opportunities in the future.
+
+👉 Join SERVE Community: https://serve.sunbird.org/community  
+
+Thank you for your interest, and wishing you a lovely day 🌼"""
+
+
+# ---------- Section 3: Eligibility Check ----------
+ELIGIBILITY_PROMPT = """Just to make sure this works smoothly for you and the students —
+
+• You're 18 or above  
+
+• You have a tablet or laptop with Internet  
+
+• You understand this is a voluntary role (no payment)
+
+Are all three okay for you?"""
+
+ELIGIBILITY_EXIT = """Thank you for being honest 💛  
+
+These are important requirements for classroom volunteering right now.
+
+You're always welcome to stay connected with the SERVE community and explore other ways to contribute.
+
+👉 Join the SERVE Community: https://serve.sunbird.org/community
+
+Wishing you a lovely day 🌼"""
+
+
+# ---------- Section 4: Identity Collection ----------
+IDENTITY_NAME_PROMPT = """Lovely!  
+
+btw, may I know your **name**? 🙂"""
+
+IDENTITY_CONTACT_PROMPT = """Thanks {name}!  
+
+Could you share your **phone number** and **email**?  
+
+This helps create your volunteer profile and keep you updated on sessions."""
+
+IDENTITY_CONTACT_RETRY = """Could you share both phone number and email? 🙂"""
+
+IDENTITY_NUDGE = """I understand your concern 💛  
+
+These details are important so we can  
+• create your volunteer profile  
+• coordinate sessions  
+• and support you properly once you start"""
+
+IDENTITY_BOUNDARY = """Without these details, I won't be able to move you into classroom volunteering just yet."""
+
+IDENTITY_EXIT = """You're very welcome to stay connected with the SERVE community,  
+learn more about our work, and explore other ways to contribute.
+
+👉 Join SERVE Community: https://serve.sunbird.org/community  
+
+Thank you for your interest, {name}.  
+Hope to see you again 🌱"""
+
+
+# ---------- Section 5: Eligibility Screening (Old - kept for reference) ----------
 ELIGIBILITY_INTRO = """Lovely!
 Quick one — you're 18 or older, right?"""
 
@@ -135,9 +210,7 @@ ELIGIBILITY_DECLINE_GENERIC = """Thanks for your interest! Right now, we need vo
 
 ELIGIBILITY_SUMMARY = """Lovely, thank you for sharing 💛
 
-So far I’ve noted: you’re {age_phrase}, have a working device & internet, and can give about {commitment_phrase} a week.
-
-Next, let’s find when you’re usually free on weekdays."""
+So far I've noted: you're {age_phrase}, have a working device & internet, and can give about {commitment_phrase} a week."""
 
 ELIGIBILITY_AGE_DEVICE_FALLBACK = """Awesome! Just one more quick check — do you have a smartphone or laptop with a fairly stable internet connection?"""
 
@@ -164,7 +237,7 @@ Example: "Math for Grade 8 in Tamil" """
 
 
 # ---------- Section 4: Teaching Preferences (continued) ----------
-PREFS_INTRO_COLLAB = """Let’s find a rhythm that works for you and the students 🌱
+PREFS_INTRO_COLLAB = """Let's find a rhythm that works for you and the students 🌱
 
 Which 2–3 weekdays usually suit you? And do mornings, lunch hours, or early afternoons feel better?"""
 
@@ -176,7 +249,7 @@ PREFS_WEEKEND_NOTE = """Got it! Weekends are mostly shut in schools. Could we tr
 
 PREFS_EVENING_NUDGE = """Thanks for sharing. Most classroom slots wrap by 4 PM — is there any morning, lunch, or early afternoon window that could fit you?"""
 
-PREFS_CONFIRM_DEFAULT = """Nice! I’ll note {days} in {band} and plan around that."""
+PREFS_CONFIRM_DEFAULT = """Nice! I'll note {days} in {band} and plan around that."""
 
 PREFS_SUMMARY_FALLBACK = """Brilliant — {days_label} in {band_label} should work well for the students."""
 
@@ -287,7 +360,7 @@ PERSUADE_WEEKEND_ONLY = """I understand weekends are easier. If you can find a s
 Could you share any weekday times between 8 AM and 3 PM that might work?"""
 
 # Orientation-specific messaging
-ORIENT_AVAILABILITY_ACK = """Got it! I’ll propose a couple of options that fit those times."""
+ORIENT_AVAILABILITY_ACK = """Got it! I'll propose a couple of options that fit those times."""
 
 ORIENT_PROPOSAL_INTRO = """Here are the options based on your preference:
 {options}
@@ -310,9 +383,9 @@ Orientation: {slot}
 Link: {meet_link}
 You'll get a reminder before the session. Welcome to the SERVE Volunteer Community 💛"""
 
-ORIENT_INVALID_PICK = """I couldn’t match that to the available slots 🙈 Could you please reply with one of the shown options (like 1 or 2), or type the exact day & time?"""
+ORIENT_INVALID_PICK = """I couldn't match that to the available slots 🙈 Could you please reply with one of the shown options (like 1 or 2), or type the exact day & time?"""
 
-ORIENT_LATER_NOTE = """No worries 😊 You can message me here anytime to fix your orientation. We’ll keep your details ready."""
+ORIENT_LATER_NOTE = """No worries 😊 You can message me here anytime to fix your orientation. We'll keep your details ready."""
 
 
 # ---------- Section 5: Final Confirmation ----------
