@@ -58,7 +58,7 @@ WELCOME_CONSENT_REMINDER = """Quick reminder — shall we continue with the onbo
 
 
 # ---------- Section 2: Intent (Commitment Check) ----------
-INTENT_PROMPT = """Before we go ahead —  
+INTENT_PROMPT = """Just so this feels easy and realistic —  
 
 would you be comfortable teaching around **2 hours a week**?  
 
@@ -84,21 +84,40 @@ ELIGIBILITY_PROMPT = """Just to make sure this works smoothly for you and the st
 
 • You're 18 or above  
 
-• You have a tablet or laptop with Internet  
+• You have a **laptop or tablet** with Internet (phones aren't suitable)  
 
 • You understand this is a voluntary role (no payment)
 
 Are all three okay for you?"""
 
-ELIGIBILITY_EXIT = """Thank you for being honest 💛  
+# Button labels for ELIGIBILITY (no emojis for encoding compatibility)
+ELIGIBILITY_BUTTONS = ["Yes", "No", "Tell me more"]
 
-These are important requirements for classroom volunteering right now.
+# Progressive clarification prompts (with buttons)
+ELIGIBILITY_CLARIFY_AGE_PROMPT = """Just to confirm — are you **18 or above**?"""
+ELIGIBILITY_CLARIFY_AGE_BUTTONS = ["Yes", "No"]
 
-You're always welcome to stay connected with the SERVE community and explore other ways to contribute.
+ELIGIBILITY_CLARIFY_DEVICE_PROMPT = """Do you have a **laptop or tablet** with a stable internet connection?
 
-👉 Join the SERVE Community: https://serve.sunbird.org/community
+(Phones aren't suitable for live classes)"""
+ELIGIBILITY_CLARIFY_DEVICE_BUTTONS = ["Yes", "No"]
 
-Wishing you a lovely day 🌼"""
+ELIGIBILITY_CLARIFY_UNPAID_PROMPT = """And are you okay with this being a **voluntary (unpaid)** role?"""
+ELIGIBILITY_CLARIFY_UNPAID_BUTTONS = ["Yes", "No"]
+
+ELIGIBILITY_EXIT = """I really appreciate you taking the time to share that with me 💛
+
+These requirements help ensure students get consistent, quality support during their live classes. That's why we need 18+, a tablet or laptop with internet, and understanding it's a volunteer role.
+
+I know this might be disappointing, and I'm sorry we can't move forward right now.
+
+The good news? You're always welcome in the SERVE community — there are other meaningful ways to contribute and stay connected.
+
+👉 Join us: https://serve.sunbird.org/community
+
+If you feel this might work for you later, you can message me here anytime 💛
+
+Thank you for your interest, and wishing you a lovely day 🌼"""
 
 
 # ---------- Section 4: Identity Collection ----------

@@ -24,6 +24,78 @@ IDENTITY_MISSING_EMAIL = """Could you also share your email? 🙂"""
 IDENTITY_MISSING_PHONE = """Could you also share your phone number? 🙂"""
 IDENTITY_SAVE_RETRY = """Hmm, I couldn't save that just now — could you share your phone number and email once again? 🙂"""
 IDENTITY_NAME_RETRY = """Could you share your name? 🙂"""
+IDENTITY_INVALID_EMAIL = """Please provide a valid email address (e.g., name@example.com) 🙂"""
+IDENTITY_INVALID_PHONE = """Please provide a valid 10-digit phone number 🙂"""
+
+
+def is_valid_phone(phone: str) -> bool:
+    """
+    Validate phone number format.
+    
+    Args:
+        phone: Phone number string
+        
+    Returns:
+        True if valid (exactly 10 digits), False otherwise
+    """
+    if not phone:
+        return False
+    
+    # Remove any non-digit characters
+    digits_only = re.sub(r'\D', '', phone)
+    
+    # Must be exactly 10 digits
+    if len(digits_only) == 10 and digits_only.isdigit():
+        return True
+    
+    return False
+
+
+def is_valid_email(email: str) -> bool:
+    """
+    Validate email format.
+    
+    Args:
+        email: Email string
+        
+    Returns:
+        True if valid email format, False otherwise
+    """
+    if not email:
+        return False
+    
+    # Basic email validation pattern
+    # More strict than extraction: requires proper domain and TLD
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    
+    if not re.match(email_pattern, email):
+        return False
+    
+    # Additional checks
+    parts = email.split('@')
+    if len(parts) != 2:
+        return False
+    
+    local, domain = parts
+    
+    # Local part should not be empty
+    if not local or len(local) > 64:
+        return False
+    
+    # Domain should have at least one dot and valid TLD
+    if '.' not in domain:
+        return False
+    
+    domain_parts = domain.split('.')
+    if len(domain_parts) < 2:
+        return False
+    
+    # TLD should be at least 2 characters
+    tld = domain_parts[-1]
+    if len(tld) < 2 or not tld.isalpha():
+        return False
+    
+    return True
 
 
 def extract_phone(text: str) -> Optional[str]:
@@ -93,7 +165,7 @@ def extract_email(text: str) -> Optional[str]:
         text: User's message
         
     Returns:
-        Email string or None
+        Email string or None (only if it matches the pattern, validation happens separately)
     """
     text_lower = text.lower()
     
@@ -102,14 +174,22 @@ def extract_email(text: str) -> Optional[str]:
         # Replace "at" with "@" and "dot" with "."
         obfuscated = text_lower.replace(" at ", "@").replace(" dot ", ".").replace(" dot", ".")
         # Try to extract email from modified text
+        # Pattern requires: local@domain.tld (with proper TLD)
         email_match = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', obfuscated)
         if email_match:
-            return email_match.group(1).lower()
+            extracted = email_match.group(1).lower()
+            # Basic sanity check: must have @ and at least one dot after @
+            if "@" in extracted and "." in extracted.split("@")[1]:
+                return extracted
     
     # Standard email pattern
+    # Pattern requires: local@domain.tld (with proper TLD)
     email_match = re.search(r'\b([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b', text)
     if email_match:
-        return email_match.group(1).lower()
+        extracted = email_match.group(1).lower()
+        # Basic sanity check: must have @ and at least one dot after @
+        if "@" in extracted and "." in extracted.split("@")[1]:
+            return extracted
     
     return None
 
@@ -181,19 +261,20 @@ def classify_name_response(text: str) -> Tuple[str, Optional[str]]:
         return ("NAME_UNCLEAR", None)
 
 
-def classify_contacts_response(text: str) -> Tuple[str, Optional[str], Optional[str]]:
+def classify_contacts_response(text: str) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
     """
     Classify contacts response using rule-based approach.
     
     Returns:
-        (intent: str, phone: Optional[str], email: Optional[str])
-        intent can be: CONTACTS_OK, CONTACTS_PARTIAL, REFUSE_CONTACTS, QUERY, AMBIGUOUS
+        (intent: str, phone: Optional[str], email: Optional[str], invalid_field: Optional[str])
+        intent can be: CONTACTS_OK, CONTACTS_PARTIAL, REFUSE_CONTACTS, QUERY, INVALID_EMAIL, INVALID_PHONE, AMBIGUOUS
+        invalid_field can be: "email", "phone", or None
     """
     text_lower = text.lower().strip()
     
     # Check for QUERY
     if "?" in text or re.search(r"^(what|how|when|why|where|who|which|can|could|do|does|is|are)\b", text, re.I):
-        return ("QUERY", None, None)
+        return ("QUERY", None, None, None)
     
     # Check for REFUSE_CONTACTS
     refusal_patterns = [
@@ -203,24 +284,66 @@ def classify_contacts_response(text: str) -> Tuple[str, Optional[str], Optional[
     ]
     for pattern in refusal_patterns:
         if re.search(pattern, text_lower):
-            return ("REFUSE_CONTACTS", None, None)
+            return ("REFUSE_CONTACTS", None, None, None)
     
     # Extract phone and email
     extracted_phone = extract_phone(text)
     extracted_email = extract_email(text)
     
+    # Validate extracted data FIRST (before checking for failed extractions)
+    if extracted_phone:
+        if not is_valid_phone(extracted_phone):
+            return ("INVALID_PHONE", None, None, "phone")
+    
+    if extracted_email:
+        if not is_valid_email(extracted_email):
+            return ("INVALID_EMAIL", None, None, "email")
+    
+    # Detect invalid format attempts (user tried but extraction failed)
+    # Check if user tried to provide email but it's invalid
+    # More specific check: look for @ symbol (most reliable indicator)
+    has_email_indicators = "@" in text or " at " in text_lower
+    # Also check if text contains email-like patterns that didn't extract
+    # This pattern matches emails without TLD (which extract_email rejects)
+    has_email_like_pattern = bool(re.search(r'[a-zA-Z0-9._%+-]+\s*@\s*[a-zA-Z0-9.-]+', text))
+    has_phone_indicators = bool(re.search(r'\d', text)) and (len(re.findall(r'\d', text)) >= 5)
+    
+    # Check for invalid format attempts (user tried but extraction failed)
+    # Priority: Check for email attempts first
+    if has_email_indicators or has_email_like_pattern:
+        if not extracted_email:
+            # User tried to provide email but extraction failed (invalid format - likely missing TLD or malformed)
+            # Double-check: make sure it's not just @ in random text
+            # If @ is present and we have email-like pattern but no valid extraction, it's invalid
+            if "@" in text:
+                # Additional check: make sure there's text before and after @
+                parts = text.split("@")
+                if len(parts) >= 2 and len(parts[0].strip()) > 0 and len(parts[1].strip()) > 0:
+                    return ("INVALID_EMAIL", None, None, "email")
+    
+    if has_phone_indicators and not extracted_phone:
+        # User tried to provide phone but format is invalid
+        # But be careful - might just be part of other text
+        # Only flag if it looks like a phone attempt (has 5+ digits in sequence or common phone patterns)
+        if re.search(r'\d{5,}', text) or re.search(r'(\+91|91)?\s*\d{6,}', text):
+            return ("INVALID_PHONE", None, None, "phone")
+    
+    # Both valid
     if extracted_phone and extracted_email:
-        return ("CONTACTS_OK", extracted_phone, extracted_email)
-    elif extracted_phone:
-        return ("CONTACTS_PARTIAL", extracted_phone, None)
-    elif extracted_email:
-        return ("CONTACTS_PARTIAL", None, extracted_email)
+        if is_valid_phone(extracted_phone) and is_valid_email(extracted_email):
+            return ("CONTACTS_OK", extracted_phone, extracted_email, None)
+    
+    # Partial - one valid
+    if extracted_phone and is_valid_phone(extracted_phone):
+        return ("CONTACTS_PARTIAL", extracted_phone, None, None)
+    elif extracted_email and is_valid_email(extracted_email):
+        return ("CONTACTS_PARTIAL", None, extracted_email, None)
+    
+    # Ambiguous
+    if len(text.strip()) > 3:
+        return ("AMBIGUOUS", None, None, None)
     else:
-        # Check if it's clearly ambiguous (has some text but no extractable data)
-        if len(text.strip()) > 3:
-            return ("AMBIGUOUS", None, None)
-        else:
-            return ("AMBIGUOUS", None, None)
+        return ("AMBIGUOUS", None, None, None)
 
 
 def should_use_llm_for_name(text: str, intent: str) -> bool:
@@ -330,6 +453,8 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
         mcp_llm_classify_intent, build_llm_context
     )
     
+    log.info(f"[IDENTITY] DEBUG: Handler called - text='{text[:50]}...', name_collected={sess.get('_identity_name_collected')}, contact_collected={sess.get('_identity_contact_collected')}, contact_asked={sess.get('_identity_contact_asked')}")
+    
     # Step A: Ask for name if not collected
     if not sess.get("_identity_name_collected"):
         if text == "__kick__" or not sess.get("_identity_name_asked"):
@@ -418,9 +543,32 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
     
     # Step B: Collect phone + email
     if sess.get("_identity_name_collected") and not sess.get("_identity_contact_collected"):
+        log.info(f"[IDENTITY] DEBUG: Entering Step B (phone + email collection)")
+        # Get previously stored partial data (if any)
+        stored_phone = sess.get("_identity_partial_phone")
+        stored_email = sess.get("_identity_partial_email")
+        log.info(f"[IDENTITY] DEBUG: Stored partial data - phone={stored_phone}, email={stored_email}")
+        
         # Step 1: Rule-based classification
-        intent, extracted_phone, extracted_email = classify_contacts_response(text)
-        log.info(f"[IDENTITY] Contacts classification: intent={intent}, phone={extracted_phone}, email={extracted_email}")
+        intent, extracted_phone, extracted_email, invalid_field = classify_contacts_response(text)
+        log.info(f"[IDENTITY] Contacts classification: intent={intent}, phone={extracted_phone}, email={extracted_email}, invalid_field={invalid_field}")
+        
+        # Step 1.5: Handle invalid formats IMMEDIATELY (before LLM or combine logic)
+        if intent == "INVALID_EMAIL":
+            log.info(f"[IDENTITY] Invalid email format provided")
+            await mcp_wa_send(phone, IDENTITY_INVALID_EMAIL)
+            _add_to_history(phone, bot_msg=IDENTITY_INVALID_EMAIL)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+        
+        if intent == "INVALID_PHONE":
+            log.info(f"[IDENTITY] Invalid phone format provided")
+            await mcp_wa_send(phone, IDENTITY_INVALID_PHONE)
+            _add_to_history(phone, bot_msg=IDENTITY_INVALID_PHONE)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
         
         # Step 2: LLM fallback if needed
         if intent in ["AMBIGUOUS", "CONTACTS_PARTIAL"] and should_use_llm_for_contacts(text, intent):
@@ -435,18 +583,129 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
                     phone = extract_phone(text)
                     email = extract_email(text)
                     if phone and email:
-                        extracted_phone = phone
-                        extracted_email = email
-                        intent = "CONTACTS_OK"
-                        log.info(f"[IDENTITY] LLM helped extract contacts")
-                    elif phone or email:
-                        extracted_phone = phone
-                        extracted_email = email
-                        intent = "CONTACTS_PARTIAL"
+                        # Validate before accepting
+                        if is_valid_phone(phone) and is_valid_email(email):
+                            extracted_phone = phone
+                            extracted_email = email
+                            intent = "CONTACTS_OK"
+                            invalid_field = None
+                            log.info(f"[IDENTITY] LLM helped extract contacts")
+                        elif is_valid_phone(phone):
+                            extracted_phone = phone
+                            intent = "CONTACTS_PARTIAL"
+                            invalid_field = "email" if email else None
+                        elif is_valid_email(email):
+                            extracted_email = email
+                            intent = "CONTACTS_PARTIAL"
+                            invalid_field = "phone" if phone else None
+                        else:
+                            # Both invalid
+                            if phone:
+                                intent = "INVALID_PHONE"
+                                invalid_field = "phone"
+                            elif email:
+                                intent = "INVALID_EMAIL"
+                                invalid_field = "email"
+                    elif phone:
+                        if is_valid_phone(phone):
+                            extracted_phone = phone
+                            intent = "CONTACTS_PARTIAL"
+                            invalid_field = None
+                        else:
+                            intent = "INVALID_PHONE"
+                            invalid_field = "phone"
+                    elif email:
+                        if is_valid_email(email):
+                            extracted_email = email
+                            intent = "CONTACTS_PARTIAL"
+                            invalid_field = None
+                        else:
+                            intent = "INVALID_EMAIL"
+                            invalid_field = "email"
             except Exception as e:
                 log.warning(f"[IDENTITY] LLM classification failed: {e}")
         
+        # Step 2.5: Combine with stored partial data if available
+        if intent == "CONTACTS_PARTIAL":
+            log.info(f"[IDENTITY] DEBUG: Entering combine logic - extracted_phone={extracted_phone}, extracted_email={extracted_email}, stored_phone={stored_phone}, stored_email={stored_email}")
+            # Combine current extraction with stored partial data
+            if extracted_phone and stored_email:
+                # We have phone now, and we had email before - validate both
+                log.info(f"[IDENTITY] DEBUG: Checking combine - phone from current + email from previous")
+                phone_valid = is_valid_phone(extracted_phone)
+                email_valid = is_valid_email(stored_email)
+                log.info(f"[IDENTITY] DEBUG: Validation - phone_valid={phone_valid}, email_valid={email_valid}")
+                if phone_valid and email_valid:
+                    extracted_email = stored_email
+                    intent = "CONTACTS_OK"
+                    invalid_field = None
+                    log.info(f"[IDENTITY] Combined: phone from current message + email from previous")
+                    # Clear stored partial data
+                    sess.pop("_identity_partial_phone", None)
+                    sess.pop("_identity_partial_email", None)
+                else:
+                    log.info(f"[IDENTITY] DEBUG: Combine failed - validation failed")
+            elif extracted_email and stored_phone:
+                # We have email now, and we had phone before - validate both
+                log.info(f"[IDENTITY] DEBUG: Checking combine - email from current + phone from previous")
+                email_valid = is_valid_email(extracted_email)
+                phone_valid = is_valid_phone(stored_phone)
+                log.info(f"[IDENTITY] DEBUG: Validation - email_valid={email_valid}, phone_valid={phone_valid}, stored_phone={stored_phone}")
+                if email_valid and phone_valid:
+                    extracted_phone = stored_phone
+                    intent = "CONTACTS_OK"
+                    invalid_field = None
+                    log.info(f"[IDENTITY] Combined: email from current message + phone from previous")
+                    # Clear stored partial data
+                    sess.pop("_identity_partial_phone", None)
+                    sess.pop("_identity_partial_email", None)
+                else:
+                    log.info(f"[IDENTITY] DEBUG: Combine failed - validation failed (email_valid={email_valid}, phone_valid={phone_valid})")
+            elif extracted_phone and not extracted_email:
+                # Only phone in current message, check if we had email before
+                log.info(f"[IDENTITY] DEBUG: Checking combine - phone from current, checking for stored email")
+                if stored_email:
+                    email_valid = is_valid_email(stored_email)
+                    phone_valid = is_valid_phone(extracted_phone)
+                    log.info(f"[IDENTITY] DEBUG: Validation - email_valid={email_valid}, phone_valid={phone_valid}")
+                    if email_valid and phone_valid:
+                        extracted_email = stored_email
+                        intent = "CONTACTS_OK"
+                        invalid_field = None
+                        log.info(f"[IDENTITY] Combined: phone from current + email from previous")
+                        sess.pop("_identity_partial_phone", None)
+                        sess.pop("_identity_partial_email", None)
+                    else:
+                        log.info(f"[IDENTITY] DEBUG: Combine failed - validation failed")
+                else:
+                    log.info(f"[IDENTITY] DEBUG: No stored email to combine with")
+            elif extracted_email and not extracted_phone:
+                # Only email in current message, check if we had phone before
+                log.info(f"[IDENTITY] DEBUG: Checking combine - email from current, checking for stored phone")
+                if stored_phone:
+                    phone_valid = is_valid_phone(stored_phone)
+                    email_valid = is_valid_email(extracted_email)
+                    log.info(f"[IDENTITY] DEBUG: Validation - phone_valid={phone_valid}, email_valid={email_valid}, stored_phone={stored_phone}")
+                    if phone_valid and email_valid:
+                        extracted_phone = stored_phone
+                        intent = "CONTACTS_OK"
+                        invalid_field = None
+                        log.info(f"[IDENTITY] Combined: email from current + phone from previous")
+                        sess.pop("_identity_partial_phone", None)
+                        sess.pop("_identity_partial_email", None)
+                    else:
+                        log.info(f"[IDENTITY] DEBUG: Combine failed - validation failed (phone_valid={phone_valid}, email_valid={email_valid})")
+                else:
+                    log.info(f"[IDENTITY] DEBUG: No stored phone to combine with")
+            else:
+                log.info(f"[IDENTITY] DEBUG: No combine condition matched")
+            
+            log.info(f"[IDENTITY] DEBUG: After combine - intent={intent}, extracted_phone={extracted_phone}, extracted_email={extracted_email}")
+        
         # Step 3: Handle based on intent
+        # Note: INVALID_EMAIL and INVALID_PHONE are already handled in Step 1.5 (early return)
+        # This section handles other intents
+        
         if intent == "REFUSE_CONTACTS":
             # Handle refusal flow
             if not sess.get("_identity_nudge_sent"):
@@ -490,51 +749,110 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
             return
         
         elif intent == "CONTACTS_OK" and extracted_phone and extracted_email:
-            # Both collected - save profile
+            # Both collected - validate before proceeding
+            if not is_valid_phone(extracted_phone):
+                log.info(f"[IDENTITY] Invalid phone format in CONTACTS_OK, showing error")
+                await mcp_wa_send(phone, IDENTITY_INVALID_PHONE)
+                _add_to_history(phone, bot_msg=IDENTITY_INVALID_PHONE)
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            
+            if not is_valid_email(extracted_email):
+                log.info(f"[IDENTITY] Invalid email format in CONTACTS_OK, showing error")
+                await mcp_wa_send(phone, IDENTITY_INVALID_EMAIL)
+                _add_to_history(phone, bot_msg=IDENTITY_INVALID_EMAIL)
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            
+            # Both are valid - save profile (bypassed for now)
             name = profile.get("name", "")
-            log.info(f"[IDENTITY] Phone and email collected: {extracted_phone}, {extracted_email}")
+            log.info(f"[IDENTITY] Phone and email collected and validated: {extracted_phone}, {extracted_email}")
             
+            # TODO: Uncomment when saveProfile MCP tool is implemented
             # Try to save profile
-            success, error = await save_profile(name, extracted_phone, extracted_email)
+            # success, error = await save_profile(name, extracted_phone, extracted_email)
             
-            if success:
-                # Profile saved successfully
-                profile["phone"] = extracted_phone
-                profile["email"] = extracted_email
-                sess["profile"] = profile
-                sess["_identity_contact_collected"] = True
-                sess["_identity_nudge_sent"] = False  # Reset for next time
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
-                
-                # Transition to next state (Preferences)
-                log.info(f"[IDENTITY] Profile saved, proceeding to PREFERENCES")
-                sess["state"] = "PREFERENCES"
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
-                await _handle(phone, "__kick__")
-                return
-            else:
-                # Save failed - ask once again
-                log.warning(f"[IDENTITY] saveProfile failed, asking to retry")
-                await mcp_wa_send(phone, IDENTITY_SAVE_RETRY)
-                _add_to_history(phone, bot_msg=IDENTITY_SAVE_RETRY)
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
-                return
+            # For now, bypass saveProfile and proceed
+            log.info(f"[IDENTITY] saveProfile bypassed (not implemented yet), proceeding anyway")
+            profile["phone"] = extracted_phone
+            profile["email"] = extracted_email
+            sess["profile"] = profile
+            sess["_identity_contact_collected"] = True
+            sess["_identity_nudge_sent"] = False  # Reset for next time
+            # Clear any stored partial data
+            sess.pop("_identity_partial_phone", None)
+            sess.pop("_identity_partial_email", None)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            
+            # Transition to next state (Preferences)
+            log.info(f"[IDENTITY] Proceeding to PREFERENCES (saveProfile bypassed)")
+            sess["state"] = "PREFERENCES"
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            await _handle(phone, "__kick__")
+            return
+            
+            # Original code (commented out for when saveProfile is implemented):
+            # if success:
+            #     # Profile saved successfully
+            #     profile["phone"] = extracted_phone
+            #     profile["email"] = extracted_email
+            #     sess["profile"] = profile
+            #     sess["_identity_contact_collected"] = True
+            #     sess["_identity_nudge_sent"] = False  # Reset for next time
+            #     sess["ts"] = time.time()
+            #     SESSIONS[phone] = sess
+            #     
+            #     # Transition to next state (Preferences)
+            #     log.info(f"[IDENTITY] Profile saved, proceeding to PREFERENCES")
+            #     sess["state"] = "PREFERENCES"
+            #     sess["ts"] = time.time()
+            #     SESSIONS[phone] = sess
+            #     await _handle(phone, "__kick__")
+            #     return
+            # else:
+            #     # Save failed - ask once again
+            #     log.warning(f"[IDENTITY] saveProfile failed, asking to retry")
+            #     await mcp_wa_send(phone, IDENTITY_SAVE_RETRY)
+            #     _add_to_history(phone, bot_msg=IDENTITY_SAVE_RETRY)
+            #     sess["ts"] = time.time()
+            #     SESSIONS[phone] = sess
+            #     return
         
         elif intent == "CONTACTS_PARTIAL":
-            # Only one provided - ask for missing one
+            # Only one provided - validate and store it, then ask for missing one
             if extracted_phone and not extracted_email:
-                log.info(f"[IDENTITY] Phone provided, missing email")
-                await mcp_wa_send(phone, IDENTITY_MISSING_EMAIL)
-                _add_to_history(phone, bot_msg=IDENTITY_MISSING_EMAIL)
+                # Validate phone before storing
+                if is_valid_phone(extracted_phone):
+                    log.info(f"[IDENTITY] Phone provided, missing email - storing phone and asking for email")
+                    # Store the partial phone
+                    sess["_identity_partial_phone"] = extracted_phone
+                    await mcp_wa_send(phone, IDENTITY_MISSING_EMAIL)
+                    _add_to_history(phone, bot_msg=IDENTITY_MISSING_EMAIL)
+                else:
+                    # Invalid phone format
+                    log.info(f"[IDENTITY] Invalid phone format provided")
+                    await mcp_wa_send(phone, IDENTITY_INVALID_PHONE)
+                    _add_to_history(phone, bot_msg=IDENTITY_INVALID_PHONE)
             elif extracted_email and not extracted_phone:
-                log.info(f"[IDENTITY] Email provided, missing phone")
-                await mcp_wa_send(phone, IDENTITY_MISSING_PHONE)
-                _add_to_history(phone, bot_msg=IDENTITY_MISSING_PHONE)
+                # Validate email before storing
+                if is_valid_email(extracted_email):
+                    log.info(f"[IDENTITY] Email provided, missing phone - storing email and asking for phone")
+                    # Store the partial email
+                    sess["_identity_partial_email"] = extracted_email
+                    await mcp_wa_send(phone, IDENTITY_MISSING_PHONE)
+                    _add_to_history(phone, bot_msg=IDENTITY_MISSING_PHONE)
+                else:
+                    # Invalid email format
+                    log.info(f"[IDENTITY] Invalid email format provided")
+                    await mcp_wa_send(phone, IDENTITY_INVALID_EMAIL)
+                    _add_to_history(phone, bot_msg=IDENTITY_INVALID_EMAIL)
             else:
                 # Both missing - re-ask
+                log.info(f"[IDENTITY] Neither phone nor email found, re-asking")
                 name = profile.get("name", "there")
                 contact_msg = format_message(IDENTITY_CONTACT_PROMPT, name=name)
                 await mcp_wa_send(phone, contact_msg)
@@ -544,12 +862,28 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
             return
         
         else:
-            # AMBIGUOUS or other - re-ask contacts
-            log.info(f"[IDENTITY] Ambiguous response, re-asking contacts")
-            name = profile.get("name", "there")
-            contact_msg = format_message(IDENTITY_CONTACT_PROMPT, name=name)
-            await mcp_wa_send(phone, contact_msg)
-            _add_to_history(phone, bot_msg=contact_msg)
+            # AMBIGUOUS or other - check if we have stored partial data
+            stored_phone = sess.get("_identity_partial_phone")
+            stored_email = sess.get("_identity_partial_email")
+            
+            if stored_phone and not stored_email:
+                # We have phone stored, ask specifically for email
+                log.info(f"[IDENTITY] Ambiguous response, but phone already stored - asking for email")
+                await mcp_wa_send(phone, IDENTITY_MISSING_EMAIL)
+                _add_to_history(phone, bot_msg=IDENTITY_MISSING_EMAIL)
+            elif stored_email and not stored_phone:
+                # We have email stored, ask specifically for phone
+                log.info(f"[IDENTITY] Ambiguous response, but email already stored - asking for phone")
+                await mcp_wa_send(phone, IDENTITY_MISSING_PHONE)
+                _add_to_history(phone, bot_msg=IDENTITY_MISSING_PHONE)
+            else:
+                # No partial data stored - re-ask full question
+                log.info(f"[IDENTITY] Ambiguous response, no partial data - re-asking contacts")
+                name = profile.get("name", "there")
+                contact_msg = format_message(IDENTITY_CONTACT_PROMPT, name=name)
+                await mcp_wa_send(phone, contact_msg)
+                _add_to_history(phone, bot_msg=contact_msg)
+            
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             return

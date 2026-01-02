@@ -1,26 +1,64 @@
 """
 ELIGIBILITY State Handler (State 3: Eligibility Check)
-Rule-first approach with LLM fallback only when needed
+Button-first approach with free-text fallback
 Strict: if any requirement not met → community exit
 """
 import logging
 import time
 import re
 from typing import Dict, Any, Optional, Tuple
-from ..messages import ELIGIBILITY_PROMPT, ELIGIBILITY_EXIT
+from ..messages import (
+    ELIGIBILITY_PROMPT, ELIGIBILITY_EXIT,
+    ELIGIBILITY_BUTTONS,
+    ELIGIBILITY_CLARIFY_AGE_PROMPT, ELIGIBILITY_CLARIFY_AGE_BUTTONS,
+    ELIGIBILITY_CLARIFY_DEVICE_PROMPT, ELIGIBILITY_CLARIFY_DEVICE_BUTTONS,
+    ELIGIBILITY_CLARIFY_UNPAID_PROMPT, ELIGIBILITY_CLARIFY_UNPAID_BUTTONS
+)
 from ..validators import is_yes_response, is_no_response
 
 log = logging.getLogger(__name__)
 
-# Clarification messages for each requirement
+# Legacy clarification messages (kept for backward compatibility if needed)
 ELIGIBILITY_CLARIFY_AGE = """Just to confirm — are you 18 or above? 🙂"""
-ELIGIBILITY_CLARIFY_DEVICE = """Do you have a phone/laptop with a reasonably stable internet connection? 🙂"""
+ELIGIBILITY_CLARIFY_DEVICE = """Do you have a tablet or laptop with a reasonably stable internet connection? 🙂"""
 ELIGIBILITY_CLARIFY_UNPAID = """And are you okay with this being a voluntary (unpaid) role? 🙂"""
 
 # FAQ answers for common questions
-ELIGIBILITY_FAQ_AGE = """Yes, 18+ is required for classroom volunteering. This is a policy requirement. Are all three okay for you?"""
-ELIGIBILITY_FAQ_DEVICE = """A phone or laptop with stable internet is needed for live online classes. Are all three okay for you?"""
-ELIGIBILITY_FAQ_UNPAID = """Yes, this is a volunteer role with no payment. Are all three okay for you?"""
+ELIGIBILITY_FAQ_AGE = """Yes, 18+ is required for classroom volunteering. This is a policy requirement.
+
+So just to confirm — are all three okay for you? (18+, tablet/laptop+internet, unpaid role)
+You can simply reply with Yes or No 🙂"""
+ELIGIBILITY_FAQ_DEVICE = """A tablet or laptop with stable internet is needed for live online classes. (Smartphones/phones are not suitable for this program.)
+
+So just to confirm — are all three okay for you? (18+, tablet/laptop+internet, unpaid role)
+You can simply reply with Yes or No 🙂"""
+ELIGIBILITY_FAQ_UNPAID = """Yes, this is a volunteer role with no payment.
+
+So just to confirm — are all three okay for you? (18+, tablet/laptop+internet, unpaid role)
+You can simply reply with Yes or No 🙂"""
+
+
+def detect_button_click(text: str) -> Optional[str]:
+    """
+    Detect if user clicked a button by matching button label text.
+    
+    Returns:
+        "yes" if Yes button clicked
+        "no" if No button clicked
+        "tell_me_more" if Tell me more button clicked
+        None if not a button click
+    """
+    text_lower = text.lower().strip()
+    
+    # Check for exact button label matches (plain text, no emojis)
+    if text_lower in ["yes", "y"]:
+        return "yes"
+    if text_lower in ["no", "n"]:
+        return "no"
+    if text_lower in ["tell me more", "tell me", "more", "info", "information"]:
+        return "tell_me_more"
+    
+    return None
 
 
 def classify_eligibility_rule_based(text: str) -> Tuple[Optional[str], Optional[str]]:
@@ -41,6 +79,10 @@ def classify_eligibility_rule_based(text: str) -> Tuple[Optional[str], Optional[
         if any(term in text_lower for term in ["18", "age", "laptop", "phone", "internet", "device", "paid", "payment", "unpaid", "volunteer", "compulsory", "required", "need"]):
             return ("QUERY", None)
     
+    # Check for simple "no" response - generic decline (exit immediately)
+    if is_no_response(text):
+        return ("ELIGIBLE_NO", None)
+    
     # Check for ELIGIBLE_NO - Age violations
     age_violations = [
         r"\b(i'?m|i am|im)\s*(17|sixteen|15|fifteen|14|fourteen|13|thirteen|12|twelve)\b",
@@ -53,12 +95,24 @@ def classify_eligibility_rule_based(text: str) -> Tuple[Optional[str], Optional[
         if re.search(pattern, text_lower):
             return ("ELIGIBLE_NO", "age")
     
+    # Check for ELIGIBLE_NO - Phone/Smartphone only (not acceptable)
+    phone_only_patterns = [
+        r"\b(only|just)\s+(phone|smartphone|mobile)\b",
+        r"\b(phone|smartphone|mobile)\s+only\b",
+        r"\b(have|got|own)\s+(phone|smartphone|mobile)\s+(but|,)\s*(no|don'?t have|dont have)\s*(laptop|tablet)\b",
+        r"\b(have|got|own)\s+(phone|smartphone|mobile)\s+(only|just)\b",
+        r"\b(no|don'?t have|dont have)\s*(laptop|tablet)\s*(but|,)\s*(have|got|own)\s*(phone|smartphone|mobile)\b",
+    ]
+    for pattern in phone_only_patterns:
+        if re.search(pattern, text_lower):
+            return ("ELIGIBLE_NO", "device")
+    
     # Check for ELIGIBLE_NO - Device/Internet violations
     device_violations = [
-        r"\b(no (laptop|phone|tablet|device|smartphone|internet|wifi|internet connection))\b",
-        r"\b(don'?t have|dont have|don't have|do not have)\s*(laptop|phone|tablet|device|internet|wifi)\b",
-        r"\b(no access to|without)\s*(internet|wifi|laptop|phone|device)\b",
-        r"\b(laptop|phone|device|internet|wifi)\s*(is|are)?\s*(broken|not working|not available|unavailable)\b",
+        r"\b(no (laptop|tablet|device|internet|wifi|internet connection))\b",
+        r"\b(don'?t have|dont have|don't have|do not have)\s*(laptop|tablet|device|internet|wifi)\b",
+        r"\b(no access to|without)\s*(internet|wifi|laptop|tablet|device)\b",
+        r"\b(laptop|tablet|device|internet|wifi)\s*(is|are)?\s*(broken|not working|not available|unavailable)\b",
     ]
     for pattern in device_violations:
         if re.search(pattern, text_lower):
@@ -89,7 +143,7 @@ def classify_eligibility_rule_based(text: str) -> Tuple[Optional[str], Optional[
     yes_patterns = [
         r"\b(yes|ok|okay|sure|definitely|absolutely|of course|sounds good|fine|works|good)\b",
         r"\b(all|everything|each|both)\s*(ok|okay|good|fine|works|confirmed)\b",
-        r"\b(i'?m|i am|im)\s*\d+\s*(and|&)\s*(have|got)\s*(internet|laptop|phone|device)\b",  # "I'm 25 and have internet"
+        r"\b(i'?m|i am|im)\s*\d+\s*(and|&)\s*(have|got)\s*(internet|laptop|tablet|device)\b",  # "I'm 25 and have internet/laptop"
         r"\b(yes|ok)\s*(i|i'?m|i am|im)\s*(understand|understood|get it|got it)\b",  # "Yes I understand"
     ]
     for pattern in yes_patterns:
@@ -101,7 +155,7 @@ def classify_eligibility_rule_based(text: str) -> Tuple[Optional[str], Optional[
     # Check for ELIGIBLE_UNCLEAR - Partial/vague responses
     # Mentions only age but not device/unpaid
     age_mentioned = re.search(r"\b(18|eighteen|\d+)\s*(years?|yr|yrs|or above|or older)\b", text_lower)
-    device_mentioned = any(term in text_lower for term in ["laptop", "phone", "tablet", "device", "internet", "wifi"])
+    device_mentioned = any(term in text_lower for term in ["laptop", "tablet", "device", "internet", "wifi"])
     unpaid_mentioned = any(term in text_lower for term in ["unpaid", "volunteer", "voluntary", "no payment", "no pay", "free"])
     
     # Check for uncertainty indicators
@@ -116,7 +170,7 @@ def classify_eligibility_rule_based(text: str) -> Tuple[Optional[str], Optional[
             # Determine which requirement is unclear
             if "18" in text_lower or "age" in text_lower:
                 return ("ELIGIBLE_UNCLEAR", "age")
-            elif "internet" in text_lower or "wifi" in text_lower or "device" in text_lower or "laptop" in text_lower or "phone" in text_lower:
+            elif "internet" in text_lower or "wifi" in text_lower or "device" in text_lower or "laptop" in text_lower or "tablet" in text_lower:
                 return ("ELIGIBLE_UNCLEAR", "device")
             elif "paid" in text_lower or "payment" in text_lower or "unpaid" in text_lower or "volunteer" in text_lower:
                 return ("ELIGIBLE_UNCLEAR", "unpaid")
@@ -157,6 +211,10 @@ def should_use_llm(text: str, rule_intent: Optional[str], missing_req: Optional[
     word_count = len(words)
     text_lower = text.lower()
     
+    # Don't use LLM for simple questions - use FAQ instead
+    if rule_intent == "QUERY":
+        return False
+    
     # If rule-based returned nothing, use LLM
     if rule_intent is None:
         return True
@@ -179,14 +237,14 @@ def should_use_llm(text: str, rule_intent: Optional[str], missing_req: Optional[
     
     # Message contains both question and partial answer
     has_question = "?" in text
-    has_answer = any(word in text_lower for word in ["yes", "no", "ok", "sure", "have", "18", "laptop", "phone"])
+    has_answer = any(word in text_lower for word in ["yes", "no", "ok", "sure", "have", "18", "laptop", "tablet"])
     if has_question and has_answer and word_count > 8:
         return True
     
     # Complex uncertainty cases
     complex_uncertainty = [
         r"\b(17|sixteen)\s+but\s+will\s+turn\s+18\b",
-        r"\b(phone|laptop)\s+but\s+internet\s+(is|'?s)\s+(patchy|unstable|not stable)\b",
+        r"\b(tablet|laptop)\s+but\s+internet\s+(is|'?s)\s+(patchy|unstable|not stable)\b",
         r"\b(can|will)\s+volunteer\s+but\s+(was|am)\s+hoping\s+(for|there'?s)\s+(stipend|payment)\b",
     ]
     for pattern in complex_uncertainty:
@@ -200,19 +258,22 @@ def should_use_llm(text: str, rule_intent: Optional[str], missing_req: Optional[
     return False
 
 
-def get_clarification_message(missing_requirement: Optional[str]) -> str:
+def get_clarification_message(missing_requirement: Optional[str]) -> Tuple[str, list[str]]:
     """
-    Get the appropriate clarification message based on missing requirement.
+    Get the appropriate clarification message and buttons based on missing requirement.
+    
+    Returns:
+        (message: str, buttons: list[str])
     """
     if missing_requirement == "age":
-        return ELIGIBILITY_CLARIFY_AGE
+        return (ELIGIBILITY_CLARIFY_AGE_PROMPT, ELIGIBILITY_CLARIFY_AGE_BUTTONS)
     elif missing_requirement == "device":
-        return ELIGIBILITY_CLARIFY_DEVICE
+        return (ELIGIBILITY_CLARIFY_DEVICE_PROMPT, ELIGIBILITY_CLARIFY_DEVICE_BUTTONS)
     elif missing_requirement == "unpaid":
-        return ELIGIBILITY_CLARIFY_UNPAID
+        return (ELIGIBILITY_CLARIFY_UNPAID_PROMPT, ELIGIBILITY_CLARIFY_UNPAID_BUTTONS)
     else:
-        # Generic clarification - re-ask all three
-        return ELIGIBILITY_PROMPT
+        # Generic clarification - re-ask all three with buttons
+        return (ELIGIBILITY_PROMPT, ELIGIBILITY_BUTTONS)
 
 
 def get_faq_answer(text: str) -> Optional[str]:
@@ -238,13 +299,15 @@ def get_faq_answer(text: str) -> Optional[str]:
 
 async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profile: Dict[str, Any]) -> None:
     """
-    Handle ELIGIBILITY state - strict 3-point eligibility check.
+    Handle ELIGIBILITY state - button-first approach with free-text fallback.
     
     Flow:
-    1. Rule-based classification (NO LLM)
-    2. LLM fallback only when needed (ambiguous/mixed signals)
-    3. Clarification for ELIGIBLE_UNCLEAR (one targeted question)
-    4. Immediate exit for ELIGIBLE_NO (no persuasion, no exceptions)
+    1. Initial prompt with buttons (Yes/No/Tell me more)
+    2. Button click handling (primary path)
+    3. Progressive clarification flow (Tell me more → one requirement at a time)
+    4. Free-text fallback (rule-based + LLM if needed)
+    5. Immediate exit for ELIGIBLE_NO (no persuasion, no exceptions)
+    6. Re-entry handling from REJECTED state
     """
     # Late import to avoid circular dependency
     from ..wa_loop import (
@@ -252,29 +315,123 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
         mcp_llm_classify_intent, build_llm_context
     )
     
+    # Handle re-entry from REJECTED state
+    if sess.get("state") == "REJECTED":
+        log.info(f"[ELIGIBILITY] User re-entering from REJECTED state, resetting eligibility")
+        sess["state"] = "ELIGIBILITY"
+        sess["_eligibility_prompted"] = False
+        sess["_eligibility_clarification_sent"] = False
+        sess["_eligibility_missing_req"] = None
+        sess["_eligibility_clarification_step"] = None
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+    
+    # Initial prompt with buttons
     if text == "__kick__" or not sess.get("_eligibility_prompted"):
-        # First time: send the eligibility check question
-        log.info(f"[ELIGIBILITY] Sending eligibility check to {phone}")
-        await mcp_wa_send(phone, ELIGIBILITY_PROMPT)
+        log.info(f"[ELIGIBILITY] Sending eligibility check with buttons to {phone}")
+        await mcp_wa_send(phone, ELIGIBILITY_PROMPT, buttons=ELIGIBILITY_BUTTONS)
         _add_to_history(phone, bot_msg=ELIGIBILITY_PROMPT)
         sess["_eligibility_prompted"] = True
         sess["_eligibility_clarification_sent"] = False
         sess["_eligibility_missing_req"] = None
+        sess["_eligibility_clarification_step"] = None  # Track which step in progressive flow
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         return
     
-    # Step 1: Rule-based classification (NO LLM)
+    # Step 1: Check for button click (PRIMARY PATH)
+    button_click = detect_button_click(text)
+    
+    if button_click:
+        log.info(f"[ELIGIBILITY] Button clicked: {button_click}")
+        
+        # Handle button clicks based on current state
+        clarification_step = sess.get("_eligibility_clarification_step")
+        
+        if button_click == "yes":
+            if clarification_step is None:
+                # Yes on initial prompt - proceed to IDENTITY
+                log.info(f"[ELIGIBILITY] User clicked Yes on initial prompt, proceeding to IDENTITY")
+                sess["state"] = "IDENTITY"
+                sess["_eligibility_clarification_sent"] = False
+                sess["_eligibility_missing_req"] = None
+                sess["_eligibility_clarification_step"] = None
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                await _handle(phone, "__kick__")
+                return
+            elif clarification_step == "age":
+                # Yes on age clarification - move to device
+                log.info(f"[ELIGIBILITY] Age confirmed, asking device")
+                clarify_msg, clarify_buttons = get_clarification_message("device")
+                await mcp_wa_send(phone, clarify_msg, buttons=clarify_buttons)
+                _add_to_history(phone, bot_msg=clarify_msg)
+                sess["_eligibility_clarification_step"] = "device"
+                sess["_eligibility_missing_req"] = "device"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            elif clarification_step == "device":
+                # Yes on device clarification - move to unpaid
+                log.info(f"[ELIGIBILITY] Device confirmed, asking unpaid")
+                clarify_msg, clarify_buttons = get_clarification_message("unpaid")
+                await mcp_wa_send(phone, clarify_msg, buttons=clarify_buttons)
+                _add_to_history(phone, bot_msg=clarify_msg)
+                sess["_eligibility_clarification_step"] = "unpaid"
+                sess["_eligibility_missing_req"] = "unpaid"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            elif clarification_step == "unpaid":
+                # Yes on unpaid clarification - all confirmed, proceed to IDENTITY
+                log.info(f"[ELIGIBILITY] All requirements confirmed via progressive flow, proceeding to IDENTITY")
+                sess["state"] = "IDENTITY"
+                sess["_eligibility_clarification_sent"] = False
+                sess["_eligibility_missing_req"] = None
+                sess["_eligibility_clarification_step"] = None
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                await _handle(phone, "__kick__")
+                return
+        
+        elif button_click == "no":
+            # No at any point - exit immediately
+            log.info(f"[ELIGIBILITY] User clicked No, sending exit message immediately")
+            await mcp_wa_send(phone, ELIGIBILITY_EXIT)
+            _add_to_history(phone, bot_msg=ELIGIBILITY_EXIT)
+            sess["state"] = "REJECTED"
+            sess["_eligibility_clarification_sent"] = False
+            sess["_eligibility_missing_req"] = None
+            sess["_eligibility_clarification_step"] = None
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+        
+        elif button_click == "tell_me_more":
+            # Enter progressive clarification flow - start with age
+            log.info(f"[ELIGIBILITY] User clicked Tell me more, starting progressive clarification")
+            clarify_msg, clarify_buttons = get_clarification_message("age")
+            await mcp_wa_send(phone, clarify_msg, buttons=clarify_buttons)
+            _add_to_history(phone, bot_msg=clarify_msg)
+            sess["_eligibility_clarification_sent"] = True
+            sess["_eligibility_clarification_step"] = "age"
+            sess["_eligibility_missing_req"] = "age"
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+    
+    # Step 2: Free-text fallback (SECONDARY PATH)
+    # Use existing rule-based classification
     rule_intent, missing_req = classify_eligibility_rule_based(text)
     log.info(f"[ELIGIBILITY] Rule-based classification: intent={rule_intent}, missing_req={missing_req}")
     
-    # Step 2: Determine if LLM is needed
+    # Determine if LLM is needed
     use_llm = should_use_llm(text, rule_intent, missing_req)
     final_intent = rule_intent
     final_missing_req = missing_req
     
     if use_llm:
-        # Step 3: LLM fallback
+        # LLM fallback for ambiguous/mixed signals
         try:
             log.info(f"[ELIGIBILITY] Calling LLM fallback for ambiguous/mixed response")
             llm_context = build_llm_context("ELIGIBILITY", sess, last_prompt=ELIGIBILITY_PROMPT)
@@ -286,15 +443,30 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
             
             # Map LLM intents to our intent names
             if llm_intent in ["ELIGIBLE_YES", "ELIGIBLE_OK"]:
-                final_intent = "ELIGIBLE_YES"
-                final_missing_req = None
+                # Check if user only has phone/smartphone (not acceptable)
+                text_lower = text.lower()
+                phone_only_patterns = [
+                    r"\b(only|just)\s+(phone|smartphone|mobile)\b",
+                    r"\b(phone|smartphone|mobile)\s+only\b",
+                    r"\b(have|got|own)\s+(phone|smartphone|mobile)\s+(but|,)\s*(no|don'?t have|dont have)\s*(laptop|tablet)\b",
+                ]
+                has_phone_only = any(re.search(pattern, text_lower) for pattern in phone_only_patterns)
+                has_laptop_tablet = any(term in text_lower for term in ["laptop", "tablet"])
+                
+                if has_phone_only and not has_laptop_tablet:
+                    # User only has phone - reject
+                    final_intent = "ELIGIBLE_NO"
+                    final_missing_req = "device"
+                else:
+                    final_intent = "ELIGIBLE_YES"
+                    final_missing_req = None
             elif llm_intent in ["ELIGIBLE_NO", "ELIGIBLE_NOT_OK"]:
                 final_intent = "ELIGIBLE_NO"
                 # Try to determine which requirement from LLM response or text
                 text_lower = text.lower()
                 if any(term in text_lower for term in ["18", "age", "17", "sixteen", "under 18"]):
                     final_missing_req = "age"
-                elif any(term in text_lower for term in ["laptop", "phone", "device", "internet", "wifi"]):
+                elif any(term in text_lower for term in ["laptop", "tablet", "device", "internet", "wifi", "phone", "smartphone"]):
                     final_missing_req = "device"
                 elif any(term in text_lower for term in ["paid", "payment", "unpaid", "volunteer"]):
                     final_missing_req = "unpaid"
@@ -325,65 +497,74 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
             if not rule_intent:
                 final_intent = "ELIGIBLE_UNCLEAR"
     
-    # Step 4: Handle based on final intent
-    # If clarification was already sent, check response again
-    if sess.get("_eligibility_clarification_sent"):
-        prev_missing_req = sess.get("_eligibility_missing_req")
-        
+    # Step 3: Handle based on final intent
+    # If in progressive clarification flow, handle response
+    clarification_step = sess.get("_eligibility_clarification_step")
+    
+    if clarification_step:
+        # User is in progressive clarification flow
         if final_intent == "ELIGIBLE_YES":
-            # Confirmed after clarification - proceed
-            log.info(f"[ELIGIBILITY] User confirmed after clarification, proceeding to IDENTITY")
-            sess["state"] = "IDENTITY"
-            sess["_eligibility_clarification_sent"] = False
-            sess["_eligibility_missing_req"] = None
-            sess["ts"] = time.time()
-            SESSIONS[phone] = sess
-            await _handle(phone, "__kick__")
-            return
+            # Confirmed current requirement - move to next
+            if clarification_step == "age":
+                # Age confirmed, ask device
+                clarify_msg, clarify_buttons = get_clarification_message("device")
+                await mcp_wa_send(phone, clarify_msg, buttons=clarify_buttons)
+                _add_to_history(phone, bot_msg=clarify_msg)
+                sess["_eligibility_clarification_step"] = "device"
+                sess["_eligibility_missing_req"] = "device"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            elif clarification_step == "device":
+                # Device confirmed, ask unpaid
+                clarify_msg, clarify_buttons = get_clarification_message("unpaid")
+                await mcp_wa_send(phone, clarify_msg, buttons=clarify_buttons)
+                _add_to_history(phone, bot_msg=clarify_msg)
+                sess["_eligibility_clarification_step"] = "unpaid"
+                sess["_eligibility_missing_req"] = "unpaid"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            elif clarification_step == "unpaid":
+                # All confirmed - proceed to IDENTITY
+                log.info(f"[ELIGIBILITY] All requirements confirmed, proceeding to IDENTITY")
+                sess["state"] = "IDENTITY"
+                sess["_eligibility_clarification_sent"] = False
+                sess["_eligibility_missing_req"] = None
+                sess["_eligibility_clarification_step"] = None
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                await _handle(phone, "__kick__")
+                return
         elif final_intent == "ELIGIBLE_NO":
-            # Still NO after clarification - exit immediately
-            log.info(f"[ELIGIBILITY] User still declined after clarification, sending exit message")
+            # Declined at any step - exit immediately
+            log.info(f"[ELIGIBILITY] User declined requirement, sending exit message")
             await mcp_wa_send(phone, ELIGIBILITY_EXIT)
             _add_to_history(phone, bot_msg=ELIGIBILITY_EXIT)
             sess["state"] = "REJECTED"
             sess["_eligibility_clarification_sent"] = False
             sess["_eligibility_missing_req"] = None
+            sess["_eligibility_clarification_step"] = None
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             return
-        elif final_intent == "ELIGIBLE_UNCLEAR":
-            # Still unclear - ask one more clarification (different requirement if possible)
-            if final_missing_req and final_missing_req != prev_missing_req:
-                # Different requirement unclear - clarify that one
-                clarify_msg = get_clarification_message(final_missing_req)
-                log.info(f"[ELIGIBILITY] Still unclear, clarifying {final_missing_req}")
-                await mcp_wa_send(phone, clarify_msg)
-                _add_to_history(phone, bot_msg=clarify_msg)
-                sess["_eligibility_missing_req"] = final_missing_req
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
-                return
-            else:
-                # Same or generic unclear - re-ask all three once more, then exit if still unclear
-                log.info(f"[ELIGIBILITY] Still unclear after clarification, re-asking all three")
-                await mcp_wa_send(phone, ELIGIBILITY_PROMPT)
-                _add_to_history(phone, bot_msg=ELIGIBILITY_PROMPT)
-                sess["_eligibility_clarification_sent"] = False  # Reset to allow one more try
-                sess["_eligibility_missing_req"] = None
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
-                return
         else:
-            # QUERY or other - handle normally
-            pass
+            # Still unclear - re-ask current step with buttons
+            clarify_msg, clarify_buttons = get_clarification_message(clarification_step)
+            await mcp_wa_send(phone, clarify_msg, buttons=clarify_buttons)
+            _add_to_history(phone, bot_msg=clarify_msg)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
     
-    # Handle first response (or response after clarification reset)
+    # Handle first response (not in progressive flow)
     if final_intent == "ELIGIBLE_YES":
         # YES - proceed directly to next state
         log.info(f"[ELIGIBILITY] User confirmed all requirements (ELIGIBLE_YES), proceeding to IDENTITY")
         sess["state"] = "IDENTITY"
         sess["_eligibility_clarification_sent"] = False
         sess["_eligibility_missing_req"] = None
+        sess["_eligibility_clarification_step"] = None
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         await _handle(phone, "__kick__")
@@ -397,12 +578,13 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
         sess["state"] = "REJECTED"
         sess["_eligibility_clarification_sent"] = False
         sess["_eligibility_missing_req"] = None
+        sess["_eligibility_clarification_step"] = None
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         return
     
     elif final_intent == "QUERY":
-        # QUERY - answer briefly and re-ask
+        # QUERY - answer briefly and re-ask with buttons
         faq_answer = get_faq_answer(text)
         if faq_answer:
             log.info(f"[ELIGIBILITY] User asked question, answering with FAQ")
@@ -411,32 +593,39 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
         else:
             # Generic answer
             log.info(f"[ELIGIBILITY] User asked question, answering generically")
-            answer = "These are the three requirements we need. Are all three okay for you?"
-            await mcp_wa_send(phone, answer)
+            answer = """These are the three requirements we need:
+• 18 or above
+• Tablet or laptop + internet (smartphones/phones are not suitable)
+• Voluntary (unpaid) role
+
+Are all three okay for you?"""
+            await mcp_wa_send(phone, answer, buttons=ELIGIBILITY_BUTTONS)
             _add_to_history(phone, bot_msg=answer)
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         return
     
     elif final_intent == "ELIGIBLE_UNCLEAR":
-        # UNCLEAR - ask one targeted clarification
-        clarify_msg = get_clarification_message(final_missing_req)
+        # UNCLEAR - ask one targeted clarification with buttons
+        clarify_msg, clarify_buttons = get_clarification_message(final_missing_req)
         log.info(f"[ELIGIBILITY] Response unclear, asking clarification for {final_missing_req}")
-        await mcp_wa_send(phone, clarify_msg)
+        await mcp_wa_send(phone, clarify_msg, buttons=clarify_buttons)
         _add_to_history(phone, bot_msg=clarify_msg)
         sess["_eligibility_clarification_sent"] = True
+        sess["_eligibility_clarification_step"] = final_missing_req or "age"  # Start progressive flow
         sess["_eligibility_missing_req"] = final_missing_req
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         return
     
     else:
-        # Ambiguous/unknown - default to UNCLEAR and ask clarification
+        # Ambiguous/unknown - default to UNCLEAR and ask clarification with buttons
         log.info(f"[ELIGIBILITY] Ambiguous response, defaulting to ELIGIBLE_UNCLEAR")
-        clarify_msg = get_clarification_message(None)  # Generic re-ask
-        await mcp_wa_send(phone, clarify_msg)
+        clarify_msg, clarify_buttons = get_clarification_message(None)  # Generic re-ask
+        await mcp_wa_send(phone, clarify_msg, buttons=clarify_buttons)
         _add_to_history(phone, bot_msg=clarify_msg)
         sess["_eligibility_clarification_sent"] = True
+        sess["_eligibility_clarification_step"] = "age"  # Start progressive flow
         sess["_eligibility_missing_req"] = None
         sess["ts"] = time.time()
         SESSIONS[phone] = sess

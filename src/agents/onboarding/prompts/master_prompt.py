@@ -8,7 +8,7 @@ Core principles:
 
 - Start with purpose before asking for details.
 
-- Convert intent → interest through clarity, not pressure.
+- Convert intent -> interest through clarity, not pressure.
 
 - Never mention internal concepts like onboarding, registration, FSM, states, or selection.
 

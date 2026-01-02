@@ -406,9 +406,19 @@ def _wa_sanitize(text: str) -> str:
     return safe
 
 
-async def mcp_wa_send(to: str, text: str):
-    """Send WhatsApp message via MCP"""
-    return await _mcp_call("wa.send_message", {"to": to, "text": _wa_sanitize(text)}, timeout=10)
+async def mcp_wa_send(to: str, text: str, buttons: list[str] = None):
+    """
+    Send WhatsApp message via MCP
+    
+    Args:
+        to: Phone number
+        text: Message text
+        buttons: Optional list of button labels (e.g., ["✅ Yes", "❌ No", "ℹ️ Tell me more"])
+    """
+    args = {"to": to, "text": _wa_sanitize(text)}
+    if buttons:
+        args["buttons"] = buttons
+    return await _mcp_call("wa.send_message", args, timeout=10)
 
 async def mcp_time_parse(text: str, duration=60, tz="Asia/Kolkata"):
     """Parse time options via MCP (fallback for complex parsing)"""
@@ -1688,9 +1698,29 @@ async def _handle(phone: str, text: str):
             sess["_greet_sent"] = True
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
+            
+            # Schedule delayed INTENT message after ~1 second (800-1500ms range)
+            async def delayed_intent_transition():
+                # Wait for ~1 second (1000ms) - natural typing pause
+                await asyncio.sleep(1.0)
+                
+                # Check if still in WELCOME state and INTENT hasn't been sent yet
+                # This ensures we don't send INTENT if user already responded and transitioned
+                current_sess = SESSIONS.get(phone)
+                if current_sess and current_sess.get("state") == "WELCOME" and not current_sess.get("_intent_prompted"):
+                    log.info(f"[GREET] Auto-transitioning to INTENT after delay for {phone}")
+                    current_sess["state"] = "INTENT"
+                    current_sess["ts"] = time.time()
+                    SESSIONS[phone] = current_sess
+                    # Trigger INTENT state handler (will send INTENT_PROMPT)
+                    await _handle(phone, "__kick__")
+            
+            # Create background task for delayed transition (non-blocking)
+            # This allows the function to return immediately while delay runs in background
+            asyncio.create_task(delayed_intent_transition())
             return
         else:
-            # User responded after State 1 message - transition to INTENT state
+            # User responded after State 1 message - transition to INTENT state immediately
             log.info(f"[GREET] User responded after State 1 message, transitioning to INTENT")
             sess["state"] = "INTENT"
             sess["ts"] = time.time()
@@ -1711,7 +1741,13 @@ async def _handle(phone: str, text: str):
     
     # ========== IDENTITY STATE (State 4: Name, Phone, Email Collection) ==========
     if state == "IDENTITY":
-        await handle_identity(phone, text, sess, profile)
+        try:
+            log.info(f"[HANDLE] Calling handle_identity for {phone}, text='{text[:50]}...'")
+            await handle_identity(phone, text, sess, profile)
+            log.info(f"[HANDLE] handle_identity completed for {phone}")
+        except Exception as e:
+            log.error(f"[HANDLE] Error in handle_identity for {phone}: {e}", exc_info=True)
+            await mcp_wa_send(phone, "Sorry, there was an error processing your message. Please try again.")
         return
     
     # ========== PREFERENCES STATE (State 5: Day & Time Preferences) ==========
@@ -1724,17 +1760,34 @@ async def _handle(phone: str, text: str):
         await handle_qa_window(phone, text, sess, profile)
         return
     
+    # ========== REJECTED STATE (Eligibility Not Met) ==========
+    if state == "REJECTED":
+        # User was rejected but can re-enter by sending a message
+        # Reset to ELIGIBILITY state and re-show prompt
+        log.info(f"[REJECTED] User messaging after rejection, resetting to ELIGIBILITY")
+        sess["state"] = "ELIGIBILITY"
+        sess["_eligibility_prompted"] = False
+        sess["_eligibility_clarification_sent"] = False
+        sess["_eligibility_missing_req"] = None
+        sess["_eligibility_clarification_step"] = None
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+        # Trigger ELIGIBILITY handler
+        await _handle(phone, "__kick__")
+        return
+    
     # ========== COMPLETE STATE (Final State) ==========
     if state == "COMPLETE":
         # Final state - just acknowledge any messages
         if text == "__kick__":
             # Send completion message if not already sent
             if not sess.get("_complete_message_sent"):
+                # Get volunteer name from profile
+                name = profile.get("name") or "there"
                 complete_msg = (
-                    "Perfect! Your onboarding is complete. 🎉\n\n"
-                    "We've captured your preferences and you're all set. "
-                    "Our team will reach out soon with next steps.\n\n"
-                    "Thank you for volunteering with SERVE! 💛"
+                    f"Thank you, {name}. 💛\n\n"
+                    "I really appreciate you taking the time to walk through this.\n\n"
+                    "Let's continue — I'll stay with you every step of the way. 🌼"
                 )
                 await mcp_wa_send(phone, complete_msg)
                 _add_to_history(phone, bot_msg=complete_msg)
@@ -1744,7 +1797,8 @@ async def _handle(phone: str, text: str):
             return
         else:
             # User sent a message after completion - just acknowledge
-            ack = "Thanks! Your onboarding is complete. If you have any questions, feel free to ask."
+            name = profile.get("name") or "there"
+            ack = f"Thanks, {name}! I'm here if you need anything. 💛"
             await mcp_wa_send(phone, ack)
             _add_to_history(phone, bot_msg=ack)
             sess["ts"] = time.time()
