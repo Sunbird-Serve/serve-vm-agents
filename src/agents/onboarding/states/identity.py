@@ -770,6 +770,24 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
             name = profile.get("name", "")
             log.info(f"[IDENTITY] Phone and email collected and validated: {extracted_phone}, {extracted_email}")
             
+            # Persistence: Update identity temp fields (checkpoint 2)
+            try:
+                from storage.db import get_db_session
+                from storage.session_store import update_identity_temp
+                
+                with get_db_session() as db:
+                    update_identity_temp(
+                        db,
+                        wa_phone=phone,
+                        temp_name=name if name else None,
+                        temp_email=extracted_email,
+                        temp_phone=extracted_phone
+                    )
+                    log.info(f"[PERSISTENCE] Updated identity temp fields for {phone}")
+            except Exception as e:
+                log.warning(f"[PERSISTENCE] Failed to update identity for {phone}: {e}", exc_info=True)
+                # Continue without DB - don't block flow
+            
             # TODO: Uncomment when saveProfile MCP tool is implemented
             # Try to save profile
             # success, error = await save_profile(name, extracted_phone, extracted_email)

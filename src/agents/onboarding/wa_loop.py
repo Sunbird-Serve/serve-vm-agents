@@ -11,7 +11,9 @@ import re
 import json
 import time
 import uuid
+import hashlib
 import logging
+from typing import Optional
 from datetime import datetime, timedelta, timezone
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 import httpx
@@ -67,6 +69,10 @@ from .states.eligibility import handle_eligibility
 from .states.identity import handle_identity
 from .states.preferences import handle_preferences
 from .states.qa import handle_qa_window
+from runtime.phone_lock import get_phone_lock
+from storage.db import get_db_session
+from storage.session_store import get_or_create_session, get_last_inbound_id, set_last_inbound_id
+from storage.event_logger import log_event
 
 log = logging.getLogger(__name__)
 
@@ -406,7 +412,7 @@ def _wa_sanitize(text: str) -> str:
     return safe
 
 
-async def mcp_wa_send(to: str, text: str, buttons: list[str] = None):
+async def mcp_wa_send(to: str, text: str, buttons: list[str] = None) -> Optional[str]:
     """
     Send WhatsApp message via MCP
     
@@ -414,11 +420,32 @@ async def mcp_wa_send(to: str, text: str, buttons: list[str] = None):
         to: Phone number
         text: Message text
         buttons: Optional list of button labels (e.g., ["✅ Yes", "❌ No", "ℹ️ Tell me more"])
+    
+    Returns:
+        Optional[str]: Outbound message ID if available, None otherwise
     """
     args = {"to": to, "text": _wa_sanitize(text)}
     if buttons:
         args["buttons"] = buttons
-    return await _mcp_call("wa.send_message", args, timeout=10)
+    result = await _mcp_call("wa.send_message", args, timeout=10)
+    
+    # Extract outbound message ID from MCP response
+    # Try common response formats
+    if isinstance(result, dict):
+        # Try direct message_id field
+        if "message_id" in result:
+            return str(result["message_id"])
+        # Try wamid field
+        if "wamid" in result:
+            return str(result["wamid"])
+        # Try nested in result
+        if "result" in result and isinstance(result["result"], dict):
+            if "message_id" in result["result"]:
+                return str(result["result"]["message_id"])
+            if "wamid" in result["result"]:
+                return str(result["result"]["wamid"])
+    
+    return None
 
 async def mcp_time_parse(text: str, duration=60, tz="Asia/Kolkata"):
     """Parse time options via MCP (fallback for complex parsing)"""
@@ -1553,6 +1580,107 @@ async def start_onboarding(phone: str, name: str = "Volunteer", registration_dat
         raise
 
 
+# ---------- Idempotency & Locking ----------
+def _extract_inbound_msg_id(evt: dict, phone: str, text: str) -> str:
+    """
+    Extract inbound message ID from Kafka event payload.
+    
+    Priority:
+    1) payload["message_id"] if present
+    2) payload["wamid"] if present
+    3) payload["meta"]["messages"][0]["id"] if present
+    4) Generate deterministic hash from (wa_phone + text + timestamp)
+    
+    Args:
+        evt: Kafka event payload
+        phone: WhatsApp phone number
+        text: Message text
+        
+    Returns:
+        str: Inbound message ID
+    """
+    data = evt.get("data") or {}
+    meta = evt.get("meta") or {}
+    
+    # Priority 1: message_id
+    if "message_id" in data:
+        return str(data["message_id"])
+    
+    # Priority 2: wamid
+    if "wamid" in data:
+        return str(data["wamid"])
+    
+    # Priority 3: meta.messages[0].id
+    if "messages" in meta and isinstance(meta["messages"], list) and len(meta["messages"]) > 0:
+        msg = meta["messages"][0]
+        if isinstance(msg, dict) and "id" in msg:
+            return str(msg["id"])
+    
+    # Priority 4: Generate deterministic hash
+    timestamp = evt.get("timestamp") or data.get("timestamp") or str(time.time())
+    hash_input = f"{phone}:{text}:{timestamp}"
+    hash_value = hashlib.sha256(hash_input.encode()).hexdigest()[:16]
+    return f"hash_{hash_value}"
+
+
+async def _handle_with_idempotency(phone: str, text: str, inbound_msg_id: str, evt: dict):
+    """
+    Handle inbound message with idempotency check and phone lock.
+    
+    Args:
+        phone: WhatsApp phone number
+        text: Message text
+        inbound_msg_id: Inbound message ID for idempotency
+        evt: Original Kafka event (for context)
+    """
+    # Get phone lock
+    lock = get_phone_lock(phone)
+    
+    async with lock:
+        # Get or create session and check idempotency
+        with get_db_session() as db:
+            db_session = get_or_create_session(db, wa_phone=phone, agent_name="onboarding")
+            
+            # Check for duplicate
+            last_inbound_id = get_last_inbound_id(db, phone)
+            if last_inbound_id == inbound_msg_id:
+                log.info(f"[IDEMPOTENCY] Duplicate message ignored for {phone}: {inbound_msg_id}")
+                # Log DUPLICATE_IGNORED event (best-effort)
+                try:
+                    log_event(
+                        db=db,
+                        wa_phone=phone,
+                        agent_name=settings.AGENT_NAME,
+                        event_type="DUPLICATE_IGNORED",
+                        event_source="onboarding_agent",
+                        state=db_session.get("state"),
+                        status="ignored",
+                        details={"inbound_msg_id": inbound_msg_id}
+                    )
+                except:
+                    pass  # Best-effort
+                return  # Early return - don't process duplicate
+        
+        # Process message normally
+        outbound_msg_id = None
+        try:
+            # Call original _handle
+            await _handle(phone, text)
+            
+            # Note: outbound_msg_id would ideally be captured from mcp_wa_send return value
+            # For now, we update idempotency after processing
+            # Future enhancement: track outbound_msg_id from mcp_wa_send calls
+            
+        finally:
+            # Update idempotency after processing (even if error occurred)
+            # Only update if we actually processed (not duplicate)
+            try:
+                with get_db_session() as db:
+                    set_last_inbound_id(db, phone, inbound_msg_id, outbound_msg_id)
+            except Exception as e:
+                log.warning(f"[IDEMPOTENCY] Failed to update idempotency for {phone}: {e}")
+
+
 # ---------- State Machine ----------
 async def _handle(phone: str, text: str):
     """
@@ -1595,6 +1723,51 @@ async def _handle(phone: str, text: str):
             "_welcomed": False
         }
         SESSIONS[phone] = sess
+        
+        # Persistence: Create/upsert session in DB (checkpoint 1)
+        try:
+            from storage.db import get_db_session
+            from storage.session_store import get_or_create_session
+            from storage.event_logger import log_event
+            from .config import settings
+            
+            with get_db_session() as db:
+                db_session = get_or_create_session(
+                    db, wa_phone=phone, agent_name=settings.AGENT_NAME
+                )
+                sess["_db_session_id"] = db_session["session_id"]
+                # Log SESSION_STARTED event
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="SESSION_STARTED",
+                    event_source="onboarding_agent",
+                    state="WELCOME",
+                    session_id=db_session["session_id"]
+                )
+                log.info(f"[PERSISTENCE] Created/updated session for {phone}")
+        except Exception as e:
+            log.warning(f"[PERSISTENCE] Failed to create session for {phone}: {e}", exc_info=True)
+            # Continue without DB - don't block flow
+    
+    # Ensure DB session exists even if in-memory session already existed
+    if sess and not sess.get("_db_session_id"):
+        try:
+            from storage.db import get_db_session
+            from storage.session_store import get_or_create_session
+            from storage.event_logger import log_event
+            from .config import settings
+            
+            with get_db_session() as db:
+                db_session = get_or_create_session(
+                    db, wa_phone=phone, agent_name=settings.AGENT_NAME
+                )
+                sess["_db_session_id"] = db_session["session_id"]
+                log.info(f"[PERSISTENCE] Ensured DB session exists for {phone} (session_id: {db_session['session_id']})")
+        except Exception as e:
+            log.warning(f"[PERSISTENCE] Failed to ensure DB session for {phone}: {e}", exc_info=True)
+            # Continue without DB - don't block flow
     
     state = sess["state"]
     profile = sess.get("profile", {})
@@ -1782,6 +1955,56 @@ async def _handle(phone: str, text: str):
         if text == "__kick__":
             # Send completion message if not already sent
             if not sess.get("_complete_message_sent"):
+                # Persistence: Finalize onboarding (checkpoint 3)
+                try:
+                    from storage.db import get_db_session
+                    from storage.session_store import finalize_onboarding
+                    from storage.event_logger import log_event
+                    from .config import settings
+                    
+                    # Determine eligibility status
+                    # Default to ELIGIBLE if passed is True or not set (assume passed if reached COMPLETE)
+                    eligibility_passed = profile.get("eligibility", {}).get("passed")
+                    if sess.get("state") == "REJECTED":
+                        eligibility_status = "REJECTED"
+                    elif eligibility_passed is False:
+                        # Explicitly set to False means rejected
+                        eligibility_status = "REJECTED"
+                    else:
+                        # passed is True or None/not set - if we reached COMPLETE, assume ELIGIBLE
+                        eligibility_status = "ELIGIBLE"
+                    
+                    # Get preferences
+                    prefs = profile.get("preferences", {})
+                    available_days = prefs.get("days", [])
+                    available_time_bands = [prefs.get("time_band")] if prefs.get("time_band") else None
+                    
+                    with get_db_session() as db:
+                        finalize_onboarding(
+                            db,
+                            wa_phone=phone,
+                            eligibility_status=eligibility_status,
+                            available_days=available_days if available_days else None,
+                            available_time_bands=available_time_bands,
+                            end_reason="completed"
+                        )
+                        # Log SESSION_ENDED event
+                        session_id = sess.get("_db_session_id")
+                        log_event(
+                            db=db,
+                            wa_phone=phone,
+                            agent_name=settings.AGENT_NAME,
+                            event_type="SESSION_ENDED",
+                            event_source="onboarding_agent",
+                            state="COMPLETE",
+                            status="completed",
+                            session_id=session_id
+                        )
+                        log.info(f"[PERSISTENCE] Finalized onboarding for {phone}")
+                except Exception as e:
+                    log.warning(f"[PERSISTENCE] Failed to finalize onboarding for {phone}: {e}", exc_info=True)
+                    # Continue without DB - don't block flow
+                
                 # Get volunteer name from profile
                 name = profile.get("name") or "there"
                 complete_msg = (
@@ -3655,11 +3878,29 @@ async def wa_loop():
 
             log.info(f"[KAFKA] Received from {phone}: '{text[:30]}...'")
             
-            # Handle message through state machine
+            # Extract inbound message ID for idempotency
+            inbound_msg_id = _extract_inbound_msg_id(evt, phone, text)
+            
+            # Handle message through state machine with lock and idempotency
             try:
-                await _handle(phone, text)
+                await _handle_with_idempotency(phone, text, inbound_msg_id, evt)
             except Exception as e:
                 log.error(f"[KAFKA] Error handling message from {phone}: {e}", exc_info=True)
+                # Log ERROR event
+                try:
+                    with get_db_session() as db:
+                        log_event(
+                            db=db,
+                            wa_phone=phone,
+                            agent_name=settings.AGENT_NAME,
+                            event_type="ERROR",
+                            event_source="onboarding_agent",
+                            state=None,
+                            status="error",
+                            details={"error": str(e), "inbound_msg_id": inbound_msg_id}
+                        )
+                except:
+                    pass  # Best-effort event logging
                 try:
                     await mcp_wa_send(phone, "Sorry, something went wrong. Please type 'restart' to try again.")
                 except:

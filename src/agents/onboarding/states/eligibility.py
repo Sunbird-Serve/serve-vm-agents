@@ -352,6 +352,9 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
             if clarification_step is None:
                 # Yes on initial prompt - proceed to IDENTITY
                 log.info(f"[ELIGIBILITY] User clicked Yes on initial prompt, proceeding to IDENTITY")
+                # Mark eligibility as passed
+                profile.setdefault("eligibility", {})["passed"] = True
+                sess["profile"] = profile
                 sess["state"] = "IDENTITY"
                 sess["_eligibility_clarification_sent"] = False
                 sess["_eligibility_missing_req"] = None
@@ -385,6 +388,9 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
             elif clarification_step == "unpaid":
                 # Yes on unpaid clarification - all confirmed, proceed to IDENTITY
                 log.info(f"[ELIGIBILITY] All requirements confirmed via progressive flow, proceeding to IDENTITY")
+                # Mark eligibility as passed
+                profile.setdefault("eligibility", {})["passed"] = True
+                sess["profile"] = profile
                 sess["state"] = "IDENTITY"
                 sess["_eligibility_clarification_sent"] = False
                 sess["_eligibility_missing_req"] = None
@@ -405,6 +411,39 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
             sess["_eligibility_clarification_step"] = None
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
+            
+            # Persistence: Finalize with REJECTED status
+            try:
+                from storage.db import get_db_session
+                from storage.session_store import finalize_onboarding
+                from storage.event_logger import log_event
+                from agents.onboarding.config import settings
+                
+                with get_db_session() as db:
+                    finalize_onboarding(
+                        db,
+                        wa_phone=phone,
+                        eligibility_status="REJECTED",
+                        available_days=None,
+                        available_time_bands=None,
+                        end_reason="eligibility_failed"
+                    )
+                    session_id = sess.get("_db_session_id")
+                    log_event(
+                        db=db,
+                        wa_phone=phone,
+                        agent_name=settings.AGENT_NAME,
+                        event_type="SESSION_ENDED",
+                        event_source="onboarding_agent",
+                        state="REJECTED",
+                        status="rejected",
+                        details={"reason": "eligibility_failed"},
+                        session_id=session_id
+                    )
+                    log.info(f"[PERSISTENCE] Finalized rejected session for {phone}")
+            except Exception as e:
+                log.warning(f"[PERSISTENCE] Failed to finalize rejected session for {phone}: {e}", exc_info=True)
+            
             return
         
         elif button_click == "tell_me_more":
@@ -528,6 +567,9 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
             elif clarification_step == "unpaid":
                 # All confirmed - proceed to IDENTITY
                 log.info(f"[ELIGIBILITY] All requirements confirmed, proceeding to IDENTITY")
+                # Mark eligibility as passed
+                profile.setdefault("eligibility", {})["passed"] = True
+                sess["profile"] = profile
                 sess["state"] = "IDENTITY"
                 sess["_eligibility_clarification_sent"] = False
                 sess["_eligibility_missing_req"] = None
@@ -561,6 +603,9 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
     if final_intent == "ELIGIBLE_YES":
         # YES - proceed directly to next state
         log.info(f"[ELIGIBILITY] User confirmed all requirements (ELIGIBLE_YES), proceeding to IDENTITY")
+        # Mark eligibility as passed
+        profile.setdefault("eligibility", {})["passed"] = True
+        sess["profile"] = profile
         sess["state"] = "IDENTITY"
         sess["_eligibility_clarification_sent"] = False
         sess["_eligibility_missing_req"] = None
@@ -581,6 +626,39 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
         sess["_eligibility_clarification_step"] = None
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
+        
+        # Persistence: Finalize with REJECTED status
+        try:
+            from storage.db import get_db_session
+            from storage.session_store import finalize_onboarding
+            from storage.event_logger import log_event
+            from agents.onboarding.config import settings
+            
+            with get_db_session() as db:
+                finalize_onboarding(
+                    db,
+                    wa_phone=phone,
+                    eligibility_status="REJECTED",
+                    available_days=None,
+                    available_time_bands=None,
+                    end_reason="eligibility_failed"
+                )
+                session_id = sess.get("_db_session_id")
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="SESSION_ENDED",
+                    event_source="onboarding_agent",
+                    state="REJECTED",
+                    status="rejected",
+                    details={"reason": "eligibility_failed"},
+                    session_id=session_id
+                )
+                log.info(f"[PERSISTENCE] Finalized rejected session for {phone}")
+        except Exception as e:
+            log.warning(f"[PERSISTENCE] Failed to finalize rejected session for {phone}: {e}", exc_info=True)
+        
         return
     
     elif final_intent == "QUERY":

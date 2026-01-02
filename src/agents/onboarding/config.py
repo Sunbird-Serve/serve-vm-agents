@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     HOURS_TOLERANCE_RATIO: float = 0.15  # 15% tolerance window
     MIN_MONTHS: float = 3.0
     MONTHS_TOLERANCE: float = 0.5  # half-month tolerance
+    # Database URL (optional, defaults to localhost)
+    DATABASE_URL: str = "postgresql+psycopg://serve_agentic_user:Agentic%40281@localhost:5433/serve_agentic"
     # allow unrelated env vars (e.g., AGENT_NAME) without error
     model_config = SettingsConfigDict(env_file=".env",
                                       env_file_encoding="utf-8",
