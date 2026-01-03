@@ -24,7 +24,7 @@ from .config import settings
 from .messages import (
     WELCOME, WELCOME_MAYBE_LATER,
     WELCOME_INTRO, WELCOME_SERVE_OVERVIEW, WELCOME_CONSENT_ACK,
-    INTENT_PROMPT, INTENT_PERSUASION, INTENT_EXIT,
+    INTENT_PROMPT, INTENT_EXIT,
     ELIGIBILITY_PROMPT, ELIGIBILITY_EXIT,
     ELIGIBILITY_INTRO, ELIGIBILITY_Q1, ELIGIBILITY_Q2, ELIGIBILITY_Q3,
     ELIGIBILITY_INVALID_RESPONSE, REJECTED, ELIGIBILITY_PASSED,
@@ -1633,6 +1633,42 @@ async def _handle_with_idempotency(phone: str, text: str, inbound_msg_id: str, e
         inbound_msg_id: Inbound message ID for idempotency
         evt: Original Kafka event (for context)
     """
+    # Check for demo shortcuts
+    try:
+        # Selection Agent shortcut
+        from agents.selection.config import settings as selection_settings
+        if selection_settings.DEMO_SELECTION_SHORTCUT:
+            text_lower = text.lower().strip()
+            if text_lower in ["select", "selection"]:
+                log.info(f"[ROUTING] Demo shortcut triggered for {phone}, routing to Selection Agent")
+                sess = SESSIONS.get(phone, {})
+                sess["state"] = "SEL_START"
+                sess["agent"] = "selection"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                
+                from agents.selection.handler import handle_selection
+                await handle_selection(phone, "__kick__", sess)
+                return
+        
+        # Fulfillment Agent shortcut
+        from agents.fulfillment.config import settings as fulfillment_settings
+        if fulfillment_settings.DEMO_NEEDS_SHORTCUT:
+            text_lower = text.lower().strip()
+            if text_lower in ["needs", "opportunities"]:
+                log.info(f"[ROUTING] Demo shortcut triggered for {phone}, routing to Fulfillment Agent")
+                sess = SESSIONS.get(phone, {})
+                sess["state"] = "FULFILL_INTRO"
+                sess["agent"] = "fulfillment"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                
+                from agents.fulfillment.handler import handle_fulfillment
+                await handle_fulfillment(phone, "__kick__", sess)
+                return
+    except Exception as e:
+        log.warning(f"[ROUTING] Failed to check demo shortcuts: {e}")
+    
     # Get phone lock
     lock = get_phone_lock(phone)
     
@@ -1661,7 +1697,42 @@ async def _handle_with_idempotency(phone: str, text: str, inbound_msg_id: str, e
                     pass  # Best-effort
                 return  # Early return - don't process duplicate
         
-        # Process message normally
+        # Check current agent and route accordingly
+        sess = SESSIONS.get(phone, {})
+        current_agent = sess.get("agent", "onboarding")
+        
+        if current_agent == "selection":
+            # Route to Selection Agent
+            try:
+                from agents.selection.handler import handle_selection
+                await handle_selection(phone, text, sess)
+                # Update idempotency after processing
+                try:
+                    with get_db_session() as db:
+                        set_last_inbound_id(db, phone, inbound_msg_id, None)
+                except Exception as e:
+                    log.warning(f"[IDEMPOTENCY] Failed to update idempotency for {phone}: {e}")
+                return
+            except Exception as e:
+                log.error(f"[ROUTING] Error in Selection Agent: {e}", exc_info=True)
+                # Fall through to onboarding handler
+        elif current_agent == "fulfillment":
+            # Route to Fulfillment Agent
+            try:
+                from agents.fulfillment.handler import handle_fulfillment
+                await handle_fulfillment(phone, text, sess)
+                # Update idempotency after processing
+                try:
+                    with get_db_session() as db:
+                        set_last_inbound_id(db, phone, inbound_msg_id, None)
+                except Exception as e:
+                    log.warning(f"[IDEMPOTENCY] Failed to update idempotency for {phone}: {e}")
+                return
+            except Exception as e:
+                log.error(f"[ROUTING] Error in Fulfillment Agent: {e}", exc_info=True)
+                # Fall through to onboarding handler
+        
+        # Process message normally (onboarding agent or fallback)
         outbound_msg_id = None
         try:
             # Call original _handle
@@ -2017,6 +2088,19 @@ async def _handle(phone: str, text: str):
                 sess["_complete_message_sent"] = True
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
+                
+                # Transition to Selection Agent
+                try:
+                    from agents.selection.handler import handle_selection
+                    sess["state"] = "SEL_START"
+                    sess["agent"] = "selection"
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+                    await handle_selection(phone, "__kick__", sess)
+                    return
+                except Exception as e:
+                    log.error(f"[ONBOARDING] Failed to transition to Selection Agent: {e}", exc_info=True)
+                    # Continue with existing flow if transition fails
             return
         else:
             # User sent a message after completion - just acknowledge

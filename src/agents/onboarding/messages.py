@@ -57,16 +57,10 @@ WELCOME_CONSENT_ACK = """Great, I'll keep it simple and quick."""
 WELCOME_CONSENT_REMINDER = """Quick reminder — shall we continue with the onboarding?"""
 
 
-# ---------- Section 2: Intent (Commitment Check) ----------
-INTENT_PROMPT = """Just so this feels easy and realistic —  
+# ---------- Section 2: Intent (Purpose Acknowledgement) ----------
+INTENT_PROMPT = """Many volunteers come here exploring how they can contribute meaningfully through teaching 🌱  
 
-would you be comfortable teaching around **2 hours a week**?  
-
-(We always try to work around your routine 😊)"""
-
-INTENT_PERSUASION = """That's completely okay — even small amounts of time can make a big difference. 🌱  
-
-Many volunteers try one session on Saturday and another during the week."""
+If you'd like, I can quickly walk you through what volunteering with SERVE looks like."""
 
 INTENT_EXIT = """I understand 💛  
 
@@ -80,15 +74,30 @@ Thank you for your interest, and wishing you a lovely day 🌼"""
 
 
 # ---------- Section 3: Eligibility Check ----------
-ELIGIBILITY_PROMPT = """Just to make sure this works smoothly for you and the students —
+# Commitment check (first step in eligibility)
+ELIGIBILITY_COMMITMENT_PROMPT = """Before we go ahead, just to make sure this works smoothly for you and the students —  
 
-• You're 18 or above  
+would you be comfortable teaching around *2 hours a week*?  
 
-• You have a **laptop or tablet** with Internet (phones aren't suitable)  
+(We always try to work around your routine 😊)"""
 
-• You understand this is a voluntary role (no payment)
+ELIGIBILITY_COMMITMENT_PERSUASION = """That's completely okay — even small amounts of time can make a big difference. 🌱  
 
-Are all three okay for you?"""
+Many volunteers try one session on Saturday and another during the week."""
+
+ELIGIBILITY_PROMPT = """Before we continue, I just want to make sure we're aligned 😊  
+
+This usually works best when volunteers:
+
+• are *18 or above*  
+
+• use a *laptop or tablet with internet*  
+
+• can give around *2 hours a week*  
+
+• are comfortable with this being a *voluntary (unpaid)* role  
+
+Does this work for you?"""
 
 # Button labels for ELIGIBILITY (no emojis for encoding compatibility)
 ELIGIBILITY_BUTTONS = ["Yes", "No", "Tell me more"]
