@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 # For now, we'll use late imports to avoid circular dependencies
 _mcp_wa_send = None
 _log_event = None
+_mcp_call = None
 
 
 def _get_mcp_wa_send():
@@ -46,44 +47,231 @@ def _get_log_event():
     return _log_event
 
 
-# ========== Stub Functions (to be replaced with real API calls) ==========
+def _get_mcp_call():
+    """Lazy import of _mcp_call to avoid circular dependencies"""
+    global _mcp_call
+    if _mcp_call is None:
+        from agents.onboarding.wa_loop import _mcp_call
+        _mcp_call = _mcp_call
+    return _mcp_call
 
-async def fetch_open_needs() -> List[NeedCard]:
+
+# ========== API Functions ==========
+
+def _format_days(days: list) -> str:
     """
-    Fetch open needs/opportunities (STUB - returns fixed list).
+    Format days array from API format to readable string.
     
-    TODO: Replace with real Serve API call to fetch open needs.
+    Args:
+        days: List of weekday strings (e.g., ["MONDAY", "TUESDAY"])
+    
+    Returns:
+        Formatted string (e.g., "Mon & Tue")
+    """
+    if not days or not isinstance(days, list):
+        return ""
+    
+    # Map uppercase weekday names to short readable format
+    day_map = {
+        "MONDAY": "Mon",
+        "TUESDAY": "Tue",
+        "WEDNESDAY": "Wed",
+        "THURSDAY": "Thu",
+        "FRIDAY": "Fri",
+        "SATURDAY": "Sat",
+        "SUNDAY": "Sun"
+    }
+    
+    formatted_days = []
+    for day in days:
+        day_upper = str(day).upper()
+        if day_upper in day_map:
+            formatted_days.append(day_map[day_upper])
+        else:
+            # Fallback: capitalize first letter
+            formatted_days.append(str(day).capitalize()[:3])
+    
+    return " & ".join(formatted_days)
+
+
+def _format_time_slots(time_slots: list) -> str:
+    """
+    Format timeSlots array from API format to readable string.
+    
+    Args:
+        time_slots: List of time slot objects with {day, startTime, endTime}
+                   Times are in 24-hour format (HH:MM)
+    
+    Returns:
+        Formatted string (e.g., "9:00–11:00 AM IST")
+    """
+    if not time_slots or not isinstance(time_slots, list):
+        return ""
+    
+    # Group time slots by time range (same start/end times)
+    time_groups = {}
+    for slot in time_slots:
+        if not isinstance(slot, dict):
+            continue
+        
+        start_time = slot.get("startTime", "")
+        end_time = slot.get("endTime", "")
+        
+        if not start_time or not end_time:
+            continue
+        
+        # Convert 24-hour to 12-hour format
+        try:
+            start_hour, start_min = map(int, start_time.split(":"))
+            end_hour, end_min = map(int, end_time.split(":"))
+            
+            # Convert to 12-hour format
+            start_period = "AM" if start_hour < 12 else "PM"
+            end_period = "AM" if end_hour < 12 else "PM"
+            
+            if start_hour == 0:
+                start_hour = 12
+            elif start_hour > 12:
+                start_hour -= 12
+            
+            if end_hour == 0:
+                end_hour = 12
+            elif end_hour > 12:
+                end_hour -= 12
+            
+            time_range = f"{start_hour}:{start_min:02d}–{end_hour}:{end_min:02d} {start_period}"
+            
+            # Group by time range
+            if time_range not in time_groups:
+                time_groups[time_range] = []
+            time_groups[time_range].append(slot.get("day", ""))
+            
+        except (ValueError, AttributeError):
+            # Fallback: use original format
+            time_range = f"{start_time}–{end_time}"
+            if time_range not in time_groups:
+                time_groups[time_range] = []
+            time_groups[time_range].append(slot.get("day", ""))
+    
+    # Format grouped time ranges
+    if not time_groups:
+        return ""
+    
+    # For simplicity, use the first time range (most common case)
+    # If multiple ranges exist, we could format them all
+    first_range = list(time_groups.keys())[0]
+    return f"{first_range} IST"
+
+
+async def fetch_open_needs(limit: int = 5) -> List[NeedCard]:
+    """
+    Fetch open needs/opportunities using serve.needs.list MCP tool.
+    
+    Args:
+        limit: Maximum number of needs to return (default: 5, max: 20)
     
     Returns:
         List of NeedCard objects
     """
-    # Stub: return fixed list of 3 needs
-    return [
-        NeedCard(
-            need_id="need_001",
-            title="Grade 11 – Computer Fundamentals & MS Office",
-            org_name="Women's Degree College",
-            location="Begumpet — Hyderabad, Telangana",
-            days_text="Mon & Wed",
-            time_text="3:30–4:30 PM IST"
-        ),
-        NeedCard(
-            need_id="need_002",
-            title="Grade 8 – Mathematics Basics",
-            org_name="Government High School",
-            location="Secunderabad, Telangana",
-            days_text="Tue & Thu",
-            time_text="4:00–5:00 PM IST"
-        ),
-        NeedCard(
-            need_id="need_003",
-            title="Grade 10 – English Communication",
-            org_name="Community Learning Center",
-            location="Hitech City, Hyderabad, Telangana",
-            days_text="Sat",
-            time_text="10:00 AM–12:00 PM IST"
-        ),
-    ]
+    try:
+        # Ensure limit doesn't exceed API maximum
+        size = min(limit, 20)
+        
+        log.info(f"[FULFILLMENT] Fetching open needs via MCP (size={size})")
+        
+        # Prepare MCP tool arguments (all optional, defaults provided by server)
+        arguments = {
+            "page": 0,  # 0-indexed page number
+            "size": size,  # Items per page (max 20)
+            "status": "Approved"  # Filter by status
+        }
+        
+        # Call MCP tool
+        mcp_call = _get_mcp_call()
+        result = await mcp_call("serve.needs.list", arguments, timeout=15)
+        
+        # Parse response - expect paginated structure with items array
+        needs_data = []
+        if isinstance(result, dict):
+            # Look for items array in paginated response
+            if "items" in result:
+                needs_data = result["items"]
+            elif isinstance(result.get("result"), dict) and "items" in result.get("result", {}):
+                needs_data = result["result"]["items"]
+            # Fallback: try other possible structures
+            elif "needs" in result:
+                needs_data = result["needs"]
+            elif "data" in result:
+                needs_data = result["data"]
+            elif isinstance(result.get("result"), list):
+                needs_data = result["result"]
+        
+        if not needs_data:
+            log.warning(f"[FULFILLMENT] No needs returned from serve.needs.list")
+            return []
+        
+        log.info(f"[FULFILLMENT] Received {len(needs_data)} needs from API")
+        
+        # Map response to NeedCard objects
+        need_cards = []
+        for need_data in needs_data:
+            try:
+                # Handle both dict and object-like structures
+                if isinstance(need_data, dict):
+                    need_dict = need_data
+                else:
+                    # If it's an object, try to convert to dict
+                    need_dict = need_data if hasattr(need_data, '__dict__') else {}
+                
+                # Map fields from actual API response
+                need_id = need_dict.get("needId") or str(need_dict.get("id", ""))
+                title = need_dict.get("title") or ""
+                org_name = need_dict.get("schoolName") or ""
+                
+                # Construct location from district and state
+                district = need_dict.get("district", "")
+                state = need_dict.get("state", "")
+                location_parts = []
+                if district:
+                    location_parts.append(district)
+                if state:
+                    location_parts.append(state)
+                location = ", ".join(location_parts) if location_parts else ""
+                
+                # Format days array
+                days = need_dict.get("days", [])
+                days_text = _format_days(days) if days else None
+                
+                # Format timeSlots array
+                time_slots = need_dict.get("timeSlots", [])
+                time_text = _format_time_slots(time_slots) if time_slots else None
+                
+                # Only create NeedCard if we have required fields
+                if need_id and title:
+                    need_card = NeedCard(
+                        need_id=str(need_id),
+                        title=str(title),
+                        org_name=str(org_name) if org_name else "",
+                        location=location,
+                        days_text=days_text,
+                        time_text=time_text
+                    )
+                    need_cards.append(need_card)
+                    log.debug(f"[FULFILLMENT] Mapped need: {need_id} - {title}")
+                else:
+                    log.warning(f"[FULFILLMENT] Skipping need with missing required fields: needId={need_id}, title={title}")
+                    
+            except Exception as e:
+                log.warning(f"[FULFILLMENT] Error mapping need data to NeedCard: {e}, data: {need_data}")
+                continue
+        
+        log.info(f"[FULFILLMENT] Successfully fetched {len(need_cards)} needs from serve.needs.list")
+        return need_cards[:limit]  # Ensure we don't exceed requested limit
+        
+    except Exception as e:
+        log.error(f"[FULFILLMENT] Failed to fetch needs from serve.needs.list: {e}")
+        # Return empty list on error (graceful degradation)
+        return []
 
 
 async def nominate_selected_need(need_id: str, nominated_user_id: str) -> Dict[str, bool]:
@@ -211,15 +399,15 @@ async def handle_fulfill_intro(phone: str, text: str, session: dict):
 
 async def handle_fulfill_list(phone: str, text: str, session: dict):
     """
-    Handle FULFILL_LIST state: fetch needs (stub), render list, prompt to pick.
+    Handle FULFILL_LIST state: fetch needs via MCP tool, render list, prompt to pick.
     
     Sends list + prompt and sets state=FULFILL_WAIT_PICK.
     """
     if text == "__kick__" or not session.get("_fulfill_list_sent"):
         log.info(f"[FULFILLMENT] Fetching and displaying needs list for {phone}")
         
-        # Fetch needs (stub)
-        needs = await fetch_open_needs()
+        # Fetch needs via MCP tool (volunteer_id not supported by API)
+        needs = await fetch_open_needs(limit=5)
         
         # Format list
         list_message = format_need_list(needs, max_items=5)

@@ -10,6 +10,14 @@ from typing import Dict, Any, Optional, Tuple
 from ..messages import (
     ELIGIBILITY_PROMPT, ELIGIBILITY_EXIT,
     ELIGIBILITY_BUTTONS,
+    ELIGIBILITY_TELL_ME_MORE_MSG,
+    ELIGIBILITY_ISSUE_SELECTION_MSG, ELIGIBILITY_ISSUE_SELECTION_BUTTONS,
+    ELIGIBILITY_ISSUE_AGE_PROMPT, ELIGIBILITY_ISSUE_AGE_BUTTONS,
+    ELIGIBILITY_ISSUE_DEVICE_PROMPT, ELIGIBILITY_ISSUE_DEVICE_BUTTONS,
+    ELIGIBILITY_ISSUE_TIME_PROMPT, ELIGIBILITY_ISSUE_TIME_BUTTONS,
+    ELIGIBILITY_ISSUE_UNPAID_PROMPT, ELIGIBILITY_ISSUE_UNPAID_BUTTONS,
+    ELIGIBILITY_ISSUE_OTHER_PROMPT,
+    # Legacy (kept for backward compatibility)
     ELIGIBILITY_CLARIFY_AGE_PROMPT, ELIGIBILITY_CLARIFY_AGE_BUTTONS,
     ELIGIBILITY_CLARIFY_DEVICE_PROMPT, ELIGIBILITY_CLARIFY_DEVICE_BUTTONS,
     ELIGIBILITY_CLARIFY_UNPAID_PROMPT, ELIGIBILITY_CLARIFY_UNPAID_BUTTONS
@@ -43,20 +51,36 @@ def detect_button_click(text: str) -> Optional[str]:
     Detect if user clicked a button by matching button label text.
     
     Returns:
-        "yes" if Yes button clicked
-        "no" if No button clicked
-        "tell_me_more" if Tell me more button clicked
+        Button ID string (e.g., "YES_WORKS", "TELL_ME_MORE", "ISSUE_AGE", etc.)
         None if not a button click
     """
     text_lower = text.lower().strip()
     
-    # Check for exact button label matches (plain text, no emojis)
-    if text_lower in ["yes", "y"]:
-        return "yes"
-    if text_lower in ["no", "n"]:
-        return "no"
+    # Main eligibility buttons
+    if text_lower in ["yes, this works", "yes this works", "yes", "y", "works", "this works"]:
+        return "YES_WORKS"
     if text_lower in ["tell me more", "tell me", "more", "info", "information"]:
-        return "tell_me_more"
+        return "TELL_ME_MORE"
+    if text_lower in ["something won't work", "something wont work", "something won't", "wont work", "something wrong"]:
+        return "SOMETHING_WONT_WORK"
+    
+    # Issue selection buttons
+    if text_lower in ["age", "18", "eighteen"]:
+        return "ISSUE_AGE"
+    if text_lower in ["device", "laptop", "tablet", "phone", "smartphone"]:
+        return "ISSUE_DEVICE"
+    if text_lower in ["time", "hours", "2 hours", "commitment", "weekly"]:
+        return "ISSUE_TIME"
+    if text_lower in ["unpaid", "payment", "paid", "volunteer", "voluntary"]:
+        return "ISSUE_UNPAID"
+    if text_lower in ["other", "something else", "different"]:
+        return "ISSUE_OTHER"
+    
+    # Issue-specific yes/no buttons
+    if text_lower in ["yes", "y", "ok", "okay", "sure", "fine", "works", "good"]:
+        return "YES"
+    if text_lower in ["no", "n", "not", "can't", "cannot", "won't", "wont"]:
+        return "NO"
     
     return None
 
@@ -392,13 +416,14 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
     
-    # ========== SINGLE ELIGIBILITY PROMPT (no separate commitment check) ==========
-    # Initial prompt - single compact message (no buttons for now)
+    # ========== SINGLE ELIGIBILITY PROMPT WITH BUTTONS ==========
+    # Initial prompt - single compact message with interactive buttons
     if text == "__kick__" or not sess.get("_eligibility_prompted"):
-        log.info(f"[ELIGIBILITY] Sending single eligibility prompt to {phone}")
-        await mcp_wa_send(phone, ELIGIBILITY_PROMPT)
+        log.info(f"[ELIGIBILITY] Sending single eligibility prompt with buttons to {phone}")
+        await mcp_wa_send(phone, ELIGIBILITY_PROMPT, buttons=ELIGIBILITY_BUTTONS)
         _add_to_history(phone, bot_msg=ELIGIBILITY_PROMPT)
         sess["_eligibility_prompted"] = True
+        sess["_eligibility_mode"] = "ALIGN"  # Track current mode
         sess["_eligibility_clarification_sent"] = False
         sess["_eligibility_missing_req"] = None
         sess["_eligibility_clarification_step"] = None
@@ -406,91 +431,221 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
         SESSIONS[phone] = sess
         return
     
-    # Step 1: Check for button click (if buttons were used in future)
+    # Step 1: Check for button click
     button_click = detect_button_click(text)
+    eligibility_mode = sess.get("_eligibility_mode", "ALIGN")
     
     if button_click:
-        log.info(f"[ELIGIBILITY] Button clicked: {button_click}")
+        log.info(f"[ELIGIBILITY] Button clicked: {button_click}, mode: {eligibility_mode}")
         
-        # Handle button clicks based on current state
-        clarification_step = sess.get("_eligibility_clarification_step")
-        
-        if button_click == "yes":
-            if clarification_step is None:
-                # Yes on initial prompt - proceed to IDENTITY
-                log.info(f"[ELIGIBILITY] User clicked Yes on initial prompt, proceeding to IDENTITY")
-                # Mark eligibility as passed
-                profile.setdefault("eligibility", {})["passed"] = True
-                sess["profile"] = profile
-                sess["state"] = "IDENTITY"
-                sess["_eligibility_clarification_sent"] = False
-                sess["_eligibility_missing_req"] = None
-                sess["_eligibility_clarification_step"] = None
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
-                await _handle(phone, "__kick__")
-                return
-            elif clarification_step in ["age", "device", "unpaid", "commitment"]:
-                # Yes on clarification - all confirmed, proceed to IDENTITY
-                log.info(f"[ELIGIBILITY] Requirement confirmed via clarification, proceeding to IDENTITY")
-                profile.setdefault("eligibility", {})["passed"] = True
-                sess["profile"] = profile
-                sess["state"] = "IDENTITY"
-                sess["_eligibility_clarification_sent"] = False
-                sess["_eligibility_missing_req"] = None
-                sess["_eligibility_clarification_step"] = None
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
-                await _handle(phone, "__kick__")
-                return
-        
-        elif button_click == "no":
-            # No at any point - exit immediately
-            log.info(f"[ELIGIBILITY] User clicked No, sending exit message immediately")
-            await mcp_wa_send(phone, ELIGIBILITY_EXIT)
-            _add_to_history(phone, bot_msg=ELIGIBILITY_EXIT)
-            sess["state"] = "REJECTED"
+        # ========== MAIN ALIGNMENT BUTTONS ==========
+        if button_click == "YES_WORKS":
+            # User confirmed all requirements - proceed to IDENTITY
+            log.info(f"[ELIGIBILITY] User confirmed all requirements, proceeding to IDENTITY")
+            profile.setdefault("eligibility", {})["passed"] = True
+            sess["profile"] = profile
+            sess["state"] = "IDENTITY"
+            sess["_eligibility_mode"] = None
             sess["_eligibility_clarification_sent"] = False
             sess["_eligibility_missing_req"] = None
             sess["_eligibility_clarification_step"] = None
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
-            
-            # Persistence: Finalize with REJECTED status
-            try:
-                from storage.db import get_db_session
-                from storage.session_store import finalize_onboarding
-                from storage.event_logger import log_event
-                from agents.onboarding.config import settings
-                
-                with get_db_session() as db:
-                    finalize_onboarding(
-                        db,
-                        wa_phone=phone,
-                        eligibility_status="REJECTED",
-                        available_days=None,
-                        available_time_bands=None,
-                        end_reason="eligibility_failed"
-                    )
-                    session_id = sess.get("_db_session_id")
-                    log_event(
-                        db=db,
-                        wa_phone=phone,
-                        agent_name=settings.AGENT_NAME,
-                        event_type="SESSION_ENDED",
-                        event_source="onboarding_agent",
-                        state="REJECTED",
-                        status="rejected",
-                        details={"reason": "eligibility_failed"},
-                        session_id=session_id
-                    )
-                    log.info(f"[PERSISTENCE] Finalized rejected session for {phone}")
-            except Exception as e:
-                log.warning(f"[PERSISTENCE] Failed to finalize rejected session for {phone}: {e}", exc_info=True)
-            
+            await _handle(phone, "__kick__")
             return
+        
+        elif button_click == "TELL_ME_MORE":
+            # Send explanation and re-show main prompt
+            log.info(f"[ELIGIBILITY] User asked for more info")
+            await mcp_wa_send(phone, ELIGIBILITY_TELL_ME_MORE_MSG)
+            _add_to_history(phone, bot_msg=ELIGIBILITY_TELL_ME_MORE_MSG)
+            # Re-show main prompt with buttons
+            await mcp_wa_send(phone, ELIGIBILITY_PROMPT, buttons=ELIGIBILITY_BUTTONS)
+            _add_to_history(phone, bot_msg=ELIGIBILITY_PROMPT)
+            sess["_eligibility_mode"] = "ALIGN"
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+        
+        elif button_click == "SOMETHING_WONT_WORK":
+            # Show issue selection
+            log.info(f"[ELIGIBILITY] User indicated something won't work, showing issue selection")
+            await mcp_wa_send(phone, ELIGIBILITY_ISSUE_SELECTION_MSG, buttons=ELIGIBILITY_ISSUE_SELECTION_BUTTONS)
+            _add_to_history(phone, bot_msg=ELIGIBILITY_ISSUE_SELECTION_MSG)
+            sess["_eligibility_mode"] = "ISSUE_PICK"
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+        
+        # ========== ISSUE SELECTION BUTTONS ==========
+        elif eligibility_mode == "ISSUE_PICK":
+            if button_click == "ISSUE_AGE":
+                await mcp_wa_send(phone, ELIGIBILITY_ISSUE_AGE_PROMPT, buttons=ELIGIBILITY_ISSUE_AGE_BUTTONS)
+                _add_to_history(phone, bot_msg=ELIGIBILITY_ISSUE_AGE_PROMPT)
+                sess["_eligibility_mode"] = "ISSUE_AGE"
+                sess["_eligibility_clarification_step"] = "age"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            elif button_click == "ISSUE_DEVICE":
+                await mcp_wa_send(phone, ELIGIBILITY_ISSUE_DEVICE_PROMPT, buttons=ELIGIBILITY_ISSUE_DEVICE_BUTTONS)
+                _add_to_history(phone, bot_msg=ELIGIBILITY_ISSUE_DEVICE_PROMPT)
+                sess["_eligibility_mode"] = "ISSUE_DEVICE"
+                sess["_eligibility_clarification_step"] = "device"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            elif button_click == "ISSUE_TIME":
+                await mcp_wa_send(phone, ELIGIBILITY_ISSUE_TIME_PROMPT, buttons=ELIGIBILITY_ISSUE_TIME_BUTTONS)
+                _add_to_history(phone, bot_msg=ELIGIBILITY_ISSUE_TIME_PROMPT)
+                sess["_eligibility_mode"] = "ISSUE_TIME"
+                sess["_eligibility_clarification_step"] = "commitment"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            elif button_click == "ISSUE_UNPAID":
+                await mcp_wa_send(phone, ELIGIBILITY_ISSUE_UNPAID_PROMPT, buttons=ELIGIBILITY_ISSUE_UNPAID_BUTTONS)
+                _add_to_history(phone, bot_msg=ELIGIBILITY_ISSUE_UNPAID_PROMPT)
+                sess["_eligibility_mode"] = "ISSUE_UNPAID"
+                sess["_eligibility_clarification_step"] = "unpaid"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            elif button_click == "ISSUE_OTHER":
+                await mcp_wa_send(phone, ELIGIBILITY_ISSUE_OTHER_PROMPT)
+                _add_to_history(phone, bot_msg=ELIGIBILITY_ISSUE_OTHER_PROMPT)
+                sess["_eligibility_mode"] = "ISSUE_OTHER"
+                sess["_eligibility_clarification_step"] = "other"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+        
+        # ========== ISSUE-SPECIFIC YES/NO BUTTONS ==========
+        elif eligibility_mode in ["ISSUE_AGE", "ISSUE_DEVICE", "ISSUE_TIME", "ISSUE_UNPAID"]:
+            if button_click == "YES":
+                # Issue resolved - re-show main prompt
+                log.info(f"[ELIGIBILITY] Issue {eligibility_mode} resolved, re-showing main prompt")
+                await mcp_wa_send(phone, ELIGIBILITY_PROMPT, buttons=ELIGIBILITY_BUTTONS)
+                _add_to_history(phone, bot_msg=ELIGIBILITY_PROMPT)
+                sess["_eligibility_mode"] = "ALIGN"
+                sess["_eligibility_clarification_step"] = None
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            elif button_click == "NO":
+                # Requirement not met - exit immediately
+                log.info(f"[ELIGIBILITY] Requirement {eligibility_mode} not met, exiting")
+                await mcp_wa_send(phone, ELIGIBILITY_EXIT)
+                _add_to_history(phone, bot_msg=ELIGIBILITY_EXIT)
+                sess["state"] = "REJECTED"
+                sess["_eligibility_mode"] = None
+                sess["_eligibility_clarification_sent"] = False
+                sess["_eligibility_missing_req"] = None
+                sess["_eligibility_clarification_step"] = None
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                
+                # Persistence: Finalize with REJECTED status
+                try:
+                    from storage.db import get_db_session
+                    from storage.session_store import finalize_onboarding
+                    from storage.event_logger import log_event
+                    from agents.onboarding.config import settings
+                    
+                    with get_db_session() as db:
+                        finalize_onboarding(
+                            db,
+                            wa_phone=phone,
+                            eligibility_status="REJECTED",
+                            available_days=None,
+                            available_time_bands=None,
+                            end_reason=f"eligibility_failed_{eligibility_mode}"
+                        )
+                        session_id = sess.get("_db_session_id")
+                        log_event(
+                            db=db,
+                            wa_phone=phone,
+                            agent_name=settings.AGENT_NAME,
+                            event_type="SESSION_ENDED",
+                            event_source="onboarding_agent",
+                            state="REJECTED",
+                            status="rejected",
+                            details={"reason": f"eligibility_failed_{eligibility_mode}"},
+                            session_id=session_id
+                        )
+                        log.info(f"[PERSISTENCE] Finalized rejected session for {phone}")
+                except Exception as e:
+                    log.warning(f"[PERSISTENCE] Failed to finalize rejected session for {phone}: {e}", exc_info=True)
+                
+                return
+        
+        # Handle ISSUE_OTHER: user typed free text about their issue
+        elif eligibility_mode == "ISSUE_OTHER":
+            # Use rule-based + LLM to classify which issue they're describing
+            log.info(f"[ELIGIBILITY] Processing ISSUE_OTHER free text: {text[:50]}")
+            rule_intent, missing_req = classify_eligibility_rule_based(text)
+            
+            # If rule-based found a specific issue, route to that handler
+            if missing_req in ["age", "device", "commitment", "unpaid"]:
+                # Map to issue mode and show appropriate prompt
+                issue_map = {
+                    "age": ("ISSUE_AGE", ELIGIBILITY_ISSUE_AGE_PROMPT, ELIGIBILITY_ISSUE_AGE_BUTTONS),
+                    "device": ("ISSUE_DEVICE", ELIGIBILITY_ISSUE_DEVICE_PROMPT, ELIGIBILITY_ISSUE_DEVICE_BUTTONS),
+                    "commitment": ("ISSUE_TIME", ELIGIBILITY_ISSUE_TIME_PROMPT, ELIGIBILITY_ISSUE_TIME_BUTTONS),
+                    "unpaid": ("ISSUE_UNPAID", ELIGIBILITY_ISSUE_UNPAID_PROMPT, ELIGIBILITY_ISSUE_UNPAID_BUTTONS),
+                }
+                mode, prompt, buttons = issue_map[missing_req]
+                await mcp_wa_send(phone, prompt, buttons=buttons)
+                _add_to_history(phone, bot_msg=prompt)
+                sess["_eligibility_mode"] = mode
+                sess["_eligibility_clarification_step"] = missing_req
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            else:
+                # Use LLM to classify if rule-based didn't find a specific issue
+                try:
+                    llm_context = build_llm_context("ELIGIBILITY", sess, last_prompt=ELIGIBILITY_ISSUE_OTHER_PROMPT)
+                    llm_result = await mcp_llm_classify_intent(text, "ELIGIBILITY", llm_context)
+                    llm_intent = (llm_result.get("intent") or "").upper()
+                    
+                    # Map LLM intent to issue type
+                    if "AGE" in llm_intent or "18" in text.lower():
+                        missing_req = "age"
+                    elif "DEVICE" in llm_intent or any(term in text.lower() for term in ["phone", "laptop", "tablet", "device"]):
+                        missing_req = "device"
+                    elif "TIME" in llm_intent or "COMMITMENT" in llm_intent or any(term in text.lower() for term in ["hour", "time", "week"]):
+                        missing_req = "commitment"
+                    elif "UNPAID" in llm_intent or "PAID" in llm_intent or any(term in text.lower() for term in ["payment", "paid", "unpaid", "money"]):
+                        missing_req = "unpaid"
+                    
+                    if missing_req:
+                        issue_map = {
+                            "age": ("ISSUE_AGE", ELIGIBILITY_ISSUE_AGE_PROMPT, ELIGIBILITY_ISSUE_AGE_BUTTONS),
+                            "device": ("ISSUE_DEVICE", ELIGIBILITY_ISSUE_DEVICE_PROMPT, ELIGIBILITY_ISSUE_DEVICE_BUTTONS),
+                            "commitment": ("ISSUE_TIME", ELIGIBILITY_ISSUE_TIME_PROMPT, ELIGIBILITY_ISSUE_TIME_BUTTONS),
+                            "unpaid": ("ISSUE_UNPAID", ELIGIBILITY_ISSUE_UNPAID_PROMPT, ELIGIBILITY_ISSUE_UNPAID_BUTTONS),
+                        }
+                        mode, prompt, buttons = issue_map[missing_req]
+                        await mcp_wa_send(phone, prompt, buttons=buttons)
+                        _add_to_history(phone, bot_msg=prompt)
+                        sess["_eligibility_mode"] = mode
+                        sess["_eligibility_clarification_step"] = missing_req
+                        sess["ts"] = time.time()
+                        SESSIONS[phone] = sess
+                        return
+                except Exception as e:
+                    log.warning(f"[ELIGIBILITY] LLM classification failed for ISSUE_OTHER: {e}")
+                
+                # If we still can't classify, re-ask issue selection
+                await mcp_wa_send(phone, ELIGIBILITY_ISSUE_SELECTION_MSG, buttons=ELIGIBILITY_ISSUE_SELECTION_BUTTONS)
+                _add_to_history(phone, bot_msg=ELIGIBILITY_ISSUE_SELECTION_MSG)
+                sess["_eligibility_mode"] = "ISSUE_PICK"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
     
-    # Step 2: Free-text fallback (PRIMARY PATH for interrupt-aware handling)
+    # Step 2: Free-text fallback (for users who type instead of clicking buttons)
     # Use existing rule-based classification
     rule_intent, missing_req = classify_eligibility_rule_based(text)
     log.info(f"[ELIGIBILITY] Rule-based classification: intent={rule_intent}, missing_req={missing_req}")
@@ -571,18 +726,92 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
             if not rule_intent:
                 final_intent = "ELIGIBLE_UNCLEAR"
     
-    # Step 3: Handle based on final intent (interrupt-aware)
-    # If in clarification flow, handle response
-    clarification_step = sess.get("_eligibility_clarification_step")
+    # Step 3: Handle based on final intent (free-text fallback for typed responses)
+    # Map typed responses to button actions based on current mode
+    eligibility_mode = sess.get("_eligibility_mode", "ALIGN")
     
-    if clarification_step:
-        # User is in clarification flow (interrupt handling)
+    # If in issue-specific mode, handle yes/no typed responses
+    if eligibility_mode in ["ISSUE_AGE", "ISSUE_DEVICE", "ISSUE_TIME", "ISSUE_UNPAID"]:
         if final_intent == "ELIGIBLE_YES":
-            # Confirmed requirement - proceed to IDENTITY
-            log.info(f"[ELIGIBILITY] Requirement confirmed via clarification, proceeding to IDENTITY")
+            # Issue resolved - re-show main prompt
+            log.info(f"[ELIGIBILITY] Issue {eligibility_mode} resolved via typed response, re-showing main prompt")
+            await mcp_wa_send(phone, ELIGIBILITY_PROMPT, buttons=ELIGIBILITY_BUTTONS)
+            _add_to_history(phone, bot_msg=ELIGIBILITY_PROMPT)
+            sess["_eligibility_mode"] = "ALIGN"
+            sess["_eligibility_clarification_step"] = None
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+        elif final_intent == "ELIGIBLE_NO":
+            # Requirement not met - exit immediately
+            log.info(f"[ELIGIBILITY] Requirement {eligibility_mode} not met via typed response, exiting")
+            await mcp_wa_send(phone, ELIGIBILITY_EXIT)
+            _add_to_history(phone, bot_msg=ELIGIBILITY_EXIT)
+            sess["state"] = "REJECTED"
+            sess["_eligibility_mode"] = None
+            sess["_eligibility_clarification_sent"] = False
+            sess["_eligibility_missing_req"] = None
+            sess["_eligibility_clarification_step"] = None
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            
+            # Persistence: Finalize with REJECTED status
+            try:
+                from storage.db import get_db_session
+                from storage.session_store import finalize_onboarding
+                from storage.event_logger import log_event
+                from agents.onboarding.config import settings
+                
+                with get_db_session() as db:
+                    finalize_onboarding(
+                        db,
+                        wa_phone=phone,
+                        eligibility_status="REJECTED",
+                        available_days=None,
+                        available_time_bands=None,
+                        end_reason=f"eligibility_failed_{eligibility_mode}"
+                    )
+                    session_id = sess.get("_db_session_id")
+                    log_event(
+                        db=db,
+                        wa_phone=phone,
+                        agent_name=settings.AGENT_NAME,
+                        event_type="SESSION_ENDED",
+                        event_source="onboarding_agent",
+                        state="REJECTED",
+                        status="rejected",
+                        details={"reason": f"eligibility_failed_{eligibility_mode}"},
+                        session_id=session_id
+                    )
+                    log.info(f"[PERSISTENCE] Finalized rejected session for {phone}")
+            except Exception as e:
+                log.warning(f"[PERSISTENCE] Failed to finalize rejected session for {phone}: {e}", exc_info=True)
+            
+            return
+        else:
+            # Unclear response - re-ask the issue-specific question
+            issue_prompts = {
+                "ISSUE_AGE": (ELIGIBILITY_ISSUE_AGE_PROMPT, ELIGIBILITY_ISSUE_AGE_BUTTONS),
+                "ISSUE_DEVICE": (ELIGIBILITY_ISSUE_DEVICE_PROMPT, ELIGIBILITY_ISSUE_DEVICE_BUTTONS),
+                "ISSUE_TIME": (ELIGIBILITY_ISSUE_TIME_PROMPT, ELIGIBILITY_ISSUE_TIME_BUTTONS),
+                "ISSUE_UNPAID": (ELIGIBILITY_ISSUE_UNPAID_PROMPT, ELIGIBILITY_ISSUE_UNPAID_BUTTONS),
+            }
+            prompt, buttons = issue_prompts.get(eligibility_mode, (ELIGIBILITY_PROMPT, ELIGIBILITY_BUTTONS))
+            await mcp_wa_send(phone, prompt, buttons=buttons)
+            _add_to_history(phone, bot_msg=prompt)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+    
+    # Handle typed responses in ALIGN mode (map to button actions)
+    if eligibility_mode == "ALIGN" or eligibility_mode is None:
+        if final_intent == "ELIGIBLE_YES":
+            # Clear YES - proceed to IDENTITY (same as YES_WORKS button)
+            log.info(f"[ELIGIBILITY] User confirmed all requirements via typed response, proceeding to IDENTITY")
             profile.setdefault("eligibility", {})["passed"] = True
             sess["profile"] = profile
             sess["state"] = "IDENTITY"
+            sess["_eligibility_mode"] = None
             sess["_eligibility_clarification_sent"] = False
             sess["_eligibility_missing_req"] = None
             sess["_eligibility_clarification_step"] = None
@@ -590,118 +819,33 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
             SESSIONS[phone] = sess
             await _handle(phone, "__kick__")
             return
-        elif final_intent == "ELIGIBLE_NO":
-            # Still NO after clarification - exit
-            log.info(f"[ELIGIBILITY] User still declined after clarification, sending exit")
-            await mcp_wa_send(phone, ELIGIBILITY_EXIT)
-            _add_to_history(phone, bot_msg=ELIGIBILITY_EXIT)
-            sess["state"] = "REJECTED"
-            sess["ts"] = time.time()
-            SESSIONS[phone] = sess
-            return
-        else:
-            # Still unclear - re-ask clarification
-            clarify_msg, clarify_buttons = get_clarification_message(clarification_step)
-            await mcp_wa_send(phone, clarify_msg, buttons=clarify_buttons)
-            _add_to_history(phone, bot_msg=clarify_msg)
-            sess["ts"] = time.time()
-            SESSIONS[phone] = sess
-            return
-    
-    # Handle first response (interrupt-aware)
-    if final_intent == "ELIGIBLE_YES":
-        # Clear YES - proceed to IDENTITY
-        log.info(f"[ELIGIBILITY] User confirmed all requirements, proceeding to IDENTITY")
-        profile.setdefault("eligibility", {})["passed"] = True
-        sess["profile"] = profile
-        sess["state"] = "IDENTITY"
-        sess["_eligibility_clarification_sent"] = False
-        sess["_eligibility_missing_req"] = None
-        sess["_eligibility_clarification_step"] = None
-        sess["ts"] = time.time()
-        SESSIONS[phone] = sess
-        await _handle(phone, "__kick__")
-        return
-    
-    elif final_intent == "ELIGIBLE_NO":
-        # Explicit NO or constraint - immediate exit (no persuasion)
-        log.info(f"[ELIGIBILITY] User declined or constraint not met, sending exit immediately")
-        await mcp_wa_send(phone, ELIGIBILITY_EXIT)
-        _add_to_history(phone, bot_msg=ELIGIBILITY_EXIT)
-        sess["state"] = "REJECTED"
-        sess["_eligibility_clarification_sent"] = False
-        sess["_eligibility_missing_req"] = None
-        sess["_eligibility_clarification_step"] = None
-        sess["ts"] = time.time()
-        SESSIONS[phone] = sess
-        
-        # Persistence: Finalize with REJECTED status
-        try:
-            from storage.db import get_db_session
-            from storage.session_store import finalize_onboarding
-            from storage.event_logger import log_event
-            from agents.onboarding.config import settings
-            
-            with get_db_session() as db:
-                finalize_onboarding(
-                    db,
-                    wa_phone=phone,
-                    eligibility_status="REJECTED",
-                    available_days=None,
-                    available_time_bands=None,
-                    end_reason="eligibility_failed"
-                )
-                session_id = sess.get("_db_session_id")
-                log_event(
-                    db=db,
-                    wa_phone=phone,
-                    agent_name=settings.AGENT_NAME,
-                    event_type="SESSION_ENDED",
-                    event_source="onboarding_agent",
-                    state="REJECTED",
-                    status="rejected",
-                    details={"reason": "eligibility_failed"},
-                    session_id=session_id
-                )
-                log.info(f"[PERSISTENCE] Finalized rejected session for {phone}")
-        except Exception as e:
-            log.warning(f"[PERSISTENCE] Failed to finalize rejected session for {phone}: {e}", exc_info=True)
-        
-        return
-    
-    elif final_intent == "ELIGIBLE_UNCLEAR":
-        # Partial interrupt - ask ONE targeted clarification
-        log.info(f"[ELIGIBILITY] Partial interrupt detected, asking clarification for: {final_missing_req}")
-        clarify_msg, clarify_buttons = get_clarification_message(final_missing_req)
-        await mcp_wa_send(phone, clarify_msg, buttons=clarify_buttons)
-        _add_to_history(phone, bot_msg=clarify_msg)
-        sess["_eligibility_clarification_sent"] = True
-        sess["_eligibility_clarification_step"] = final_missing_req
-        sess["_eligibility_missing_req"] = final_missing_req
-        sess["ts"] = time.time()
-        SESSIONS[phone] = sess
-        return
-    
-    elif final_intent == "QUERY":
-        # Query - answer briefly and re-ask
-        log.info(f"[ELIGIBILITY] User asked question, answering and re-asking")
-        faq_answer = get_faq_answer(text)
-        if faq_answer:
-            await mcp_wa_send(phone, faq_answer)
-            _add_to_history(phone, bot_msg=faq_answer)
-        else:
-            # Generic answer
-            await mcp_wa_send(phone, ELIGIBILITY_PROMPT)
+        elif final_intent == "QUERY":
+            # Query - send "Tell me more" explanation and re-show main prompt
+            log.info(f"[ELIGIBILITY] User asked a question, sending explanation")
+            await mcp_wa_send(phone, ELIGIBILITY_TELL_ME_MORE_MSG)
+            _add_to_history(phone, bot_msg=ELIGIBILITY_TELL_ME_MORE_MSG)
+            await mcp_wa_send(phone, ELIGIBILITY_PROMPT, buttons=ELIGIBILITY_BUTTONS)
             _add_to_history(phone, bot_msg=ELIGIBILITY_PROMPT)
-        sess["ts"] = time.time()
-        SESSIONS[phone] = sess
-        return
+            sess["_eligibility_mode"] = "ALIGN"
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+        elif final_intent == "ELIGIBLE_NO" or final_intent == "ELIGIBLE_UNCLEAR":
+            # Something won't work - show issue selection
+            log.info(f"[ELIGIBILITY] User indicated problem via typed response, showing issue selection")
+            await mcp_wa_send(phone, ELIGIBILITY_ISSUE_SELECTION_MSG, buttons=ELIGIBILITY_ISSUE_SELECTION_BUTTONS)
+            _add_to_history(phone, bot_msg=ELIGIBILITY_ISSUE_SELECTION_MSG)
+            sess["_eligibility_mode"] = "ISSUE_PICK"
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
     
-    else:
-        # Ambiguous/unknown - default to UNCLEAR and ask for clarification
-        log.info(f"[ELIGIBILITY] Ambiguous response, asking for clarification")
-        await mcp_wa_send(phone, ELIGIBILITY_PROMPT)
-        _add_to_history(phone, bot_msg=ELIGIBILITY_PROMPT)
-        sess["ts"] = time.time()
-        SESSIONS[phone] = sess
-        return
+    # Fallback for unexpected modes or edge cases
+    # If we reach here, something unexpected happened - re-show main prompt with buttons
+    log.warning(f"[ELIGIBILITY] Unexpected state: mode={eligibility_mode}, intent={final_intent}, re-showing main prompt")
+    await mcp_wa_send(phone, ELIGIBILITY_PROMPT, buttons=ELIGIBILITY_BUTTONS)
+    _add_to_history(phone, bot_msg=ELIGIBILITY_PROMPT)
+    sess["_eligibility_mode"] = "ALIGN"
+    sess["ts"] = time.time()
+    SESSIONS[phone] = sess
+    return

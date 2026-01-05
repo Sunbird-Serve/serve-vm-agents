@@ -29,7 +29,9 @@ def get_sel_about_you(name: str = "there") -> str:
 
 
 # Recommended message
-SEL_RECOMMENDED_MSG = "You're all set, Let's look at open opportunities."
+def get_sel_recommended_msg(name: str = "there") -> str:
+    """Get recommended message with name"""
+    return f"Thanks {name} for sharing! You're all set, Let's look at open opportunities."
 
 # Not recommended message (placeholder, not used now)
 SEL_NOT_RECOMMENDED_MSG = """Thank you for your interest. We're currently looking for volunteers with specific qualifications.

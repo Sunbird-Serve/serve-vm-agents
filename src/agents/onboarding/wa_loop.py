@@ -1996,7 +1996,10 @@ async def _handle(phone: str, text: str):
     
     # ========== PREFERENCES STATE (State 5: Day & Time Preferences) ==========
     if state == "PREFERENCES":
+        log.info(f"[HANDLE] Calling handle_preferences for {phone}, text='{text[:50]}...', "
+                f"state={sess.get('state')}, _prefs_confirmed={sess.get('_prefs_confirmed')}")
         await handle_preferences(phone, text, sess, profile)
+        log.info(f"[HANDLE] handle_preferences returned for {phone}, new_state={sess.get('state')}")
         return
     
     # ========== QA_WINDOW STATE (State 6: Questions & Answers) ==========

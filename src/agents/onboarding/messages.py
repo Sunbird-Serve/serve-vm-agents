@@ -38,11 +38,11 @@ WELCOME_MAYBE_LATER = """No worries! You can come back anytime using this same l
 
 Just send 'start' whenever you're ready."""
 
-WELCOME_INTRO = """Hi! 👋 I'm SIA from Sunbird SERVE. 💛
+WELCOME_INTRO = """Hi! 👋 I'm SIA
 
-I'm genuinely happy you reached out.
+Welcome to SERVE - a community where volunteers from across the world support students in government schools through live online teaching.
 
-A child's learning can change because one volunteer showed up — and that could be you."""
+I'm really glad you're here."""
 
 WELCOME_SERVE_OVERVIEW = """Beautiful 🌼
 
@@ -58,9 +58,10 @@ WELCOME_CONSENT_REMINDER = """Quick reminder — shall we continue with the onbo
 
 
 # ---------- Section 2: Intent (Purpose Acknowledgement) ----------
-INTENT_PROMPT = """Many volunteers come here exploring how they can contribute meaningfully through teaching 🌱  
+INTENT_PROMPT = """Before we go ahead — I'm curious 🙂  
+What made you click the SERVE link today?"""
 
-If you'd like, I can quickly walk you through what volunteering with SERVE looks like."""
+INTENT_FOLLOWUP = """If you'd like, I can quickly walk you through what volunteering with SERVE looks like."""
 
 INTENT_EXIT = """I understand 💛  
 
@@ -85,22 +86,49 @@ ELIGIBILITY_COMMITMENT_PERSUASION = """That's completely okay — even small amo
 
 Many volunteers try one session on Saturday and another during the week."""
 
-ELIGIBILITY_PROMPT = """Before we continue, I just want to make sure we're aligned 😊  
+ELIGIBILITY_PROMPT = """Just so you can decide if this feels right for you - 😊  
 
-This usually works best when volunteers:
+Volunteering with SERVE usually means:
 
-• are *18 or above*  
+• teaching students online using laptop or a tablet (not phone)  
 
-• use a *laptop or tablet with internet*  
+• spending around *2 hours a week*
 
-• can give around *2 hours a week*  
+• contributing in a *voluntary (unpaid)* role
 
-• are comfortable with this being a *voluntary (unpaid)* role  
+• are 18 years or above
 
-Does this work for you?"""
+If this sounds like something you'd enjoy, we can continue"""
 
-# Button labels for ELIGIBILITY (no emojis for encoding compatibility)
-ELIGIBILITY_BUTTONS = ["Yes", "No", "Tell me more"]
+# Button labels for ELIGIBILITY main prompt
+ELIGIBILITY_BUTTONS = ["Yes, this works", "Tell me more", "Something won't work"]
+
+# Button labels for issue selection
+ELIGIBILITY_ISSUE_SELECTION_BUTTONS = ["Age", "Device", "Time", "Unpaid", "Other"]
+
+# Button labels for issue-specific confirmations
+ELIGIBILITY_ISSUE_AGE_BUTTONS = ["Yes", "No"]
+ELIGIBILITY_ISSUE_DEVICE_BUTTONS = ["Yes", "No"]
+ELIGIBILITY_ISSUE_TIME_BUTTONS = ["Yes", "No"]
+ELIGIBILITY_ISSUE_UNPAID_BUTTONS = ["Yes", "No"]
+
+# Message for "Tell me more"
+ELIGIBILITY_TELL_ME_MORE_MSG = """Of course 🙂 We partner with government schools for live, interactive teaching.
+We align on these basics so the experience is safe, meaningful, and smooth for both you and students."""
+
+# Message for issue selection
+ELIGIBILITY_ISSUE_SELECTION_MSG = """Thanks for telling me 💛 Which part feels difficult right now?"""
+
+# Issue-specific prompts
+ELIGIBILITY_ISSUE_AGE_PROMPT = """Just to confirm — are you *18 or above*?"""
+
+ELIGIBILITY_ISSUE_DEVICE_PROMPT = """Do you have access to a *laptop or tablet with internet* for sessions? (Phones won't work well for teaching.)"""
+
+ELIGIBILITY_ISSUE_TIME_PROMPT = """Would around *2 hours a week* generally work for you?"""
+
+ELIGIBILITY_ISSUE_UNPAID_PROMPT = """Are you comfortable with this being a *voluntary (unpaid)* role?"""
+
+ELIGIBILITY_ISSUE_OTHER_PROMPT = """Tell me what feels difficult right now, and I'll guide you 🙂"""
 
 # Progressive clarification prompts (with buttons)
 ELIGIBILITY_CLARIFY_AGE_PROMPT = """Just to confirm — are you **18 or above**?"""

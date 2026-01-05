@@ -33,6 +33,33 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
         mcp_preferences_save, mcp_deferral_create
     )
     
+    # LOG: Entry point
+    log.info(f"[PREFS] Handler called for {phone}, text='{text[:50]}...', state={sess.get('state')}, "
+             f"_prefs_confirmed={sess.get('_prefs_confirmed')}, "
+             f"_prefs_confirmation_sent={sess.get('_prefs_confirmation_sent')}, "
+             f"_prefs_summary_sent={sess.get('_prefs_summary_sent')}")
+    
+    # Early return if already transitioned to next state (idempotency)
+    if sess.get("state") != "PREFERENCES" and sess.get("state") != "PREFS_DAYTIME":
+        log.info(f"[PREFS] State is already {sess.get('state')}, skipping preferences handler")
+        return
+    
+    # Early return if preferences have already been confirmed (idempotency)
+    if sess.get("_prefs_confirmed"):
+        log.warning(f"[PREFS] DUPLICATE CALL DETECTED: Preferences already confirmed for {phone}, "
+                   f"state={sess.get('state')}, skipping handler")
+        # Just ensure state is correct and transition if needed
+        if sess.get("state") != "QA_WINDOW":
+            sess["state"] = "QA_WINDOW"
+            sess["_qa_count"] = 0
+            sess["_qa_topics"] = []
+            sess["_qa_summary_sent"] = False
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            await asyncio.sleep(0.5)
+            await _handle(phone, "__kick__")
+        return
+    
     if text == "__kick__" or not sess.get("_prefs_prompted"):
         await mcp_wa_send(phone, PREFS_INTRO_COLLAB)
         _add_to_history(phone, bot_msg=PREFS_INTRO_COLLAB)
@@ -159,21 +186,41 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
     profile["preferences"]["days"] = days
     profile["preferences"]["time_band"] = time_band
 
-    confirm = format_message(PREFS_CONFIRM_DEFAULT, days=days_str, band=band_str)
-    await mcp_wa_send(phone, confirm)
-    _add_to_history(phone, bot_msg=confirm)
-    sess["_prefs_last_prompt"] = None
-    sess["_prefs_last_prompt_text"] = None
-    sess.pop("_prefs_evening_attempts", None)
+    # Double-check idempotency right before sending messages (defense in depth)
+    if sess.get("_prefs_confirmed"):
+        log.warning(f"[PREFS] Preferences already confirmed for {phone} (duplicate call detected), skipping messages")
+        # Just ensure state is correct and transition
+        if sess.get("state") != "QA_WINDOW":
+            sess["state"] = "QA_WINDOW"
+            sess["_qa_count"] = 0
+            sess["_qa_topics"] = []
+            sess["_qa_summary_sent"] = False
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            await asyncio.sleep(0.5)
+            await _handle(phone, "__kick__")
+        return
 
+    # Mark as confirmed IMMEDIATELY before any message sending to prevent race conditions
+    # This must happen before any await calls to ensure flag is set synchronously
+    log.info(f"[PREFS] Setting _prefs_confirmed=True for {phone} before sending messages")
+    sess["_prefs_confirmed"] = True
+    sess["ts"] = time.time()
+    # Persist immediately to make flag visible to concurrent calls
+    SESSIONS[phone] = sess
+    log.info(f"[PREFS] Persisted _prefs_confirmed=True to SESSIONS for {phone}")
+
+    # Try to save preferences first (will fail for now, but that's okay)
     vid = profile.get("uuid")
     if vid and str(vid).upper() not in {"NONE", "UNKNOWN"}:
         try:
             await mcp_preferences_save(vid, time_band)
+            log.info(f"[PREFS] preferences.save succeeded for {phone}")
         except Exception as e:
             # Non-blocking: log warning but continue flow
             log.warning(f"[PREFS] preferences.save failed (continuing anyway): {e}")
 
+    # Send only summary message (with idempotency check)
     summary_msg = await _generate_prefs_summary_phone(
         phone=phone,
         sess=sess,
@@ -185,18 +232,33 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
         band_label=band_str,
     )
     if summary_msg:
-        await asyncio.sleep(0.4)
-        await mcp_wa_send(phone, summary_msg)
-        _add_to_history(phone, bot_msg=summary_msg)
+        if not sess.get("_prefs_summary_sent"):
+            log.info(f"[PREFS] Sending summary message for {phone}")
+            sess["_prefs_summary_sent"] = True
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            await mcp_wa_send(phone, summary_msg)
+            _add_to_history(phone, bot_msg=summary_msg)
+            log.info(f"[PREFS] Summary message sent for {phone}")
+        else:
+            log.warning(f"[PREFS] DUPLICATE: Summary already sent for {phone}, skipping duplicate")
+    
+    sess["_prefs_last_prompt"] = None
+    sess["_prefs_last_prompt_text"] = None
+    sess.pop("_prefs_evening_attempts", None)
 
     # Transition to QA_WINDOW state
+    log.info(f"[PREFS] Transitioning to QA_WINDOW for {phone}")
     sess["state"] = "QA_WINDOW"
     sess["_qa_count"] = 0
     sess["_qa_topics"] = []
     sess["_qa_summary_sent"] = False
     sess["ts"] = time.time()
     SESSIONS[phone] = sess
+    log.info(f"[PREFS] State transitioned to QA_WINDOW and persisted for {phone}")
 
     await asyncio.sleep(0.5)
+    log.info(f"[PREFS] Calling _handle(phone, '__kick__') for {phone} to trigger QA_WINDOW")
     await _handle(phone, "__kick__")
+    log.info(f"[PREFS] Handler completed for {phone}")
     return

@@ -13,8 +13,8 @@ from .prompts import (
     get_sel_video_done_prompt,
     get_sel_video_followup,
     get_sel_about_you,
+    get_sel_recommended_msg,
     WELCOME_VIDEO_URL,
-    SEL_RECOMMENDED_MSG,
     SEL_NOT_RECOMMENDED_MSG,
 )
 from .config import settings
@@ -351,8 +351,25 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
         SESSIONS[phone] = session
         
     elif decision in [KnowingVolunteerResult.COMPLETE.value, KnowingVolunteerResult.COMPLETE_INSUFFICIENT_INFO.value]:
-        # Complete: transition to evaluation
+        # Complete: check if we should send final response, then transition to evaluation
         log.info(f"[SELECTION] Knowing volunteer complete for {phone}, decision: {decision}")
+        
+        # Only send assistant_text if it doesn't contain a question (to avoid orphaned questions)
+        # The "thanks" will be included in the recommended message instead
+        if assistant_text and "?" not in assistant_text:
+            mcp_wa_send = _get_mcp_wa_send()
+            await mcp_wa_send(phone, assistant_text)
+            session["_last_agent_prompt"] = assistant_text
+            
+            # Add to history
+            try:
+                from agents.onboarding.wa_loop import _add_to_history
+                _add_to_history(phone, bot_msg=assistant_text)
+            except:
+                pass
+        elif assistant_text and "?" in assistant_text:
+            log.info(f"[SELECTION] Skipping question in assistant_text since we're completing: {assistant_text[:50]}...")
+        
         session["state"] = SelectionState.EVALUATE
         session["ts"] = time.time()
         
@@ -507,9 +524,14 @@ async def handle_selection_recommended(phone: str, session: dict):
     """
     log.info(f"[SELECTION] Volunteer {phone} is recommended, transitioning to Fulfillment")
     
-    # Send recommended message
+    # Get volunteer name from profile
+    profile = session.get("profile", {})
+    name = profile.get("name") or "there"
+    
+    # Send recommended message with thanks
     mcp_wa_send = _get_mcp_wa_send()
-    await mcp_wa_send(phone, SEL_RECOMMENDED_MSG)
+    recommended_msg = get_sel_recommended_msg(name)
+    await mcp_wa_send(phone, recommended_msg)
     
     # Transition to Fulfillment agent
     session["state"] = "FULFILL_INTRO"  # Fulfillment agent entry state
