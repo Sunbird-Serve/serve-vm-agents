@@ -266,7 +266,7 @@ states:
     description: "Short Q&A window (max 2 turns) before orientation scheduling"
     entry_trigger: "__kick__"
     
-    entry_message: "Before we wrap up, do you have any quick questions for me?"
+    entry_message: "Do you have any quick questions for me?"
     
     routing:
       - rule_based:

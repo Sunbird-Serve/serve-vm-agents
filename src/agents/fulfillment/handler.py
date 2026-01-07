@@ -276,20 +276,61 @@ async def fetch_open_needs(limit: int = 5) -> List[NeedCard]:
 
 async def nominate_selected_need(need_id: str, nominated_user_id: str) -> Dict[str, bool]:
     """
-    Nominate volunteer for selected need (STUB - always returns success).
-    
-    TODO: Replace with real Serve API call to create nomination.
+    Nominate volunteer for selected need using serve.fulfill.nominate MCP tool.
     
     Args:
-        need_id: ID of the selected need
-        nominated_user_id: User/volunteer identifier (phone or user_id)
+        need_id: UUID of the selected need
+        nominated_user_id: User/volunteer identifier (currently ignored, using hardcoded value)
     
     Returns:
         Dict with "success" key (boolean)
     """
-    # Stub: always return success
-    log.info(f"[FULFILLMENT] Stub: Nominating {nominated_user_id} for need {need_id}")
-    return {"success": True}
+    # Hardcoded nominatedUserId as per requirements
+    HARDCODED_USER_ID = "1-93c6dd23-599a-4191-82c9-af6d2fc5a1f9"
+    
+    log.info(f"[FULFILLMENT] Nominating user {HARDCODED_USER_ID} for need {need_id}")
+    
+    try:
+        # Prepare MCP tool arguments
+        arguments = {
+            "needId": need_id,
+            "nominatedUserId": HARDCODED_USER_ID,
+            "source": "whatsapp"  # Optional but good to include
+        }
+        
+        # Call MCP tool
+        mcp_call = _get_mcp_call()
+        result = await mcp_call("serve.fulfill.nominate", arguments, timeout=15)
+        
+        # Parse response - MCP tools typically return success on HTTP 200/201
+        # Check for explicit success indicators or assume success if no error
+        success = False
+        
+        if isinstance(result, dict):
+            # Check for explicit success field
+            if "success" in result:
+                success = bool(result["success"])
+            elif "status" in result:
+                # Check status field
+                status = result.get("status", "").lower()
+                success = status in ["success", "created", "ok", "completed"]
+            elif "error" not in result:
+                # No error field suggests success
+                success = True
+        elif result is not None:
+            # Non-dict response (unlikely but handle it)
+            success = True
+        
+        if success:
+            log.info(f"[FULFILLMENT] Nomination successful for need {need_id}, user {HARDCODED_USER_ID}")
+        else:
+            log.warning(f"[FULFILLMENT] Nomination may have failed for need {need_id}, user {HARDCODED_USER_ID}. Response: {result}")
+        
+        return {"success": success}
+        
+    except Exception as e:
+        log.error(f"[FULFILLMENT] Failed to nominate user {HARDCODED_USER_ID} for need {need_id}: {e}", exc_info=True)
+        return {"success": False}
 
 
 # ========== State Handlers ==========

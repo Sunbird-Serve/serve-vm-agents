@@ -55,15 +55,21 @@ def format_need_list(needs: list[NeedCard], max_items: int = 5) -> str:
         location_line = f"   {need.org_name}, {need.location}"
         lines.append(location_line)
         
-        # Line 3: Days + time window (if available)
-        if need.days_text or need.time_text:
-            schedule_parts = []
-            if need.days_text:
-                schedule_parts.append(need.days_text)
-            if need.time_text:
-                schedule_parts.append(need.time_text)
-            if schedule_parts:
-                lines.append(f"   {' • '.join(schedule_parts)}")
+        # Line 3: Days + time window (always show if available)
+        schedule_parts = []
+        if need.days_text:
+            schedule_parts.append(need.days_text)
+        if need.time_text:
+            schedule_parts.append(need.time_text)
+        
+        if schedule_parts:
+            # Use ASCII-safe separator instead of Unicode bullet
+            lines.append(f"   {' | '.join(schedule_parts)}")
+        elif need.days_text or need.time_text:
+            # If only one is available, show it
+            single_item = need.days_text or need.time_text
+            if single_item:
+                lines.append(f"   {single_item}")
         
         lines.append("")  # Empty line between items
     
