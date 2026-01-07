@@ -224,6 +224,7 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
         session["tool_state"]["selection"] = {}
     if "profile" not in session["tool_state"]["selection"]:
         session["tool_state"]["selection"]["profile"] = init_volunteer_profile()
+        session["tool_state"]["selection"]["discussed_fields"] = set()
     if "question_index" not in session["tool_state"]["selection"]:
         session["tool_state"]["selection"]["question_index"] = 0
     
@@ -396,33 +397,42 @@ async def handle_selection_evaluate(phone: str, session: dict):
     """
     Handle SEL_EVALUATE state: internal evaluation, compute decision.
     
-    Uses simple rule for demo:
-    - if user never said TIME_NO earlier AND did not STOP -> recommended=true
-    - else recommended=false/hold
+    Evaluation logic:
+    - Default is recommended=true
+    - Hold for human follow-up if ANY of these are true:
+      - user_stop_requested == True (STOP state)
+      - profile.teaching_interest == "no"
+      - profile.commitment_horizon == "no"
+    
+    Routing:
+    - If recommended -> transition to Fulfillment
+    - If hold_for_human -> send coordinator follow-up message and end (no Fulfillment)
     """
     log.info(f"[SELECTION] Evaluating for {phone}")
     
     # Get profile from tool_state
     profile = session.get("tool_state", {}).get("selection", {}).get("profile", {})
     
-    # Simple rule-based evaluation
-    # Check if user said TIME_NO earlier (from onboarding/selection)
-    time_no_mentioned = False
-    if "selection" in session:
-        # Check selection answers
-        if session.get("selection", {}).get("intent_answer"):
-            intent_lower = session["selection"]["intent_answer"].lower()
-            if any(term in intent_lower for term in ["no", "can't", "cannot", "not possible", "too busy"]):
-                time_no_mentioned = True
+    # Derive basic signals
+    teaching_interest = profile.get("teaching_interest")
+    commitment_horizon = profile.get("commitment_horizon")
     
-    # Check if STOP was triggered
-    stopped = session.get("state") == SelectionState.STOP
+    # User stop requested (via STOP state)
+    user_stop_requested = session.get("state") == SelectionState.STOP
     
-    # Determine recommendation
-    if not time_no_mentioned and not stopped:
-        recommended = True
-    else:
-        recommended = False
+    # Compute hold_for_human based on guardrails
+    reason_codes = []
+    if user_stop_requested:
+        reason_codes.append("USER_STOP_REQUESTED")
+    if teaching_interest == "no":
+        reason_codes.append("TEACHING_INTEREST_NO")
+    if commitment_horizon == "no":
+        reason_codes.append("COMMITMENT_HORIZON_NO")
+    
+    hold_for_human = len(reason_codes) > 0
+    
+    # Recommended is simply the inverse of hold_for_human
+    recommended = not hold_for_human
     
     outcome = RecommendationOutcome.RECOMMENDED if recommended else RecommendationOutcome.NOT_RECOMMENDED
     
@@ -430,8 +440,8 @@ async def handle_selection_evaluate(phone: str, session: dict):
     signals_present_count = sum([
         1 if profile.get("motivation") else 0,
         1 if profile.get("has_teaching_experience") is not None else 0,
-        1 if profile.get("children_age_comfort") else 0,
-        1 if profile.get("subjects") and len(profile.get("subjects", [])) > 0 else 0,
+        1 if profile.get("commitment_horizon") else 0,
+        1 if profile.get("language") or profile.get("language_comfort") else 0,  # Language signal counts if either field is present
         1 if profile.get("teaching_interest") else 0,
     ])
     
@@ -447,11 +457,13 @@ async def handle_selection_evaluate(phone: str, session: dict):
         session["tool_state"]["selection"] = {}
     session["tool_state"]["selection"]["outcome"] = {
         "recommended": recommended,
+        "hold_for_human": hold_for_human,
+        "reason_codes": reason_codes,
         "mode": "lite",
         "signals": profile.copy()
     }
     
-    # Log SELECTION_COMPLETED event
+    # Log SELECTION_EVALUATED event
     try:
         from storage.db import get_db_session
         log_event = _get_log_event()
@@ -460,12 +472,14 @@ async def handle_selection_evaluate(phone: str, session: dict):
                 db=db,
                 wa_phone=phone,
                 agent_name=settings.AGENT_NAME,
-                event_type="SELECTION_COMPLETED",
+                event_type="SELECTION_EVALUATED",
                 event_source="selection_agent",
                 state=SelectionState.EVALUATE,
                 status="completed",
                 details={
                     "recommended": recommended,
+                    "hold_for_human": hold_for_human,
+                    "reason_codes": reason_codes,
                     "signals_present_count": signals_present_count
                 }
             )
@@ -548,15 +562,22 @@ async def handle_selection_recommended(phone: str, session: dict):
 
 async def handle_selection_not_recommended(phone: str, session: dict):
     """
-    Handle SEL_NOT_RECOMMENDED state: send message and exit gracefully.
-    
-    Currently not used (always recommended=true), but kept as placeholder.
+    Handle SEL_NOT_RECOMMENDED state: send coordinator follow-up message and exit gracefully.
     """
-    log.info(f"[SELECTION] Volunteer {phone} is not recommended")
+    log.info(f"[SELECTION] Volunteer {phone} is on hold for human follow-up")
     
-    # Send not recommended message
+    # Get volunteer name from profile (if available)
+    profile = session.get("profile", {})
+    name = profile.get("name") or "there"
+    
+    # Coordinator follow-up message (no transition to Fulfillment)
+    hold_msg = (
+        f"Thank you, {name} 💛 A SERVE Coordinator will get in touch with you to guide the next step. "
+        "If you have questions meanwhile, you can message here anytime."
+    )
+    
     mcp_wa_send = _get_mcp_wa_send()
-    await mcp_wa_send(phone, SEL_NOT_RECOMMENDED_MSG)
+    await mcp_wa_send(phone, hold_msg)
     
     # Mark session as ended
     session["state"] = "CLOSE"

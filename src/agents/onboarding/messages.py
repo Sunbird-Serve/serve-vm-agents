@@ -90,13 +90,13 @@ ELIGIBILITY_PROMPT = """Just so you can decide if this feels right for you - �
 
 Volunteering with SERVE usually means:
 
-• teaching students online using laptop or a tablet (not phone)  
+* teaching students online using laptop or a tablet (not phone)  
 
-• spending around *2 hours a week*
+* spending around *2 hours a week*
 
-• contributing in a *voluntary (unpaid)* role
+* contributing in a *voluntary (unpaid)* role
 
-• are 18 years or above
+* are 18 years or above
 
 If this sounds like something you'd enjoy, we can continue"""
 
@@ -324,7 +324,7 @@ PREFS_EVENING_DEFERRAL = (
 
 
 # ---------- Section 5: QA Window & Orientation Transition ----------
-QA_ENTRY_PROMPT = """Before we wrap up, do you have any quick questions for me? (training, certificate, subjects, tech setup…)
+QA_ENTRY_PROMPT = """Do you have any quick questions for me? (training, certificate, subjects, tech setup…)
 
 I'll keep it short and clear. 🙂"""
 
