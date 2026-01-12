@@ -278,6 +278,73 @@ def set_state(
     # Note: commit handled by context manager
 
 
+def update_session_state_and_tool_state(
+    db: Session,
+    wa_phone: str,
+    state: str,
+    sub_state: Optional[str] = None,
+    last_outbound_msg_id: Optional[str] = None,
+    last_agent_prompt_id: Optional[str] = None,
+    tool_state_updates: Optional[dict] = None,
+    retries: Optional[dict] = None
+) -> None:
+    """
+    Update session state, sub_state, and merge tool_state updates atomically.
+    
+    Args:
+        db: Database session
+        wa_phone: WhatsApp phone number
+        state: New state (e.g., "ONBOARDING")
+        sub_state: Sub-state (e.g., "READINESS_CHECK", "INTENT", etc.)
+        last_outbound_msg_id: Last outbound message ID (optional)
+        last_agent_prompt_id: Last agent prompt ID (optional)
+        tool_state_updates: Dict of tool_state fields to merge (e.g., {"readiness": {...}})
+        retries: Retries dict to update (optional)
+    """
+    now = datetime.now(timezone.utc)
+    
+    # Get current tool_state
+    stmt = select(serve_agent_sessions.c.tool_state).where(
+        serve_agent_sessions.c.wa_phone == wa_phone
+    )
+    result = db.execute(stmt).first()
+    
+    tool_state = {}
+    if result and result[0] and isinstance(result[0], dict):
+        tool_state = result[0].copy()
+    
+    # Merge tool_state updates
+    if tool_state_updates:
+        tool_state.update(tool_state_updates)
+    
+    # Build update values
+    values = {
+        "state": state,
+        "updated_at": now,
+    }
+    
+    if sub_state is not None:
+        values["sub_state"] = sub_state
+    if last_outbound_msg_id is not None:
+        values["last_outbound_msg_id"] = last_outbound_msg_id
+    if last_agent_prompt_id is not None:
+        values["last_agent_prompt_id"] = last_agent_prompt_id
+    if tool_state_updates:
+        values["tool_state"] = tool_state
+    if retries is not None:
+        values["retries"] = retries
+    
+    update_stmt = (
+        update(serve_agent_sessions)
+        .where(serve_agent_sessions.c.wa_phone == wa_phone)
+        .values(**values)
+    )
+    result = db.execute(update_stmt)
+    if result.rowcount == 0:
+        log.warning(f"[SESSION_STORE] Update session state failed: no rows affected for {wa_phone}")
+    # Note: commit handled by context manager
+
+
 def get_last_inbound_id(db: Session, wa_phone: str) -> Optional[str]:
     """
     Get the last processed inbound message ID from tool_state.

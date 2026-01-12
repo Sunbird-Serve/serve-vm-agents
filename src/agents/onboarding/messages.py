@@ -38,11 +38,9 @@ WELCOME_MAYBE_LATER = """No worries! You can come back anytime using this same l
 
 Just send 'start' whenever you're ready."""
 
-WELCOME_INTRO = """Hi! 👋 I'm SIA
+WELCOME_INTRO = """Hi! 👋 I'm SIA.
 
-Welcome to SERVE - a community where volunteers from across the world support students in government schools through live online teaching.
-
-I'm really glad you're here."""
+Welcome to Sunbird SERVE - a platform where volunteers connect with children in government schools through live online learning."""
 
 WELCOME_SERVE_OVERVIEW = """Beautiful 🌼
 
@@ -58,8 +56,7 @@ WELCOME_CONSENT_REMINDER = """Quick reminder — shall we continue with the onbo
 
 
 # ---------- Section 2: Intent (Purpose Acknowledgement) ----------
-INTENT_PROMPT = """Before we go ahead — I'm curious 🙂  
-What made you click the SERVE link today?"""
+INTENT_PROMPT = """Amazing! Just Curious, What made you check this out today?"""
 
 INTENT_FOLLOWUP = """If you'd like, I can quickly walk you through what volunteering with SERVE looks like."""
 
@@ -72,6 +69,54 @@ and explore volunteering or contribution opportunities in the future.
 👉 Join SERVE Community: https://serve.sunbird.org/community  
 
 Thank you for your interest, and wishing you a lovely day 🌼"""
+
+
+# ---------- Section 2.1: Readiness Check ----------
+READINESS_CHECK_PROMPT = """Before we dive in, a quick check 🙂 
+Would you like to continue learning about volunteering with SERVE now, or come back later?"""
+
+READINESS_CHECK_BUTTONS = ["Continue Now", "Later works better"]
+
+READINESS_DEFERRED_MSG = """No worries at all 😊
+Come back whenever it works for you — I'll be right here."""
+
+
+# ---------- Section 2.2: Intent (Purpose Acknowledgement) ----------
+# INTENT_PROMPT already defined above
+INTENT_ACKNOWLEDGEMENT = """Nice 🙂"""
+
+
+# ---------- Section 2.3: Class Preview Ask ----------
+CLASS_PREVIEW_ASK_PROMPT = """BTW! Would you like to see a short glimpse of how a SERVE class usually looks?"""
+
+CLASS_PREVIEW_ASK_BUTTONS = ["Yes, show me", "Skip for now"]
+
+
+# ---------- Section 2.4: Video ----------
+VIDEO_INTRO = """Here's a short glimpse of how a SERVE class usually looks 🙂"""
+
+VIDEO_DONE_PROMPT = """Take a look when you're ready — just reply *Done* after watching."""
+
+VIDEO_ERROR_MSG = """I'm having trouble playing the video right now, but we can still continue."""
+
+
+# ---------- Section 2.5: Needs Preview ----------
+NEEDS_PREVIEW_HEADER = """Right now, these are some of the kinds of classes where volunteers are needed 👇"""
+
+NEEDS_PREVIEW_DISCLAIMER = """This is just a preview — we'll match you properly a bit later 🙂"""
+
+NEEDS_PREVIEW_ERROR_MSG = """I'm having trouble fetching the latest list right now — but we can still continue."""
+
+
+# ---------- Section 2.8: Continue Confirm (Time Expectation) ----------
+CONTINUE_CONFIRM_PROMPT = """From here, it'll just take about 10 minutes to check a few basics and see available classes 😊
+
+Shall we continue?"""
+
+CONTINUE_CONFIRM_BUTTONS = ["Yes, continue", "I'll come back later"]
+
+CONTINUE_CONFIRM_DEFERRED_MSG = """No worries at all 😊
+You can message here whenever you're ready."""
 
 
 # ---------- Section 3: Eligibility Check ----------
@@ -164,11 +209,22 @@ btw, may I know your **name**? 🙂"""
 
 IDENTITY_CONTACT_PROMPT = """Thanks {name}!  
 
-Could you share your **phone number** and **email**?  
+I have your phone number: **{phone}**  
+
+Could you share your **email**?  
 
 This helps create your volunteer profile and keep you updated on sessions."""
 
-IDENTITY_CONTACT_RETRY = """Could you share both phone number and email? 🙂"""
+IDENTITY_CONTACT_RETRY = """Could you share your email? 🙂"""
+
+IDENTITY_CONFIRM_CONTACT = """Got it! 
+
+Phone: **{phone}**  
+Email: **{email}**  
+
+Is this correct?"""
+
+IDENTITY_EMAIL_CORRECTION = """No worries! Could you share your email again? 🙂"""
 
 IDENTITY_NUDGE = """I understand your concern 💛  
 

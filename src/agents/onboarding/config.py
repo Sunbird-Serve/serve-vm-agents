@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     MONTHS_TOLERANCE: float = 0.5  # half-month tolerance
     # Database URL (optional, defaults to localhost)
     DATABASE_URL: str = "postgresql+psycopg://serve_agentic_user:Agentic%40281@localhost:5433/serve_agentic"
+    # Video URL for class preview (legacy, for fallback)
+    SERVE_CLASS_VIDEO_URL: str = "https://example.com/serve-class-video.mp4"  # Fallback video URL
+    # Local video file path for in-app playback
+    SERVE_CLASS_VIDEO_PATH: str = "temp/serve_class_video.mp4"  # Local MP4 file path
     # allow unrelated env vars (e.g., AGENT_NAME) without error
     model_config = SettingsConfigDict(env_file=".env",
                                       env_file_encoding="utf-8",

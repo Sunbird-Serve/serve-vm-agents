@@ -13,6 +13,8 @@ import time
 import uuid
 import hashlib
 import logging
+import os
+import pathlib
 from typing import Optional
 from datetime import datetime, timedelta, timezone
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
@@ -65,6 +67,10 @@ from .prompts.state_prompts import STATE_TASK_PROMPTS, DEFAULT_TASK_PROMPT
 from .prompts.few_shots import FEW_SHOT_EXAMPLES
 from .prompts.context import build_llm_context
 from .states.intent import handle_intent
+from .states.readiness_check import handle_readiness_check
+from .states.video import handle_video
+from .states.needs_preview import handle_needs_preview
+from .states.continue_confirm import handle_continue_confirm
 from .states.eligibility import handle_eligibility
 from .states.identity import handle_identity
 from .states.preferences import handle_preferences
@@ -430,22 +436,175 @@ async def mcp_wa_send(to: str, text: str, buttons: list[str] = None) -> Optional
     result = await _mcp_call("wa.send_message", args, timeout=10)
     
     # Extract outbound message ID from MCP response
-    # Try common response formats
+    message_id = None
     if isinstance(result, dict):
         # Try direct message_id field
         if "message_id" in result:
-            return str(result["message_id"])
+            message_id = str(result["message_id"])
         # Try wamid field
-        if "wamid" in result:
-            return str(result["wamid"])
+        elif "wamid" in result:
+            message_id = str(result["wamid"])
         # Try nested in result
-        if "result" in result and isinstance(result["result"], dict):
+        elif "result" in result and isinstance(result["result"], dict):
             if "message_id" in result["result"]:
-                return str(result["result"]["message_id"])
-            if "wamid" in result["result"]:
-                return str(result["result"]["wamid"])
+                message_id = str(result["result"]["message_id"])
+            elif "wamid" in result["result"]:
+                message_id = str(result["result"]["wamid"])
     
-    return None
+    # Update last_outbound_msg_id in database (best-effort, non-blocking)
+    if message_id:
+        try:
+            from storage.db import get_db_session
+            from storage.session_store import update_session_state_and_tool_state
+            
+            with get_db_session() as db:
+                # Get current state from in-memory session
+                sess = SESSIONS.get(to, {})
+                current_state = sess.get("state", "WELCOME")
+                sub_state = sess.get("sub_state")
+                
+                # Update last_outbound_msg_id without changing state
+                update_session_state_and_tool_state(
+                    db=db,
+                    wa_phone=to,
+                    state=current_state,
+                    sub_state=sub_state,
+                    last_outbound_msg_id=message_id
+                )
+        except Exception as e:
+            log.warning(f"[MCP_WA_SEND] Failed to update last_outbound_msg_id for {to}: {e}")
+            # Don't block on persistence failure
+    
+    return message_id
+
+
+# ---------- Media Upload & Video Sending ----------
+# In-memory cache for media_id (keyed by file path)
+_MEDIA_ID_CACHE: dict[str, str] = {}
+_MEDIA_CACHE_FILE = ".media_cache.json"
+
+
+def _load_media_cache() -> dict[str, str]:
+    """Load media_id cache from file if it exists."""
+    if os.path.exists(_MEDIA_CACHE_FILE):
+        try:
+            with open(_MEDIA_CACHE_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            log.warning(f"[MEDIA] Failed to load cache file: {e}")
+    return {}
+
+
+def _save_media_cache(cache: dict[str, str]):
+    """Save media_id cache to file."""
+    try:
+        with open(_MEDIA_CACHE_FILE, "w") as f:
+            json.dump(cache, f)
+    except Exception as e:
+        log.warning(f"[MEDIA] Failed to save cache file: {e}")
+
+
+async def mcp_wa_send_class_video(to_phone: str) -> Optional[str]:
+    """
+    Send class preview video to WhatsApp recipient.
+    The MCP server handles loading and sending the video file internally.
+    
+    Args:
+        to_phone: Recipient phone number (required)
+        
+    Returns:
+        message_id if successful, None otherwise
+    """
+    log.info(f"[VIDEO] Requesting class video send to {to_phone}")
+    
+    try:
+        # Call serve.whatsapp.send_class_video MCP tool
+        # Server handles loading the video file internally
+        result = await _mcp_call(
+            "serve.whatsapp.send_class_video",
+            {
+                "to_phone": to_phone
+            },
+            timeout=60  # Longer timeout for file upload and send
+        )
+        
+        # Extract message_id from result (tool sends video and returns message_id)
+        if isinstance(result, dict):
+            # Check for success indicator
+            if result.get("ok") is True:
+                # Extract message_id - check wa_message_id first (actual field name)
+                message_id = result.get("wa_message_id") or result.get("message_id") or result.get("id") or result.get("wamid")
+                if message_id:
+                    log.info(f"[VIDEO] MCP tool sent video successfully, message_id: {message_id}")
+                    return str(message_id)
+                else:
+                    # Video was sent (ok: true) but no message_id - still consider success
+                    log.info(f"[VIDEO] MCP tool sent video successfully (ok: true), but no message_id in response")
+                    return "success"  # Return a success indicator even without message_id
+            elif result.get("ok") is False:
+                # Explicit failure
+                error_msg = result.get("error") or "Unknown error"
+                log.error(f"[VIDEO] MCP tool failed: {error_msg}")
+                return None
+            else:
+                # No 'ok' field - try to extract message_id anyway (backward compatibility)
+                message_id = result.get("wa_message_id") or result.get("message_id") or result.get("id") or result.get("wamid")
+                if message_id:
+                    log.info(f"[VIDEO] MCP tool sent video successfully, message_id: {message_id}")
+                    return str(message_id)
+        
+        log.warning(f"[VIDEO] MCP tool returned unexpected format: {result}")
+        return None
+        
+    except Exception as e:
+        log.error(f"[VIDEO] Failed to send class video: {e}")
+        return None
+
+
+async def mcp_wa_send_video(to: str, media_id: str, caption: Optional[str] = None) -> Optional[str]:
+    """
+    Send a WhatsApp video message using media_id.
+    
+    Args:
+        to: Phone number
+        media_id: Media ID from upload
+        caption: Optional caption text
+        
+    Returns:
+        Optional[str]: Outbound message ID if available, None otherwise
+    """
+    try:
+        args = {
+            "to": to,
+            "type": "video",
+            "video": {
+                "id": media_id
+            }
+        }
+        
+        if caption:
+            args["video"]["caption"] = _wa_sanitize(caption)
+        
+        result = await _mcp_call("wa.send_message", args, timeout=30)
+        
+        # Extract outbound message ID
+        if isinstance(result, dict):
+            if "message_id" in result:
+                return str(result["message_id"])
+            if "wamid" in result:
+                return str(result["wamid"])
+            if "result" in result and isinstance(result["result"], dict):
+                if "message_id" in result["result"]:
+                    return str(result["result"]["message_id"])
+                if "wamid" in result["result"]:
+                    return str(result["result"]["wamid"])
+        
+        return None
+        
+    except Exception as e:
+        log.error(f"[VIDEO] Failed to send video message: {e}")
+        raise
+
 
 async def mcp_time_parse(text: str, duration=60, tz="Asia/Kolkata"):
     """Parse time options via MCP (fallback for complex parsing)"""
@@ -1943,39 +2102,58 @@ async def _handle(phone: str, text: str):
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             
-            # Schedule delayed INTENT message after ~1 second (800-1500ms range)
-            async def delayed_intent_transition():
+            # Schedule delayed READINESS_CHECK message after ~1 second
+            async def delayed_readiness_transition():
                 # Wait for ~1 second (1000ms) - natural typing pause
                 await asyncio.sleep(1.0)
                 
-                # Check if still in WELCOME state and INTENT hasn't been sent yet
-                # This ensures we don't send INTENT if user already responded and transitioned
+                # Check if still in WELCOME state
                 current_sess = SESSIONS.get(phone)
-                if current_sess and current_sess.get("state") == "WELCOME" and not current_sess.get("_intent_prompted"):
-                    log.info(f"[GREET] Auto-transitioning to INTENT after delay for {phone}")
-                    current_sess["state"] = "INTENT"
+                if current_sess and current_sess.get("state") == "WELCOME" and not current_sess.get("_readiness_check_prompted"):
+                    log.info(f"[GREET] Auto-transitioning to READINESS_CHECK after delay for {phone}")
+                    current_sess["state"] = "READINESS_CHECK"
                     current_sess["ts"] = time.time()
                     SESSIONS[phone] = current_sess
-                    # Trigger INTENT state handler (will send INTENT_PROMPT)
+                    # Trigger READINESS_CHECK state handler
                     await _handle(phone, "__kick__")
             
             # Create background task for delayed transition (non-blocking)
             # This allows the function to return immediately while delay runs in background
-            asyncio.create_task(delayed_intent_transition())
+            asyncio.create_task(delayed_readiness_transition())
             return
         else:
-            # User responded after State 1 message - transition to INTENT state immediately
-            log.info(f"[GREET] User responded after State 1 message, transitioning to INTENT")
-            sess["state"] = "INTENT"
+            # User responded after State 1 message - transition to READINESS_CHECK state immediately
+            log.info(f"[GREET] User responded after State 1 message, transitioning to READINESS_CHECK")
+            sess["state"] = "READINESS_CHECK"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
-            # Trigger INTENT state handler
+            # Trigger READINESS_CHECK state handler
             await _handle(phone, "__kick__")
             return
     
-    # ========== INTENT STATE (State 2: Commitment Check) ==========
+    # ========== READINESS_CHECK STATE (State 1.5: Ready for chat now vs later) ==========
+    if state == "READINESS_CHECK":
+        await handle_readiness_check(phone, text, sess, profile)
+        return
+    
+    # ========== INTENT STATE (State 2: Purpose Acknowledgement) ==========
     if state == "INTENT":
         await handle_intent(phone, text, sess, profile)
+        return
+    
+    # ========== VIDEO STATE (State 2.5: Show class preview video) ==========
+    if state == "VIDEO":
+        await handle_video(phone, text, sess, profile)
+        return
+    
+    # ========== NEEDS_PREVIEW STATE (State 2.7: Show needs preview) ==========
+    if state == "NEEDS_PREVIEW":
+        await handle_needs_preview(phone, text, sess, profile)
+        return
+    
+    # ========== CONTINUE_CONFIRM STATE (State 2.8: Confirm continuation with time expectation) ==========
+    if state == "CONTINUE_CONFIRM":
+        await handle_continue_confirm(phone, text, sess, profile)
         return
     
     # ========== ELIGIBILITY STATE (State 3: Eligibility Check) ==========

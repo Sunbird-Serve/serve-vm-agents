@@ -73,42 +73,24 @@ states:
         action: "fast_forward_to_existing_state"
 
   INTENT:
-    description: "Commitment check - 2 hours/week comfort"
-    entry_trigger: "consent_recorded"
+    description: "Purpose acknowledgement - what sparked their interest"
+    entry_trigger: "welcome_completed"
     
-    question: "Would you be comfortable teaching around 2 hours a week?"
+    question: "What sparked your interest in volunteering today?"
     parsing:
-      - rule_based: ["classify_intent_rule_based"]
+      - rule_based: ["classify_intent_simple"]
       - llm_fallback: "mcp_llm_classify_intent" (only when needed)
     validation:
       - rule_first: true
-      - llm_only_when: ["ambiguous", "mixed_signals", "long_message"]
+      - llm_only_when: ["ambiguous", "query"]
     tools: ["onboarding.parse_message", "llm.classify_intent"]
     
     transitions:
       - from: "INTENT"
-        to: "ELIGIBILITY"
-        trigger: "TIME_YES"
-        condition: "intent == TIME_YES"
-        action: "proceed_to_eligibility"
-      
-      - from: "INTENT"
-        to: "ELIGIBILITY"
-        trigger: "TIME_MAYBE"
-        condition: "intent == TIME_MAYBE"
-        action: "proceed_to_eligibility"
-      
-      - from: "INTENT"
-        to: "INTENT"
-        trigger: "TIME_NO"
-        condition: "intent == TIME_NO && !persuasion_sent"
-        action: "send_persuasion"
-      
-      - from: "INTENT"
-        to: "REJECTED"
-        trigger: "TIME_NO_AFTER_PERSUASION"
-        condition: "intent == TIME_NO && persuasion_sent"
-        action: "exit_with_community_link"
+        to: "INTEREST_CONTEXT"
+        trigger: "USER_RESPONDED"
+        condition: "intent != DEFERRAL && intent != STOP"
+        action: "proceed_to_interest_context"
       
       - from: "INTENT"
         to: "REJECTED"
@@ -117,7 +99,51 @@ states:
         action: "exit_with_community_link"
       
       - from: "INTENT"
-        to: "INTENT"
+        to: "REJECTED"
+        trigger: "STOP"
+        condition: "intent == STOP"
+        action: "exit_with_community_link"
+
+  INTEREST_CONTEXT:
+    description: "Continue now vs come back later choice - NOT a screening gate, only timing preference"
+    entry_trigger: "intent_completed"
+    
+    question: "If you'd like, I can quickly share what volunteering with SERVE usually looks like — so you can see if it feels right for you 😊\n\nWhat would you like to do?"
+    buttons:
+      - title: "Continue now"
+        payload: "interest_continue"
+      - title: "Come back later"
+        payload: "interest_later"
+    parsing:
+      - button_payloads: ["interest_continue", "interest_later"] (deterministic, no LLM)
+      - rule_based: ["detect_button_payload", "classify_interest_context_intent"]
+      - llm_fallback: "mcp_llm_classify_intent" (only for QUERY/AMBIGUOUS)
+    validation:
+      - rule_first: true
+      - llm_only_when: ["query", "ambiguous"]
+    tools: ["wa.send_message", "deferral.create"]
+    
+    transitions:
+      - from: "INTEREST_CONTEXT"
+        to: "ELIGIBILITY"
+        trigger: "CONTINUE_NOW"
+        condition: "intent == CONTINUE_NOW || payload == interest_continue"
+        action: "proceed_to_eligibility"
+      
+      - from: "INTEREST_CONTEXT"
+        to: "DEFERRED"
+        trigger: "DEFERRAL"
+        condition: "intent == DEFERRAL || payload == interest_later"
+        action: "create_deferral_and_exit"
+      
+      - from: "INTEREST_CONTEXT"
+        to: "OPTOUT"
+        trigger: "STOP"
+        condition: "intent == STOP"
+        action: "acknowledge_stop"
+      
+      - from: "INTEREST_CONTEXT"
+        to: "INTEREST_CONTEXT"
         trigger: "QUERY"
         condition: "intent == QUERY"
         action: "answer_faq_and_reask"

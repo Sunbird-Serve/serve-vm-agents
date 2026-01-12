@@ -5,6 +5,7 @@ Lightweight: acknowledges purpose, offers to guide, transitions to ELIGIBILITY
 import logging
 import time
 import re
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
 from ..messages import INTENT_PROMPT, INTENT_FOLLOWUP, INTENT_EXIT
@@ -60,9 +61,43 @@ async def handle_intent(phone: str, text: str, sess: Dict[str, Any], profile: Di
     if text == "__kick__" or not sess.get("_intent_prompted"):
         # First time: send curiosity question
         log.info(f"[INTENT] Sending curiosity question to {phone}")
-        await mcp_wa_send(phone, INTENT_PROMPT)
+        message_id = await mcp_wa_send(phone, INTENT_PROMPT)
         _add_to_history(phone, bot_msg=INTENT_PROMPT)
+        
+        # Persistence: Update state and log event
+        try:
+            from storage.db import get_db_session
+            from storage.session_store import update_session_state_and_tool_state
+            from storage.event_logger import log_event
+            from ..config import settings
+            
+            with get_db_session() as db:
+                session_id = sess.get("_db_session_id")
+                update_session_state_and_tool_state(
+                    db=db,
+                    wa_phone=phone,
+                    state="ONBOARDING",
+                    sub_state="INTENT",
+                    last_outbound_msg_id=message_id
+                )
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="MOTIVATION_ASKED",
+                    event_source="agent",
+                    state="ONBOARDING",
+                    sub_state="INTENT",
+                    status="SUCCESS",
+                    details={},
+                    session_id=session_id
+                )
+        except Exception as e:
+            log.warning(f"[INTENT] Failed to persist: {e}", exc_info=True)
+        
         sess["_intent_prompted"] = True
+        sess["state"] = "INTENT"
+        sess["sub_state"] = "INTENT"
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         return
@@ -84,16 +119,16 @@ async def handle_intent(phone: str, text: str, sess: Dict[str, Any], profile: Di
             SESSIONS[phone] = sess
             return
         else:
-            # User wants to continue - transition to ELIGIBILITY
-            log.info(f"[INTENT] User wants to continue, proceeding to ELIGIBILITY for {phone}")
-            sess["state"] = "ELIGIBILITY"
+            # User wants to continue - transition directly to VIDEO
+            log.info(f"[INTENT] User wants to continue, proceeding to VIDEO for {phone}")
+            sess["state"] = "VIDEO"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             await _handle(phone, "__kick__")
             return
     
     # This is the first user response (their reason for clicking SERVE link)
-    # Generate reflective response, then send follow-up and wait
+    # Generate reflective response using LLM, then transition directly to VIDEO
     log.info(f"[INTENT] User shared their reason, generating reflective response for {phone}")
     
     # Classify response - check for DEFERRAL/STOP first
@@ -105,6 +140,30 @@ async def handle_intent(phone: str, text: str, sess: Dict[str, Any], profile: Di
         log.info(f"[INTENT] User deferred/stopped, sending exit message")
         await mcp_wa_send(phone, INTENT_EXIT)
         _add_to_history(phone, bot_msg=INTENT_EXIT)
+        
+        # Persistence: Log event for deferral
+        try:
+            from storage.db import get_db_session
+            from storage.event_logger import log_event
+            from ..config import settings
+            
+            with get_db_session() as db:
+                session_id = sess.get("_db_session_id")
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="MOTIVATION_RECEIVED",
+                    event_source="user",
+                    state="ONBOARDING",
+                    sub_state="INTENT",
+                    status="SUCCESS",
+                    details={"text": text, "deferred": True},
+                    session_id=session_id
+                )
+        except Exception as e:
+            log.warning(f"[INTENT] Failed to persist: {e}", exc_info=True)
+        
         sess["state"] = "REJECTED"
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
@@ -151,13 +210,52 @@ Keep it brief, warm, and genuine. Do not make promises or commitments."""
         await mcp_wa_send(phone, fallback_response)
         _add_to_history(phone, bot_msg=fallback_response)
     
-    # Send follow-up message and wait for response
-    log.info(f"[INTENT] Sending follow-up message to {phone} and waiting for response")
-    await mcp_wa_send(phone, INTENT_FOLLOWUP)
-    _add_to_history(phone, bot_msg=INTENT_FOLLOWUP)
+    # Persistence: Store motivation text and log event
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        from storage.db import get_db_session
+        from storage.session_store import update_session_state_and_tool_state
+        from storage.event_logger import log_event
+        from ..config import settings
+        
+        with get_db_session() as db:
+            session_id = sess.get("_db_session_id")
+            # Set class_video.offered=true and choice=yes since we're going directly to video
+            tool_state_updates = {
+                "motivation": {"text": text, "at": now_iso},
+                "class_video": {
+                    "offered": True,
+                    "choice": "yes",  # Auto-selected since we're going directly
+                    "at": now_iso
+                }
+            }
+            update_session_state_and_tool_state(
+                db=db,
+                wa_phone=phone,
+                state="ONBOARDING",
+                sub_state="VIDEO",
+                tool_state_updates=tool_state_updates
+            )
+            log_event(
+                db=db,
+                wa_phone=phone,
+                agent_name=settings.AGENT_NAME,
+                event_type="MOTIVATION_RECEIVED",
+                event_source="user",
+                state="ONBOARDING",
+                sub_state="INTENT",
+                status="SUCCESS",
+                details={"text": text},
+                session_id=session_id
+            )
+    except Exception as e:
+        log.warning(f"[INTENT] Failed to persist: {e}", exc_info=True)
     
-    # Set flag to indicate follow-up was sent - next message will be the response to this
-    sess["_intent_followup_sent"] = True
+    # Transition directly to VIDEO (no CLASS_PREVIEW_ASK step)
+    log.info(f"[INTENT] Transitioning directly to VIDEO for {phone}")
+    sess["state"] = "VIDEO"
+    sess["sub_state"] = "VIDEO"
     sess["ts"] = time.time()
     SESSIONS[phone] = sess
+    await _handle(phone, "__kick__")
     return
