@@ -16,7 +16,7 @@ import hashlib
 import logging
 import os
 import pathlib
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta, timezone
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 import httpx
@@ -443,6 +443,73 @@ def _wa_sanitize(text: str) -> str:
     return safe
 
 
+async def mcp_wa_send_template(to: str, template_name: str, language_code: str = "en") -> Optional[str]:
+    """
+    Send WhatsApp template message via MCP (required for first outbound message).
+    
+    Args:
+        to: Phone number
+        template_name: Template name (e.g., "serve_welcome")
+        language_code: Template language code (default: "en")
+    
+    Returns:
+        Optional[str]: Outbound message ID if available, None otherwise
+    """
+    args = {
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {
+                "code": language_code
+            }
+        }
+    }
+    result = await _mcp_call("wa.send_message", args, timeout=10)
+    
+    # Extract outbound message ID from MCP response
+    message_id = None
+    if isinstance(result, dict):
+        # Try direct message_id field
+        if "message_id" in result:
+            message_id = str(result["message_id"])
+        # Try wamid field
+        elif "wamid" in result:
+            message_id = str(result["wamid"])
+        # Try nested in result
+        elif "result" in result and isinstance(result["result"], dict):
+            if "message_id" in result["result"]:
+                message_id = str(result["result"]["message_id"])
+            elif "wamid" in result["result"]:
+                message_id = str(result["result"]["wamid"])
+    
+    # Update last_outbound_msg_id in database (best-effort, non-blocking)
+    if message_id:
+        try:
+            from storage.db import get_db_session
+            from storage.session_store import update_session_state_and_tool_state
+            
+            with get_db_session() as db:
+                # Get current state from in-memory session
+                sess = SESSIONS.get(to, {})
+                current_state = sess.get("state", "WELCOME")
+                sub_state = sess.get("sub_state")
+                
+                # Update last_outbound_msg_id without changing state
+                update_session_state_and_tool_state(
+                    db=db,
+                    wa_phone=to,
+                    state=current_state,
+                    sub_state=sub_state,
+                    last_outbound_msg_id=message_id
+                )
+        except Exception as e:
+            log.warning(f"[MCP_WA_SEND_TEMPLATE] Failed to update last_outbound_msg_id for {to}: {e}")
+            # Don't block on persistence failure
+    
+    return message_id
+
+
 async def mcp_wa_send(to: str, text: str, buttons: list[str] = None) -> Optional[str]:
     """
     Send WhatsApp message via MCP
@@ -501,6 +568,122 @@ async def mcp_wa_send(to: str, text: str, buttons: list[str] = None) -> Optional
             # Don't block on persistence failure
     
     return message_id
+
+
+async def mcp_wa_send_list(
+    to: str,
+    header: str,
+    body: Optional[str] = None,
+    footer: Optional[str] = None,
+    sections: List[Dict[str, Any]] = None,
+    button_label: str = "View options",
+) -> Optional[str]:
+    """
+    Send WhatsApp interactive list message (carousel) via MCP.
+
+    Expected MCP payload shape:
+    {
+      "to": "<phone>",
+      "list": {
+        "body": "Message body text",
+        "button": "View Options",
+        "header": "Optional header",
+        "footer": "Optional footer",
+        "sections": [ { "rows": [ { "id": "...", "title": "...", "description": "..." } ] } ]
+      }
+    }
+    """
+    # Validate and trim fields to WhatsApp limits
+    header_trimmed = header[:60] if header else ""
+    body_text = body or header_trimmed or "Here are some options you can consider:"
+    body_trimmed = body_text[:1024]
+    footer_trimmed = footer[:60] if footer else ""
+    button_trimmed = (button_label or "View options")[:20]
+
+    list_obj: Dict[str, Any] = {
+        "body": body_trimmed,
+        "button": button_trimmed,
+    }
+    if header_trimmed:
+        list_obj["header"] = header_trimmed
+    if footer_trimmed:
+        list_obj["footer"] = footer_trimmed
+
+    # Validate and format sections/rows
+    formatted_sections: List[Dict[str, Any]] = []
+    if sections:
+        for section in sections[:10]:  # Max 10 sections
+            rows = section.get("rows", [])
+            if not rows:
+                continue
+
+            formatted_section: Dict[str, Any] = {}
+            if section.get("title"):
+                formatted_section["title"] = str(section["title"])[:24]
+
+            formatted_rows = []
+            for row in rows[:10]:  # Max 10 rows total per WhatsApp docs
+                formatted_row: Dict[str, Any] = {
+                    "id": str(row.get("id", ""))[:200],
+                    "title": str(row.get("title", ""))[:24],
+                }
+                if row.get("description"):
+                    formatted_row["description"] = str(row["description"])[:72]
+                formatted_rows.append(formatted_row)
+
+            if formatted_rows:
+                formatted_section["rows"] = formatted_rows
+                formatted_sections.append(formatted_section)
+
+    if formatted_sections:
+        list_obj["sections"] = formatted_sections
+
+    args = {
+        "to": to,
+        "list": list_obj,
+    }
+    
+    try:
+        result = await _mcp_call("wa.send_message", args, timeout=10)
+        
+        # Extract outbound message ID from MCP response
+        message_id = None
+        if isinstance(result, dict):
+            if "message_id" in result:
+                message_id = str(result["message_id"])
+            elif "wamid" in result:
+                message_id = str(result["wamid"])
+            elif "result" in result and isinstance(result["result"], dict):
+                if "message_id" in result["result"]:
+                    message_id = str(result["result"]["message_id"])
+                elif "wamid" in result["result"]:
+                    message_id = str(result["result"]["wamid"])
+        
+        # Update last_outbound_msg_id in database (best-effort, non-blocking)
+        if message_id:
+            try:
+                from storage.db import get_db_session
+                from storage.session_store import update_session_state_and_tool_state
+                
+                with get_db_session() as db:
+                    sess = SESSIONS.get(to, {})
+                    current_state = sess.get("state", "WELCOME")
+                    sub_state = sess.get("sub_state")
+                    
+                    update_session_state_and_tool_state(
+                        db=db,
+                        wa_phone=to,
+                        state=current_state,
+                        sub_state=sub_state,
+                        last_outbound_msg_id=message_id
+                    )
+            except Exception as e:
+                log.warning(f"[MCP_WA_SEND_LIST] Failed to update last_outbound_msg_id for {to}: {e}")
+        
+        return message_id
+    except Exception as e:
+        log.error(f"[MCP_WA_SEND_LIST] Failed to send interactive list to {to}: {e}", exc_info=True)
+        return None
 
 
 # ---------- Media Upload & Video Sending ----------
@@ -2060,9 +2243,17 @@ async def _handle(phone: str, text: str):
         ])
     
     # Lightweight FAQ intercept (strict: only explicit questions)
+    # Behavior: answer FAQ and then continue normal state flow (no pause),
+    # except when _reask_pending_question explicitly handles the follow-up and returns True.
     awaiting_simple_consent = state == "WELCOME" and sess.get("_greet_step") == "await_continue"
     deferral_like = state == "WELCOME" and _detect_deferral(text)
-    if text != "__kick__" and not deferral_like and ("?" in text or re.search(r"^(what|how|when|why|where|who|which|can|could|do|does|is|are)\b", text, re.I)):
+    # Skip FAQ intercept inside QA_WINDOW so QA_WINDOW owns all Q&A behavior.
+    if (
+        text != "__kick__"
+        and state != "QA_WINDOW"
+        and not deferral_like
+        and ("?" in text or re.search(r"^(what|how|when|why|where|who|which|can|could|do|does|is|are)\b", text, re.I))
+    ):
         # If we're in commitment (ELIGIBILITY_PART2) and the question is about "same day 2 hours",
         # skip FAQ so the commitment handler can respond with the correct policy clarification.
         same_day_commitment = (
@@ -2079,12 +2270,13 @@ async def _handle(phone: str, text: str):
                     if ans:
                         await mcp_wa_send(phone, ans)
                         _add_to_history(phone, bot_msg=ans)
+                        # If there was a pending question that we re-asked,
+                        # let that handler own the flow and stop here.
                         if await _reask_pending_question(phone, state, sess):
                             return
-                        # Pause progression after FAQ; resume on next user message
+                        # Otherwise, continue with normal state handling.
                         sess["ts"] = time.time()
                         SESSIONS[phone] = sess
-                        return
                 else:
                     log.info("[FAQ] No KB match; skipping FAQ answer")
             except Exception as e:
@@ -2113,22 +2305,137 @@ async def _handle(phone: str, text: str):
         return
     
     # ========== WELCOME STATE ==========
-    # State 1: First outbound message - warm greeting, then wait for user reply
+    # State 1: First outbound message - template message (required by Meta), then welcome text
     if state == "WELCOME":
         if text == "__kick__" or not sess.get("_greet_sent"):
             log.info(f"[GREET] Sending welcome message to {phone}")
 
-            # Send the welcome intro message
+            # Step 1: Send template message first (required by Meta for first outbound)
+            template_sent = sess.get("_template_sent", False)
+            if not template_sent:
+                try:
+                    from .config import settings
+                    template_name = settings.WHATSAPP_WELCOME_TEMPLATE_NAME
+                    language_code = settings.WHATSAPP_TEMPLATE_LANGUAGE_CODE
+                    
+                    log.info(f"[GREET] Sending template message '{template_name}' to {phone}")
+                    template_msg_id = await mcp_wa_send_template(phone, template_name, language_code)
+                    
+                    # Mark template as sent
+                    sess["_template_sent"] = True
+                    
+                    # Persistence: record template sent
+                    try:
+                        from datetime import datetime, timezone
+                        from storage.db import get_db_session
+                        from storage.session_store import update_session_state_and_tool_state
+                        from storage.event_logger import log_event
+                        
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        with get_db_session() as db:
+                            session_id = sess.get("_db_session_id")
+                            update_session_state_and_tool_state(
+                                db=db,
+                                wa_phone=phone,
+                                state="ONBOARDING",
+                                sub_state="WELCOME",
+                                last_outbound_msg_id=template_msg_id,
+                                tool_state_updates={
+                                    "welcome": {
+                                        "template_sent_at": now_iso,
+                                        "template_name": template_name
+                                    }
+                                },
+                            )
+                            log_event(
+                                db=db,
+                                wa_phone=phone,
+                                agent_name=settings.AGENT_NAME,
+                                event_type="WELCOME_TEMPLATE_SENT",
+                                event_source="agent",
+                                state="ONBOARDING",
+                                sub_state="WELCOME",
+                                status="SUCCESS",
+                                details={"template_name": template_name, "language_code": language_code},
+                                session_id=session_id
+                            )
+                    except Exception as e:
+                        log.warning(f"[GREET] Failed to persist template: {e}", exc_info=True)
+                    
+                    # Small delay to ensure template is delivered before sending text messages
+                    import asyncio
+                    await asyncio.sleep(1.0)
+                    
+                except Exception as e:
+                    log.error(f"[GREET] Failed to send template message to {phone}: {e}", exc_info=True)
+                    # Don't block - continue with text messages (but this may fail if Meta rejects)
+            
+            # Step 2: Send the welcome intro message (now that 24-hour session is open)
             intro_msg = WELCOME_INTRO
-            await mcp_wa_send(phone, intro_msg)
+            intro_msg_id = await mcp_wa_send(phone, intro_msg)
             _add_to_history(phone, bot_msg=intro_msg)
 
-            # Immediately send instructions message
+            # Step 3: Immediately send instructions message
             instructions_msg = WELCOME_INSTRUCTIONS
-            await mcp_wa_send(phone, instructions_msg)
+            instructions_msg_id = await mcp_wa_send(phone, instructions_msg)
             _add_to_history(phone, bot_msg=instructions_msg)
 
+            # Persistence: record welcome text messages in sessions + events
+            try:
+                from datetime import datetime, timezone
+                from storage.db import get_db_session
+                from storage.session_store import update_session_state_and_tool_state
+                from storage.event_logger import log_event
+                from .config import settings
+
+                now_iso = datetime.now(timezone.utc).isoformat()
+                last_msg_id = instructions_msg_id or intro_msg_id
+                with get_db_session() as db:
+                    session_id = sess.get("_db_session_id")
+                    
+                    # Read existing welcome from tool_state to preserve template info
+                    from sqlalchemy import select
+                    from storage.tables import serve_agent_sessions
+                    stmt = select(serve_agent_sessions.c.tool_state).where(
+                        serve_agent_sessions.c.wa_phone == phone
+                    )
+                    result = db.execute(stmt).first()
+                    existing_welcome = {}
+                    if result and result[0] and isinstance(result[0], dict):
+                        existing_welcome = result[0].get("welcome", {})
+                    
+                    welcome_update = existing_welcome.copy()
+                    welcome_update.update({
+                        "sent_at": now_iso,
+                    })
+                    
+                    update_session_state_and_tool_state(
+                        db=db,
+                        wa_phone=phone,
+                        state="ONBOARDING",
+                        sub_state="WELCOME",
+                        last_outbound_msg_id=last_msg_id,
+                        tool_state_updates={
+                            "welcome": welcome_update
+                        },
+                    )
+                    log_event(
+                        db=db,
+                        wa_phone=phone,
+                        agent_name=settings.AGENT_NAME,
+                        event_type="WELCOME_PROMPT_SENT",
+                        event_source="agent",
+                        state="ONBOARDING",
+                        sub_state="WELCOME",
+                        status="SUCCESS",
+                        details={"messages": ["WELCOME_INTRO", "WELCOME_INSTRUCTIONS"]},
+                        session_id=session_id,
+                    )
+            except Exception as e:
+                log.warning(f"[WELCOME] Failed to persist welcome state: {e}", exc_info=True)
+
             sess["_greet_sent"] = True
+            sess["sub_state"] = "WELCOME"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             return
@@ -2266,14 +2573,16 @@ async def _handle(phone: str, text: str):
                 
                 # Get volunteer name from profile
                 name = profile.get("name") or "there"
-                complete_msg = (
-                    f"Thank you, {name}. 💛\n\n"
-                    "I really appreciate you taking the time to walk through this.\n\n"
-                    "Let's continue — I'll stay with you every step of the way. 🌼"
+                # Combine "Let's continue" message with Selection intro
+                combined_msg = (
+                    f"Thanks {name}, for walking through this with me 🌼 "
+                    "Before we go ahead, here's a short welcome video"
                 )
-                await mcp_wa_send(phone, complete_msg)
-                _add_to_history(phone, bot_msg=complete_msg)
+                await mcp_wa_send(phone, combined_msg)
+                _add_to_history(phone, bot_msg=combined_msg)
                 sess["_complete_message_sent"] = True
+                # Mark that selection intro was already sent
+                sess["_selection_intro_sent"] = True
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
                 

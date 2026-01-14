@@ -2,7 +2,7 @@
 VIDEO State Handler
 Show class preview video and wait for done/skip.
 Do NOT block if user doesn't watch - proceed on any response.
-If no response after 30 seconds, auto-proceed to NEEDS_PREVIEW.
+If no response after 40 seconds, auto-proceed to NEEDS_PREVIEW.
 """
 import logging
 import time
@@ -59,9 +59,17 @@ async def handle_video(
     if text == "__kick__" or not sess.get("_video_sent"):
         log.info(f"[VIDEO] Sending in-app video to {phone}")
         
-        # Send intro
-        intro_msg_id = await mcp_wa_send(phone, VIDEO_INTRO)
-        _add_to_history(phone, bot_msg=VIDEO_INTRO)
+        # Check if VIDEO_INTRO was already sent in INTENT state
+        if not sess.get("_video_intro_sent"):
+            # Send intro (if not already sent)
+            intro_msg_id = await mcp_wa_send(phone, VIDEO_INTRO)
+            _add_to_history(phone, bot_msg=VIDEO_INTRO)
+        else:
+            log.info(f"[VIDEO] VIDEO_INTRO already sent in INTENT state, skipping")
+            intro_msg_id = None
+        
+        # Add a 5 second delay before sending video to avoid message dumping
+        await asyncio.sleep(5.0)
         
         # Send class video (server handles loading the file internally)
         video_message_id = None
@@ -204,16 +212,16 @@ async def handle_video(
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         
-        # Schedule 30-second timeout to auto-proceed if no response
+        # Schedule 40-second timeout to auto-proceed if no response
         async def video_timeout_handler():
-            await asyncio.sleep(30.0)
+            await asyncio.sleep(40.0)
             
             # Check if still in VIDEO state and no response received
             current_sess = SESSIONS.get(phone)
-            if (current_sess and 
-                current_sess.get("state") == "VIDEO" and 
+            if (current_sess and
+                current_sess.get("state") == "VIDEO" and
                 not current_sess.get("_video_response_received")):
-                log.info(f"[VIDEO] 30-second timeout reached, auto-proceeding to NEEDS_PREVIEW for {phone}")
+                log.info(f"[VIDEO] 40-second timeout reached, auto-proceeding to NEEDS_PREVIEW for {phone}")
                 current_sess["state"] = "NEEDS_PREVIEW"
                 current_sess["sub_state"] = "NEEDS_PREVIEW"
                 current_sess["ts"] = time.time()

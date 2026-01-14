@@ -8,7 +8,7 @@ import re
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
-from ..messages import INTENT_PROMPT, INTENT_FOLLOWUP, INTENT_EXIT
+from ..messages import INTENT_PROMPT, INTENT_FOLLOWUP, INTENT_EXIT, VIDEO_INTRO
 from ..validators import is_no_response
 
 log = logging.getLogger(__name__)
@@ -199,16 +199,26 @@ Keep it brief, warm, and genuine. Do not make promises or commitments."""
         
         log.info(f"[INTENT] Generated reflective response: {reflective_response}")
         
-        # Send reflective response
-        await mcp_wa_send(phone, reflective_response)
-        _add_to_history(phone, bot_msg=reflective_response)
+        # Combine reflective response with VIDEO_INTRO into one message
+        combined_message = f"{reflective_response}\n\n{VIDEO_INTRO}"
+        
+        # Send combined message
+        await mcp_wa_send(phone, combined_message)
+        _add_to_history(phone, bot_msg=combined_message)
+        
+        # Mark that VIDEO_INTRO was already sent (so VIDEO state won't send it again)
+        sess["_video_intro_sent"] = True
         
     except Exception as e:
         log.warning(f"[INTENT] Failed to generate reflective response: {e}, using fallback")
-        # Fallback: send a simple acknowledgement
+        # Fallback: combine fallback response with VIDEO_INTRO
         fallback_response = "That's wonderful to hear."
-        await mcp_wa_send(phone, fallback_response)
-        _add_to_history(phone, bot_msg=fallback_response)
+        combined_message = f"{fallback_response}\n\n{VIDEO_INTRO}"
+        await mcp_wa_send(phone, combined_message)
+        _add_to_history(phone, bot_msg=combined_message)
+        
+        # Mark that VIDEO_INTRO was already sent
+        sess["_video_intro_sent"] = True
     
     # Persistence: Store motivation text and log event
     now_iso = datetime.now(timezone.utc).isoformat()

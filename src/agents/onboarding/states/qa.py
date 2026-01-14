@@ -31,8 +31,8 @@ async def handle_qa_window(phone: str, text: str, sess: Dict[str, Any], profile:
     from ..wa_loop import (
         mcp_wa_send, _add_to_history, _handle, SESSIONS,
         mcp_telemetry_emit, mcp_deferral_create, mcp_state_get,
-        mcp_knowledge_search, mcp_llm_qa
     )
+    from ..faq import retrieve, compose_answer
     
     volunteer_id = profile.get("uuid") or phone
     name = profile.get("name") or "there"
@@ -193,34 +193,20 @@ async def handle_qa_window(phone: str, text: str, sess: Dict[str, Any], profile:
                 await _handle(phone, "__kick__")
             return
     
-    # E) LLM + RAG (free-text, multilingual, mixed questions)
+    # E) LLM + KB (single pipeline: retrieve from faqs.jsonl + compose_answer via faq.answer)
     if not matched_bucket:
         route = "LLM"
-        policy_version = sess.get("_policy_version")
-        knowledge_version = sess.get("_knowledge_version")
         
-        # Search knowledge base
-        snippets = []
-        try:
-            snippets = await mcp_knowledge_search(text, top_k=5, policy_version=policy_version)
-        except Exception as e:
-            log.warning(f"[QA] knowledge.search failed: {e}")
-        
-        # Generate answer using LLM
+        # Retrieve top KB entries from local FAQ KB
+        context_entries = retrieve(text, k=3)
         answer = ""
-        if snippets:
-            try:
-                answer = await mcp_llm_qa(
-                    text,
-                    snippets,
-                    policy_version=policy_version,
-                    knowledge_version=knowledge_version,
-                    user_profile={"name": name, "tz": profile.get("tz", "Asia/Kolkata")}
-                )
-            except Exception as e:
-                log.warning(f"[QA] LLM QA generation failed: {e}")
+        try:
+            if context_entries:
+                answer = await compose_answer(text, context_entries)
+        except Exception as e:
+            log.warning(f"[QA] FAQ compose_answer failed: {e}")
         
-        # Fallback if LLM failed or no snippets
+        # Fallback if LLM+KB failed or no context
         if not answer:
             answer = (
                 "I might not have the perfect answer right now. Our coordinator will cover this in orientation."
@@ -244,9 +230,8 @@ async def handle_qa_window(phone: str, text: str, sess: Dict[str, Any], profile:
                 "route": "LLM",
                 "classifier_conf": classifier_conf,
                 "faq_bucket": faq_bucket,
-                "snippet_ids": [s.get("id") for s in snippets if isinstance(s, dict) and s.get("id")],
-                "policy_version": policy_version,
-                "knowledge_version": knowledge_version
+                "policy_version": sess.get("_policy_version"),
+                "knowledge_version": sess.get("_knowledge_version"),
             })
         except Exception:
             pass

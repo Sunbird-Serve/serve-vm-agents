@@ -4,6 +4,7 @@ Fetch and display needs preview using MCP serve.needs.list.
 """
 import logging
 import time
+import asyncio
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
@@ -18,13 +19,13 @@ log = logging.getLogger(__name__)
 
 def format_needs_list(needs_data: List[Dict]) -> str:
     """
-    Format needs list for WhatsApp display (same format as Fulfillment agent, no CTA).
+    Format needs list for WhatsApp display with book emoji and disclaimer appended.
     
     Args:
         needs_data: List of need dicts from API
         
     Returns:
-        Formatted string with numbered list (no header, no CTA)
+        Formatted string with emoji-prefixed list and disclaimer at the end
     """
     if not needs_data:
         return ""
@@ -34,7 +35,7 @@ def format_needs_list(needs_data: List[Dict]) -> str:
     
     lines = []
     
-    for idx, need in enumerate(display_needs, start=1):
+    for need in display_needs:
         # Extract fields
         title = need.get("title", "")
         org_name = need.get("schoolName", "") or need.get("orgName", "")
@@ -77,11 +78,11 @@ def format_needs_list(needs_data: List[Dict]) -> str:
                 elif start:
                     time_text = start
         
-        # Line 1: Numbered title (bold/italics using asterisks)
+        # Line 1: Book emoji + title (bold/italics using asterisks)
         if title:
-            lines.append(f"{idx}) *{title}*")
+            lines.append(f"📚 *{title}*")
         else:
-            lines.append(f"{idx}) *Need {idx}*")
+            lines.append(f"📚 *Need*")
         
         # Line 2: Organization + location
         if org_name and location:
@@ -103,7 +104,122 @@ def format_needs_list(needs_data: List[Dict]) -> str:
         
         lines.append("")  # Empty line between items
     
+    # Append disclaimer at the end
+    lines.append("")
+    lines.append(NEEDS_PREVIEW_DISCLAIMER)
+    
     return "\n".join(lines)
+
+
+def format_needs_carousel(needs_data: List[Dict]) -> Dict[str, Any]:
+    """
+    Format needs list as WhatsApp interactive list (carousel) structure.
+    
+    Args:
+        needs_data: List of need dicts from API
+        
+    Returns:
+        Dict with carousel structure: {
+            "header": str,
+            "body": Optional[str],
+            "footer": str,
+            "sections": [{
+                "title": Optional[str],
+                "rows": [{
+                    "id": str,
+                    "title": str,
+                    "description": str
+                }]
+            }]
+        }
+    """
+    if not needs_data:
+        return {}
+    
+    # Limit to 10 items max (WhatsApp limit)
+    display_needs = needs_data[:10]
+    
+    rows = []
+    row_id_to_need_id = {}  # Map row IDs to actual need IDs
+    
+    for idx, need in enumerate(display_needs, start=1):
+        # Extract fields
+        need_id = need.get("id") or need.get("needId") or need.get("_id", "")
+        title = need.get("title", "") or f"Need {idx}"
+        org_name = need.get("schoolName", "") or need.get("orgName", "")
+        
+        # Format location
+        location_parts = []
+        district = need.get("district", "")
+        state = need.get("state", "")
+        if district:
+            location_parts.append(district)
+        if state:
+            location_parts.append(state)
+        location = ", ".join(location_parts) if location_parts else ""
+        
+        # Format days
+        days = need.get("days", [])
+        days_text = ""
+        if days:
+            day_map = {
+                "MONDAY": "Mon", "TUESDAY": "Tue", "WEDNESDAY": "Wed",
+                "THURSDAY": "Thu", "FRIDAY": "Fri", "SATURDAY": "Sat", "SUNDAY": "Sun"
+            }
+            formatted_days = [day_map.get(str(d).upper(), str(d)[:3]) for d in days if d]
+            if formatted_days:
+                days_text = " & ".join(formatted_days)
+        
+        # Format time slots
+        time_slots = need.get("timeSlots", [])
+        time_text = ""
+        if time_slots and isinstance(time_slots, list) and len(time_slots) > 0:
+            first_slot = time_slots[0]
+            if isinstance(first_slot, dict):
+                start = first_slot.get("startTime", "")
+                end = first_slot.get("endTime", "")
+                if start and end:
+                    time_text = f"{start}-{end}"
+                elif start:
+                    time_text = start
+        
+        # Build description (max 72 chars for WhatsApp)
+        desc_parts = []
+        if org_name:
+            desc_parts.append(org_name)
+        if location:
+            desc_parts.append(location)
+        if days_text:
+            desc_parts.append(days_text)
+        if time_text:
+            desc_parts.append(time_text)
+        
+        description = " | ".join(desc_parts)[:72]  # WhatsApp limit
+        
+        # Create row
+        row_id = f"need_{idx}"
+        rows.append({
+            "id": row_id,
+            "title": title[:24],  # WhatsApp limit
+            "description": description
+        })
+        
+        # Store mapping
+        row_id_to_need_id[row_id] = str(need_id)
+    
+    # Build carousel structure
+    carousel = {
+        "header": NEEDS_PREVIEW_HEADER[:60],  # WhatsApp limit
+        "footer": NEEDS_PREVIEW_DISCLAIMER[:60],  # WhatsApp limit
+        "sections": [{
+            "rows": rows
+        }]
+    }
+    
+    # Store row_id mapping in carousel for later use
+    carousel["_row_id_to_need_id"] = row_id_to_need_id
+    
+    return carousel
 
 
 async def fetch_needs_preview(limit: int = 4) -> List[Dict]:
@@ -194,20 +310,24 @@ async def handle_needs_preview(
                 needs_items.append({"need_id": str(need_id), "label": label[:100]})
         
         if needs_data and needs_success:
-            # Format and send needs list
+            # Format and send needs list (includes disclaimer at the end)
             needs_list = format_needs_list(needs_data)
             if needs_list:
-                await mcp_wa_send(phone, needs_list)
+                list_msg_id = await mcp_wa_send(phone, needs_list)
                 _add_to_history(phone, bot_msg=needs_list)
+                message_id = list_msg_id or header_msg_id
+            else:
+                message_id = header_msg_id
         else:
             # Error fetching needs - send graceful message and continue
             log.warning(f"[NEEDS_PREVIEW] Failed to fetch needs, sending error message")
-            await mcp_wa_send(phone, NEEDS_PREVIEW_ERROR_MSG)
+            error_msg_id = await mcp_wa_send(phone, NEEDS_PREVIEW_ERROR_MSG)
             _add_to_history(phone, bot_msg=NEEDS_PREVIEW_ERROR_MSG)
+            message_id = error_msg_id or header_msg_id
         
-        # Send disclaimer
-        disclaimer_msg_id = await mcp_wa_send(phone, NEEDS_PREVIEW_DISCLAIMER)
-        _add_to_history(phone, bot_msg=NEEDS_PREVIEW_DISCLAIMER)
+        # Add 10-second delay before transitioning to CONTINUE_CONFIRM
+        log.info(f"[NEEDS_PREVIEW] Waiting 10 seconds before continuing to {phone}")
+        await asyncio.sleep(10)
         
         # Persistence: Store needs preview and log event
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -231,7 +351,7 @@ async def handle_needs_preview(
                     wa_phone=phone,
                     state="ONBOARDING",
                     sub_state="NEEDS_PREVIEW",
-                    last_outbound_msg_id=disclaimer_msg_id or header_msg_id,
+                    last_outbound_msg_id=message_id,
                     tool_state_updates=tool_state_updates
                 )
                 log_event(

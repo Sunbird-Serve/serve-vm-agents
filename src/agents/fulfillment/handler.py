@@ -6,12 +6,14 @@ Handles the Fulfillment Agent state machine for opportunity discovery and nomina
 import logging
 import time
 import re
+from datetime import datetime, timezone
 from typing import Optional, List, Dict
 
 from .types import FulfillmentState, NeedCard
 from .prompts import (
     FULFILL_INTRO_MSG,
     FULFILL_LIST_HEADER,
+    FULFILL_LIST_FOOTER,
     FULFILL_INVALID_PICK_MSG,
     FULFILL_CONFIRM_SUCCESS_MSG,
     FULFILL_CONFIRM_FAILED_MSG,
@@ -274,28 +276,27 @@ async def fetch_open_needs(limit: int = 5) -> List[NeedCard]:
         return []
 
 
-async def nominate_selected_need(need_id: str, nominated_user_id: str) -> Dict[str, bool]:
+async def nominate_selected_need(need_id: str, volunteer_id: str, wa_phone: str) -> Dict[str, bool]:
     """
     Nominate volunteer for selected need using serve.fulfill.nominate MCP tool.
     
     Args:
         need_id: UUID of the selected need
-        nominated_user_id: User/volunteer identifier (currently ignored, using hardcoded value)
+        volunteer_id: SERVE volunteer osid
+        wa_phone: WhatsApp phone (for idempotency key)
     
     Returns:
         Dict with "success" key (boolean)
     """
-    # Hardcoded nominatedUserId as per requirements
-    HARDCODED_USER_ID = "1-93c6dd23-599a-4191-82c9-af6d2fc5a1f9"
-    
-    log.info(f"[FULFILLMENT] Nominating user {HARDCODED_USER_ID} for need {need_id}")
+    idempotency_key = f"{wa_phone}:{need_id}:nominate"
+    log.info(f"[FULFILLMENT] Nominating volunteer {volunteer_id} for need {need_id}")
     
     try:
-        # Prepare MCP tool arguments
+        # Prepare MCP tool arguments as per serve.fulfill.nominate contract
         arguments = {
-            "needId": need_id,
-            "nominatedUserId": HARDCODED_USER_ID,
-            "source": "whatsapp"  # Optional but good to include
+            "need_id": need_id,
+            "volunteer_id": volunteer_id,
+            "idempotency_key": idempotency_key,
         }
         
         # Call MCP tool
@@ -322,14 +323,14 @@ async def nominate_selected_need(need_id: str, nominated_user_id: str) -> Dict[s
             success = True
         
         if success:
-            log.info(f"[FULFILLMENT] Nomination successful for need {need_id}, user {HARDCODED_USER_ID}")
+            log.info(f"[FULFILLMENT] Nomination successful for need {need_id}, volunteer {volunteer_id}")
         else:
-            log.warning(f"[FULFILLMENT] Nomination may have failed for need {need_id}, user {HARDCODED_USER_ID}. Response: {result}")
+            log.warning(f"[FULFILLMENT] Nomination may have failed for need {need_id}, volunteer {volunteer_id}. Response: {result}")
         
         return {"success": success}
         
     except Exception as e:
-        log.error(f"[FULFILLMENT] Failed to nominate user {HARDCODED_USER_ID} for need {need_id}: {e}", exc_info=True)
+        log.error(f"[FULFILLMENT] Failed to nominate volunteer {volunteer_id} for need {need_id}: {e}", exc_info=True)
         return {"success": False}
 
 
@@ -369,73 +370,66 @@ async def handle_fulfillment(phone: str, text: str, session: dict):
 
 async def handle_fulfill_intro(phone: str, text: str, session: dict):
     """
-    Handle FULFILL_INTRO state: ask consent to see open opportunities.
-    
-    On __kick__: send FULFILL_INTRO_MSG and set state=FULFILL_INTRO.
-    If user says Yes -> go to FULFILL_LIST.
-    If user says No -> send exit msg and set state=FULFILL_EXIT.
+    Handle FULFILL_START: send intro and immediately show list (no extra Yes/No step).
     """
-    if text == "__kick__" or not session.get("_fulfill_intro_sent"):
-        log.info(f"[FULFILLMENT] Starting fulfillment for {phone}")
+    log.info(f"[FULFILLMENT] Starting fulfillment for {phone}")
+    
+    now_iso = datetime.now(timezone.utc).isoformat()
+    
+    # Send intro message
+    mcp_wa_send = _get_mcp_wa_send()
+    intro_msg_id = await mcp_wa_send(phone, FULFILL_INTRO_MSG)
+    
+    # Persistence: mark fulfillment started and intro sent
+    try:
+        from storage.db import get_db_session
+        from storage.session_store import update_session_state_and_tool_state
+        log_event = _get_log_event()
         
-        # Log FULFILL_STARTED event
-        try:
-            from storage.db import get_db_session
-            log_event = _get_log_event()
-            with get_db_session() as db:
-                log_event(
-                    db=db,
-                    wa_phone=phone,
-                    agent_name=settings.AGENT_NAME,
-                    event_type="FULFILL_STARTED",
-                    event_source="fulfillment_agent",
-                    state=FulfillmentState.INTRO,
-                    status="started"
-                )
-        except Exception as e:
-            log.warning(f"[FULFILLMENT] Failed to log FULFILL_STARTED event: {e}")
-        
-        # Send intro message
-        mcp_wa_send = _get_mcp_wa_send()
-        await mcp_wa_send(phone, FULFILL_INTRO_MSG)
-        
-        session["_fulfill_intro_sent"] = True
-        session["state"] = FulfillmentState.INTRO
-        session["ts"] = time.time()
-        
-        from agents.onboarding.wa_loop import SESSIONS
-        SESSIONS[phone] = session
-    else:
-        # User replied: check Yes/No
-        text_lower = text.lower().strip()
-        
-        # Check for Yes
-        if text_lower in ["yes", "y", "yeah", "yep", "sure", "ok", "okay"]:
-            log.info(f"[FULFILLMENT] User {phone} said Yes, proceeding to LIST")
-            session["state"] = FulfillmentState.LIST
-            session["ts"] = time.time()
+        with get_db_session() as db:
+            session_id = session.get("_db_session_id")
             
-            from agents.onboarding.wa_loop import SESSIONS
-            SESSIONS[phone] = session
+            # Merge into tool_state.fulfillment
+            tool_state_updates = {
+                "fulfillment": {
+                    "started_at": now_iso,
+                }
+            }
             
-            # Move to list state
-            await handle_fulfill_list(phone, "__kick__", session)
-        # Check for No
-        elif text_lower in ["no", "n", "nope", "not now", "later"]:
-            log.info(f"[FULFILLMENT] User {phone} said No, exiting")
-            session["state"] = FulfillmentState.EXIT
-            session["ts"] = time.time()
+            update_session_state_and_tool_state(
+                db=db,
+                wa_phone=phone,
+                state="FULFILLMENT",
+                sub_state=FulfillmentState.INTRO,
+                last_outbound_msg_id=intro_msg_id,
+                tool_state_updates=tool_state_updates,
+            )
             
-            from agents.onboarding.wa_loop import SESSIONS
-            SESSIONS[phone] = session
-            
-            # Handle exit
-            await handle_fulfill_exit(phone, session)
-        else:
-            # Ambiguous response - re-ask
-            log.info(f"[FULFILLMENT] Ambiguous response from {phone}, re-asking")
-            mcp_wa_send = _get_mcp_wa_send()
-            await mcp_wa_send(phone, FULFILL_INTRO_MSG)
+            # Log FULFILL_STARTED event
+            log_event(
+                db=db,
+                wa_phone=phone,
+                agent_name=settings.AGENT_NAME,
+                event_type="FULFILL_STARTED",
+                event_source="fulfillment_agent",
+                state="FULFILLMENT",
+                sub_state=FulfillmentState.INTRO,
+                status="started",
+                details={},
+                session_id=session_id,
+            )
+    except Exception as e:
+        log.warning(f"[FULFILLMENT] Failed to persist FULFILL_STARTED: {e}", exc_info=True)
+    
+    # Immediately move to list state
+    session["_fulfill_intro_sent"] = True
+    session["state"] = FulfillmentState.LIST
+    session["ts"] = time.time()
+    
+    from agents.onboarding.wa_loop import SESSIONS
+    SESSIONS[phone] = session
+    
+    await handle_fulfill_list(phone, "__kick__", session)
 
 
 async def handle_fulfill_list(phone: str, text: str, session: dict):
@@ -455,35 +449,61 @@ async def handle_fulfill_list(phone: str, text: str, session: dict):
         
         # Send list
         mcp_wa_send = _get_mcp_wa_send()
-        await mcp_wa_send(phone, list_message)
+        list_msg_id = await mcp_wa_send(phone, list_message)
         
         # Store needs in session for validation
         session["fulfillment"] = session.get("fulfillment", {})
         session["fulfillment"]["needs"] = [need.to_dict() for need in needs]
         
         # Create choice mapping: {"1": need_id1, "2": need_id2, ...}
-        choice_map = {}
+        choice_map: Dict[str, str] = {}
         for idx, need in enumerate(needs[:5], start=1):
             choice_map[str(idx)] = need.need_id
         session["fulfillment"]["choice_map"] = choice_map
         
-        # Log NEEDS_LIST_SHOWN event
+        # Persistence: tool_state.fulfillment.needs + NEEDS_LIST_SHOWN event
         try:
             from storage.db import get_db_session
+            from storage.session_store import update_session_state_and_tool_state
             log_event = _get_log_event()
+            
+            now_iso = datetime.now(timezone.utc).isoformat()
+            needs_payload = [need.to_dict() for need in needs]
+            
             with get_db_session() as db:
+                session_id = session.get("_db_session_id")
+                
+                tool_state_updates = {
+                    "fulfillment": {
+                        "need_list_cached_at": now_iso,
+                        "needs": needs_payload,
+                        "need_map": choice_map,
+                    }
+                }
+                
+                update_session_state_and_tool_state(
+                    db=db,
+                    wa_phone=phone,
+                    state="FULFILLMENT",
+                    sub_state=FulfillmentState.WAIT_PICK,
+                    last_outbound_msg_id=list_msg_id,
+                    tool_state_updates=tool_state_updates,
+                )
+                
                 log_event(
                     db=db,
                     wa_phone=phone,
                     agent_name=settings.AGENT_NAME,
                     event_type="NEEDS_LIST_SHOWN",
                     event_source="fulfillment_agent",
-                    state=FulfillmentState.LIST,
+                    state="FULFILLMENT",
+                    sub_state=FulfillmentState.LIST,
                     status="shown",
-                    details={"count": len(needs)}
+                    details={"count": len(needs)},
+                    session_id=session_id,
                 )
         except Exception as e:
-            log.warning(f"[FULFILLMENT] Failed to log NEEDS_LIST_SHOWN event: {e}")
+            log.warning(f"[FULFILLMENT] Failed to persist NEEDS_LIST_SHOWN: {e}", exc_info=True)
         
         # Move to wait_pick state
         session["_fulfill_list_sent"] = True
@@ -496,13 +516,82 @@ async def handle_fulfill_list(phone: str, text: str, session: dict):
 
 async def handle_fulfill_wait_pick(phone: str, text: str, session: dict):
     """
-    Handle FULFILL_WAIT_PICK state: parse reply, validate selection.
+    Handle FULFILL_WAIT_PICK state: parse reply, validate selection or defer.
     
-    If numeric selection valid -> go to FULFILL_NOMINATE.
-    Else reply invalid pick and remain in FULFILL_WAIT_PICK.
+    - If numeric selection valid -> store selection and go to FULFILL_NOMINATE.
+    - If defer keywords ("not now", "later", "maybe", etc.) -> graceful exit/deferred.
+    - If question -> reassure and re-show list.
+    - Else -> invalid input, re-prompt.
     """
-    # Extract number from text
     text_stripped = text.strip()
+    text_lower = text_stripped.lower()
+    
+    mcp_wa_send = _get_mcp_wa_send()
+    
+    # Helper: detect defer
+    defer_keywords = ["not now", "later", "maybe", "think", "decide later"]
+    if any(k in text_lower for k in defer_keywords):
+        log.info(f"[FULFILLMENT] User {phone} chose to defer nomination")
+        # Persistence: mark fulfillment deferred
+        try:
+            from storage.db import get_db_session
+            from storage.session_store import update_session_state_and_tool_state
+            log_event = _get_log_event()
+            
+            now_iso = datetime.now(timezone.utc).isoformat()
+            with get_db_session() as db:
+                session_id = session.get("_db_session_id")
+                
+                tool_state_updates = {
+                    "fulfillment": {
+                        "status": "deferred",
+                        "deferred_at": now_iso,
+                    }
+                }
+                
+                update_session_state_and_tool_state(
+                    db=db,
+                    wa_phone=phone,
+                    state="FULFILLMENT",
+                    sub_state=FulfillmentState.EXIT,
+                    tool_state_updates=tool_state_updates,
+                )
+                
+                # Log FULFILL_DEFERRED event
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="FULFILL_DEFERRED",
+                    event_source="fulfillment_agent",
+                    state="FULFILLMENT",
+                    sub_state=FulfillmentState.WAIT_PICK,
+                    status="deferred",
+                    details={},
+                    session_id=session_id,
+                )
+        except Exception as e:
+            log.warning(f"[FULFILLMENT] Failed to persist FULFILL_DEFERRED: {e}", exc_info=True)
+        
+        # Send graceful closing and exit
+        session["state"] = FulfillmentState.EXIT
+        session["ts"] = time.time()
+        from agents.onboarding.wa_loop import SESSIONS
+        SESSIONS[phone] = session
+        await handle_fulfill_exit(phone, session)
+        return
+    
+    # Helper: detect question
+    if "?" in text_stripped or re.search(r"^(what|how|when|why|where|who|which|can|could|do|does|is|are)\b", text_stripped, re.I):
+        log.info(f"[FULFILLMENT] Question detected from {phone}, reassuring and re-showing list")
+        reassurance = "No pressure at all — you can always decide later. For now, here are some options you can pick from:"
+        await mcp_wa_send(phone, reassurance)
+        # Re-show list
+        session["ts"] = time.time()
+        from agents.onboarding.wa_loop import SESSIONS
+        SESSIONS[phone] = session
+        await handle_fulfill_list(phone, "__kick__", session)
+        return
     
     # Try to extract a number (1, 2, 3, etc.)
     match = re.search(r'^(\d+)', text_stripped)
@@ -531,26 +620,55 @@ async def handle_fulfill_wait_pick(phone: str, text: str, session: dict):
             session["fulfillment"]["selected_need_id"] = need_id
             session["fulfillment"]["selected_need"] = selected_need
             
-            # Log NEED_SELECTED event
+            # Persistence: store selection in tool_state.fulfillment
             try:
                 from storage.db import get_db_session
+                from storage.session_store import update_session_state_and_tool_state
                 log_event = _get_log_event()
+                
+                now_iso = datetime.now(timezone.utc).isoformat()
                 with get_db_session() as db:
+                    session_id = session.get("_db_session_id")
+                    
+                    selection_payload = {
+                        "selected_choice": selection_str,
+                        "selected_need_id": need_id,
+                        "selected_need_title": (selected_need or {}).get("title") if isinstance(selected_need, dict) else None,
+                        "selected_at": now_iso,
+                    }
+                    
+                    tool_state_updates = {
+                        "fulfillment": {
+                            "selection": selection_payload,
+                        }
+                    }
+                    
+                    update_session_state_and_tool_state(
+                        db=db,
+                        wa_phone=phone,
+                        state="FULFILLMENT",
+                        sub_state=FulfillmentState.NOMINATE,
+                        tool_state_updates=tool_state_updates,
+                    )
+                    
+                    # Log NEED_SELECTED event
                     log_event(
                         db=db,
                         wa_phone=phone,
                         agent_name=settings.AGENT_NAME,
-                        event_type="NEED_SELECTED",
+                        event_type="FULFILL_NEED_SELECTED",
                         event_source="fulfillment_agent",
-                        state=FulfillmentState.WAIT_PICK,
+                        state="FULFILLMENT",
+                        sub_state=FulfillmentState.WAIT_PICK,
                         status="selected",
                         details={
                             "selection_index": selection_str,
-                            "need_id": need_id
-                        }
+                            "need_id": need_id,
+                        },
+                        session_id=session_id,
                     )
             except Exception as e:
-                log.warning(f"[FULFILLMENT] Failed to log NEED_SELECTED event: {e}")
+                log.warning(f"[FULFILLMENT] Failed to persist FULFILL_NEED_SELECTED: {e}", exc_info=True)
             
             # Move to nominate state
             session["state"] = FulfillmentState.NOMINATE
@@ -564,7 +682,6 @@ async def handle_fulfill_wait_pick(phone: str, text: str, session: dict):
         else:
             # Invalid selection number
             log.warning(f"[FULFILLMENT] Invalid selection '{selection_str}' from {phone}")
-            mcp_wa_send = _get_mcp_wa_send()
             await mcp_wa_send(phone, FULFILL_INVALID_PICK_MSG)
             
             # Stay in WAIT_PICK state
@@ -574,7 +691,6 @@ async def handle_fulfill_wait_pick(phone: str, text: str, session: dict):
     else:
         # No number found
         log.warning(f"[FULFILLMENT] No number found in reply from {phone}: '{text[:30]}...'")
-        mcp_wa_send = _get_mcp_wa_send()
         await mcp_wa_send(phone, FULFILL_INVALID_PICK_MSG)
         
         # Stay in WAIT_PICK state
@@ -606,38 +722,118 @@ async def handle_fulfill_nominate(phone: str, text: str, session: dict):
         await handle_fulfill_list(phone, "__kick__", session)
         return
     
-    # Get user identifier (use phone for now, or user_id if available)
-    user_id = phone  # TODO: Use actual user_id from profile if available
+    # Get volunteer_id (SERVE osid) from registration tool_state (DB)
+    volunteer_id = None
+    try:
+        from storage.db import get_db_session
+        from sqlalchemy import select
+        from storage.tables import serve_agent_sessions
+        
+        with get_db_session() as db:
+            stmt = select(serve_agent_sessions.c.tool_state).where(
+                serve_agent_sessions.c.wa_phone == phone
+            )
+            result = db.execute(stmt).first()
+            if result and result[0] and isinstance(result[0], dict):
+                tool_state = result[0]
+                reg = tool_state.get("registration", {})
+                serve_block = reg.get("serve", {}) if isinstance(reg, dict) else {}
+                volunteer_id = serve_block.get("volunteer_id")
+    except Exception as e:
+        log.warning(f"[FULFILLMENT] Failed to load volunteer_id from tool_state for {phone}: {e}", exc_info=True)
     
-    # Call nominate stub
-    result = await nominate_selected_need(need_id, user_id)
+    if not volunteer_id:
+        log.error(f"[FULFILLMENT] Missing volunteer_id for {phone}, cannot nominate")
+        mcp_wa_send = _get_mcp_wa_send()
+        await mcp_wa_send(
+            phone,
+            "Sorry — I couldn't find your registration details to complete the nomination. "
+            "A coordinator will reach out to help you with the next steps."
+        )
+        return
+    
+    # Call nominate tool via MCP
+    result = await nominate_selected_need(need_id, volunteer_id, phone)
     
     mcp_wa_send = _get_mcp_wa_send()
+    
+    now_iso = datetime.now(timezone.utc).isoformat()
     
     if result.get("success"):
         # Success
         log.info(f"[FULFILLMENT] Nomination successful for {phone}, need_id: {need_id}")
         
-        # Log NOMINATION_SUCCESS event
+        # Send success message
+        success_msg_id = await mcp_wa_send(phone, FULFILL_CONFIRM_SUCCESS_MSG)
+        
+        # Persistence: store successful nomination
         try:
             from storage.db import get_db_session
+            from storage.session_store import update_session_state_and_tool_state
             log_event = _get_log_event()
+            
             with get_db_session() as db:
+                session_id = session.get("_db_session_id")
+                
+                # Read existing fulfillment from tool_state
+                from sqlalchemy import select
+                from storage.tables import serve_agent_sessions
+                stmt = select(serve_agent_sessions.c.tool_state).where(
+                    serve_agent_sessions.c.wa_phone == phone
+                )
+                db_result = db.execute(stmt).first()
+                existing_fulfillment = {}
+                if db_result and db_result[0] and isinstance(db_result[0], dict):
+                    existing_fulfillment = db_result[0].get("fulfillment", {})
+                
+                nomination_payload = {
+                    "status": "success",
+                    "need_id": need_id,
+                    "volunteer_id": volunteer_id,
+                    "nominated_at": now_iso,
+                    "error": None,
+                }
+                
+                fulfillment_update = existing_fulfillment.copy()
+                fulfillment_update["nomination"] = nomination_payload
+                fulfillment_update["completed_at"] = now_iso
+                
+                update_session_state_and_tool_state(
+                    db=db,
+                    wa_phone=phone,
+                    state="FULFILLMENT",
+                    sub_state=FulfillmentState.DONE,
+                    last_outbound_msg_id=success_msg_id,
+                    tool_state_updates={"fulfillment": fulfillment_update},
+                )
+                
+                # Log NOMINATION_SUCCESS + FULFILL_COMPLETED
                 log_event(
                     db=db,
                     wa_phone=phone,
                     agent_name=settings.AGENT_NAME,
                     event_type="NOMINATION_SUCCESS",
                     event_source="fulfillment_agent",
-                    state=FulfillmentState.NOMINATE,
+                    state="FULFILLMENT",
+                    sub_state=FulfillmentState.NOMINATE,
                     status="success",
-                    details={"need_id": need_id}
+                    details={"need_id": need_id, "volunteer_id": volunteer_id},
+                    session_id=session_id,
+                )
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="FULFILL_COMPLETED",
+                    event_source="fulfillment_agent",
+                    state="FULFILLMENT",
+                    sub_state=FulfillmentState.DONE,
+                    status="success",
+                    details={"need_id": need_id, "volunteer_id": volunteer_id},
+                    session_id=session_id,
                 )
         except Exception as e:
-            log.warning(f"[FULFILLMENT] Failed to log NOMINATION_SUCCESS event: {e}")
-        
-        # Send success message
-        await mcp_wa_send(phone, FULFILL_CONFIRM_SUCCESS_MSG)
+            log.warning(f"[FULFILLMENT] Failed to persist successful nomination: {e}", exc_info=True)
         
         # Move to done state
         session["state"] = FulfillmentState.DONE
@@ -649,26 +845,63 @@ async def handle_fulfill_nominate(phone: str, text: str, session: dict):
         # Failed
         log.warning(f"[FULFILLMENT] Nomination failed for {phone}, need_id: {need_id}")
         
-        # Log NOMINATION_FAILED event
+        # Send failed message
+        failed_msg_id = await mcp_wa_send(phone, FULFILL_CONFIRM_FAILED_MSG)
+        
+        # Persistence: store failed nomination attempt
         try:
             from storage.db import get_db_session
+            from storage.session_store import update_session_state_and_tool_state
             log_event = _get_log_event()
+            
             with get_db_session() as db:
+                session_id = session.get("_db_session_id")
+                
+                from sqlalchemy import select
+                from storage.tables import serve_agent_sessions
+                stmt = select(serve_agent_sessions.c.tool_state).where(
+                    serve_agent_sessions.c.wa_phone == phone
+                )
+                db_result = db.execute(stmt).first()
+                existing_fulfillment = {}
+                if db_result and db_result[0] and isinstance(db_result[0], dict):
+                    existing_fulfillment = db_result[0].get("fulfillment", {})
+                
+                nomination_payload = {
+                    "status": "failed",
+                    "need_id": need_id,
+                    "volunteer_id": volunteer_id,
+                    "nominated_at": now_iso,
+                    "error": "nomination_failed",
+                }
+                
+                fulfillment_update = existing_fulfillment.copy()
+                fulfillment_update["nomination"] = nomination_payload
+                
+                update_session_state_and_tool_state(
+                    db=db,
+                    wa_phone=phone,
+                    state="FULFILLMENT",
+                    sub_state=FulfillmentState.WAIT_PICK,
+                    last_outbound_msg_id=failed_msg_id,
+                    tool_state_updates={"fulfillment": fulfillment_update},
+                )
+                
+                # Log NOMINATION_FAILED event
                 log_event(
                     db=db,
                     wa_phone=phone,
                     agent_name=settings.AGENT_NAME,
                     event_type="NOMINATION_FAILED",
                     event_source="fulfillment_agent",
-                    state=FulfillmentState.NOMINATE,
+                    state="FULFILLMENT",
+                    sub_state=FulfillmentState.NOMINATE,
                     status="failed",
-                    details={"need_id": need_id}
+                    details={"need_id": need_id, "volunteer_id": volunteer_id},
+                    session_id=session_id,
                 )
         except Exception as e:
-            log.warning(f"[FULFILLMENT] Failed to log NOMINATION_FAILED event: {e}")
-        
-        # Send failed message
-        await mcp_wa_send(phone, FULFILL_CONFIRM_FAILED_MSG)
+            log.warning(f"[FULFILLMENT] Failed to persist failed nomination: {e}", exc_info=True)
         
         # Go back to wait_pick state (allow retry)
         session["state"] = FulfillmentState.WAIT_PICK
@@ -685,10 +918,27 @@ async def handle_fulfill_done(phone: str, text: str, session: dict):
     Just acknowledge any further messages (journey complete).
     """
     log.info(f"[FULFILLMENT] Journey complete for {phone}")
-    # Journey is complete - just acknowledge if needed
+    # Journey is complete - move back to onboarding QA window for any final questions.
     session["ts"] = time.time()
-    from agents.onboarding.wa_loop import SESSIONS
-    SESSIONS[phone] = session
+    try:
+        from agents.onboarding.wa_loop import SESSIONS, _handle as onboarding_handle
+        # Switch agent back to onboarding and enter QA_WINDOW ("Do you have any questions for me?")
+        session["agent"] = "onboarding"
+        session["state"] = "QA_WINDOW"
+        session.setdefault("_qa_count", 0)
+        session.setdefault("_qa_topics", [])
+        session.setdefault("_qa_summary_sent", False)
+        SESSIONS[phone] = session
+        # Kick off QA_WINDOW state
+        await onboarding_handle(phone, "__kick__")
+    except Exception as e:
+        # If anything goes wrong, just persist the fulfillment session and continue.
+        from agents.onboarding.wa_loop import SESSIONS
+        log.warning(
+            f"[FULFILLMENT] Failed to transition to QA_WINDOW after done for {phone}: {e}",
+            exc_info=True,
+        )
+        SESSIONS[phone] = session
 
 
 async def handle_fulfill_exit(phone: str, session: dict):
@@ -701,9 +951,23 @@ async def handle_fulfill_exit(phone: str, session: dict):
     mcp_wa_send = _get_mcp_wa_send()
     await mcp_wa_send(phone, FULFILL_EXIT_MSG)
     
-    # Mark session as ended (or keep it open for potential return)
-    session["state"] = FulfillmentState.EXIT
+    # After exit, route back to onboarding QA window for any remaining questions.
     session["ts"] = time.time()
-    
-    from agents.onboarding.wa_loop import SESSIONS
-    SESSIONS[phone] = session
+    try:
+        from agents.onboarding.wa_loop import SESSIONS, _handle as onboarding_handle
+        session["agent"] = "onboarding"
+        session["state"] = "QA_WINDOW"
+        session.setdefault("_qa_count", 0)
+        session.setdefault("_qa_topics", [])
+        session.setdefault("_qa_summary_sent", False)
+        SESSIONS[phone] = session
+        await onboarding_handle(phone, "__kick__")
+    except Exception as e:
+        from agents.onboarding.wa_loop import SESSIONS
+        log.warning(
+            f"[FULFILLMENT] Failed to transition to QA_WINDOW after exit for {phone}: {e}",
+            exc_info=True,
+        )
+        # Fallback: just persist the fulfillment EXIT state
+        session["state"] = FulfillmentState.EXIT
+        SESSIONS[phone] = session

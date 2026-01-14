@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     SERVE_CLASS_VIDEO_URL: str = "https://example.com/serve-class-video.mp4"  # Fallback video URL
     # Local video file path for in-app playback
     SERVE_CLASS_VIDEO_PATH: str = "temp/serve_class_video.mp4"  # Local MP4 file path
+    # WhatsApp template message for first outbound (required by Meta)
+    WHATSAPP_WELCOME_TEMPLATE_NAME: str = "serve_welcome"  # Template name in Meta Business Manager
+    WHATSAPP_TEMPLATE_LANGUAGE_CODE: str = "en"  # Template language code
     # allow unrelated env vars (e.g., AGENT_NAME) without error
     model_config = SettingsConfigDict(env_file=".env",
                                       env_file_encoding="utf-8",

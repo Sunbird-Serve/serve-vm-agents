@@ -5,6 +5,7 @@ Handles the Selection Agent state machine for volunteer screening and recommenda
 """
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from .types import SelectionState, RecommendationOutcome
@@ -103,38 +104,85 @@ async def handle_selection_start(phone: str, text: str, session: dict):
     if text == "__kick__" or not session.get("_selection_started"):
         log.info(f"[SELECTION] Starting selection for {phone}")
         
-        # Log SELECTION_STARTED event
+        now_iso = datetime.now(timezone.utc).isoformat()
+        
+        # Check if intro was already sent in COMPLETE state
+        if not session.get("_selection_intro_sent"):
+            # Send video intro (fallback if not sent from onboarding)
+            profile = session.get("profile", {})
+            name = profile.get("name") or "there"
+            mcp_wa_send = _get_mcp_wa_send()
+            video_intro = get_sel_video_intro(name)
+            await mcp_wa_send(phone, video_intro)
+        else:
+            log.info(f"[SELECTION] Intro already sent in COMPLETE state, skipping")
+            mcp_wa_send = _get_mcp_wa_send()
+        
+        # Wait 10 seconds before sending video
+        log.info(f"[SELECTION] Waiting 10 seconds before sending video to {phone}")
+        import asyncio
+        await asyncio.sleep(10)
+        
+        # Send video URL and done prompt together
+        done_prompt = get_sel_video_done_prompt()
+        combined_video_msg = f"{WELCOME_VIDEO_URL}\n\n{done_prompt}"
+        video_msg_id = await mcp_wa_send(phone, combined_video_msg)
+        
+        # Persistence: Store selection start and video sent
         try:
             from storage.db import get_db_session
+            from storage.session_store import update_session_state_and_tool_state
             log_event = _get_log_event()
+            
             with get_db_session() as db:
+                session_id = session.get("_db_session_id")
+                
+                # Initialize tool_state.selection structure
+                tool_state_updates = {
+                    "selection": {
+                        "started_at": now_iso,
+                        "video": {
+                            "sent_at": now_iso
+                        }
+                    }
+                }
+                
+                update_session_state_and_tool_state(
+                    db=db,
+                    wa_phone=phone,
+                    state="SELECTION",
+                    sub_state=SelectionState.WAIT_VIDEO_DONE,
+                    last_outbound_msg_id=video_msg_id,
+                    tool_state_updates=tool_state_updates
+                )
+                
                 log_event(
                     db=db,
                     wa_phone=phone,
                     agent_name=settings.AGENT_NAME,
                     event_type="SELECTION_STARTED",
                     event_source="selection_agent",
-                    state=SelectionState.START,
-                    status="started"
+                    state="SELECTION",
+                    sub_state=SelectionState.START,
+                    status="SUCCESS",
+                    details={},
+                    session_id=session_id
+                )
+                
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="SELECTION_VIDEO_SENT",
+                    event_source="selection_agent",
+                    state="SELECTION",
+                    sub_state=SelectionState.WAIT_VIDEO_DONE,
+                    status="SUCCESS",
+                    details={},
+                    session_id=session_id
                 )
         except Exception as e:
-            log.warning(f"[SELECTION] Failed to log SELECTION_STARTED event: {e}")
-        
-        # Get volunteer name from profile
-        profile = session.get("profile", {})
-        name = profile.get("name") or "there"
-        
-        # Send video intro
-        mcp_wa_send = _get_mcp_wa_send()
-        video_intro = get_sel_video_intro(name)
-        await mcp_wa_send(phone, video_intro)
-        
-        # Send video URL
-        await mcp_wa_send(phone, WELCOME_VIDEO_URL)
-        
-        # Send done prompt
-        done_prompt = get_sel_video_done_prompt()
-        await mcp_wa_send(phone, done_prompt)
+            log.warning(f"[SELECTION] Failed to persist start: {e}", exc_info=True)
         
         # Update session
         session["_selection_started"] = True
@@ -144,6 +192,43 @@ async def handle_selection_start(phone: str, text: str, session: dict):
         # Store in SESSIONS (imported from wa_loop)
         from agents.onboarding.wa_loop import SESSIONS
         SESSIONS[phone] = session
+        
+        # Schedule 30-second timeout to auto-proceed if no response
+        async def selection_video_timeout_handler():
+            await asyncio.sleep(30.0)
+            
+            # Check if still in WAIT_VIDEO_DONE state and no response received
+            current_session = SESSIONS.get(phone)
+            if (current_session and
+                current_session.get("state") == SelectionState.WAIT_VIDEO_DONE and
+                not current_session.get("_selection_video_response_received")):
+                log.info(f"[SELECTION] 30-second timeout reached, auto-proceeding for {phone}")
+                
+                # Get volunteer name
+                profile = current_session.get("profile", {})
+                name = profile.get("name") or "there"
+                
+                mcp_wa_send = _get_mcp_wa_send()
+                
+                # Send followup
+                followup = get_sel_video_followup()
+                await mcp_wa_send(phone, followup)
+                
+                # Send about-you question
+                about_you = get_sel_about_you(name)
+                await mcp_wa_send(phone, about_you)
+                
+                # Store the about-you question as last agent prompt
+                current_session["_last_agent_prompt"] = about_you
+                
+                # Transition to knowing volunteer loop (do NOT send kickoff question)
+                current_session["state"] = SelectionState.KNOWING_VOLUNTEER_LOOP
+                current_session["_knowing_volunteer_started"] = True
+                current_session["ts"] = time.time()
+                SESSIONS[phone] = current_session
+        
+        # Create background task for timeout (non-blocking)
+        asyncio.create_task(selection_video_timeout_handler())
 
 
 async def handle_selection_wait_video_done(phone: str, text: str, session: dict):
@@ -162,8 +247,16 @@ async def handle_selection_wait_video_done(phone: str, text: str, session: dict)
     skip_keywords = ["skip", "cannot", "can't", "cant", "not now", "later"]
     
     if any(keyword in text_lower for keyword in done_keywords) or any(keyword in text_lower for keyword in skip_keywords):
+        # Mark response as received to prevent timeout
+        session["_selection_video_response_received"] = True
+        session["ts"] = time.time()
+        from agents.onboarding.wa_loop import SESSIONS
+        SESSIONS[phone] = session
+        
         # Proceed to followup and about-you question
         log.info(f"[SELECTION] Video acknowledged by {phone}, proceeding")
+        
+        now_iso = datetime.now(timezone.utc).isoformat()
         
         # Get volunteer name
         profile = session.get("profile", {})
@@ -173,14 +266,85 @@ async def handle_selection_wait_video_done(phone: str, text: str, session: dict)
         
         # Send followup
         followup = get_sel_video_followup()
-        await mcp_wa_send(phone, followup)
+        followup_msg_id = await mcp_wa_send(phone, followup)
         
         # Send about-you question
         about_you = get_sel_about_you(name)
-        await mcp_wa_send(phone, about_you)
+        about_you_msg_id = await mcp_wa_send(phone, about_you)
         
         # Store the about-you question as last agent prompt
         session["_last_agent_prompt"] = about_you
+        
+        # Persistence: Store video acknowledgement and transition to knowing volunteer
+        try:
+            from storage.db import get_db_session
+            from storage.session_store import update_session_state_and_tool_state
+            log_event = _get_log_event()
+            
+            with get_db_session() as db:
+                session_id = session.get("_db_session_id")
+                
+                # Read existing selection from tool_state
+                from sqlalchemy import select
+                from storage.tables import serve_agent_sessions
+                stmt = select(serve_agent_sessions.c.tool_state).where(
+                    serve_agent_sessions.c.wa_phone == phone
+                )
+                result = db.execute(stmt).first()
+                existing_selection = {}
+                if result and result[0] and isinstance(result[0], dict):
+                    existing_selection = result[0].get("selection", {})
+                
+                # Determine ack type
+                ack_type = "done" if any(kw in text_lower for kw in done_keywords) else "skip"
+                
+                selection_update = existing_selection.copy()
+                if "video" not in selection_update:
+                    selection_update["video"] = {}
+                selection_update["video"].update({
+                    "acknowledged_at": now_iso,
+                    "ack_response": ack_type
+                })
+                if "knowing_volunteer" not in selection_update:
+                    selection_update["knowing_volunteer"] = {}
+                selection_update["knowing_volunteer"]["started_at"] = now_iso
+                
+                update_session_state_and_tool_state(
+                    db=db,
+                    wa_phone=phone,
+                    state="SELECTION",
+                    sub_state=SelectionState.KNOWING_VOLUNTEER_LOOP,
+                    last_outbound_msg_id=about_you_msg_id or followup_msg_id,
+                    tool_state_updates={"selection": selection_update}
+                )
+                
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="SELECTION_VIDEO_ACKNOWLEDGED",
+                    event_source="user",
+                    state="SELECTION",
+                    sub_state=SelectionState.WAIT_VIDEO_DONE,
+                    status="SUCCESS",
+                    details={"ack_type": ack_type, "raw_text": text},
+                    session_id=session_id
+                )
+                
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="SELECTION_KNOWING_VOLUNTEER_STARTED",
+                    event_source="selection_agent",
+                    state="SELECTION",
+                    sub_state=SelectionState.KNOWING_VOLUNTEER_LOOP,
+                    status="SUCCESS",
+                    details={},
+                    session_id=session_id
+                )
+        except Exception as e:
+            log.warning(f"[SELECTION] Failed to persist video acknowledgement: {e}", exc_info=True)
         
         # Transition to knowing volunteer loop (do NOT send kickoff question)
         session["state"] = SelectionState.KNOWING_VOLUNTEER_LOOP
@@ -335,9 +499,10 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
     # Handle decision
     if decision == KnowingVolunteerResult.CONTINUE.value:
         # Continue: send assistant text and remain in loop
+        question_msg_id = None
         if assistant_text:
             mcp_wa_send = _get_mcp_wa_send()
-            await mcp_wa_send(phone, assistant_text)
+            question_msg_id = await mcp_wa_send(phone, assistant_text)
             session["_last_agent_prompt"] = assistant_text
             
             # Add to history
@@ -347,6 +512,52 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
             except:
                 pass
         
+        # Persistence: Update profile signals after each step
+        try:
+            from storage.db import get_db_session
+            from storage.session_store import update_session_state_and_tool_state
+            
+            with get_db_session() as db:
+                # Read existing selection from tool_state
+                from sqlalchemy import select
+                from storage.tables import serve_agent_sessions
+                stmt = select(serve_agent_sessions.c.tool_state).where(
+                    serve_agent_sessions.c.wa_phone == phone
+                )
+                result = db.execute(stmt).first()
+                existing_selection = {}
+                if result and result[0] and isinstance(result[0], dict):
+                    existing_selection = result[0].get("selection", {})
+                
+                # Get updated profile and question index
+                current_profile = session.get("tool_state", {}).get("selection", {}).get("profile", {})
+                question_index = session.get("tool_state", {}).get("selection", {}).get("question_index", 0)
+                discussed_fields = session.get("tool_state", {}).get("selection", {}).get("discussed_fields", set())
+                
+                # Convert set to list for JSON serialization
+                if isinstance(discussed_fields, set):
+                    discussed_fields = list(discussed_fields)
+                
+                selection_update = existing_selection.copy()
+                if "knowing_volunteer" not in selection_update:
+                    selection_update["knowing_volunteer"] = {}
+                selection_update["knowing_volunteer"].update({
+                    "questions_asked": question_index,
+                    "profile": current_profile.copy(),
+                    "discussed_fields": discussed_fields
+                })
+                
+                update_session_state_and_tool_state(
+                    db=db,
+                    wa_phone=phone,
+                    state="SELECTION",
+                    sub_state=SelectionState.KNOWING_VOLUNTEER_LOOP,
+                    last_outbound_msg_id=question_msg_id,
+                    tool_state_updates={"selection": selection_update}
+                )
+        except Exception as e:
+            log.warning(f"[SELECTION] Failed to persist knowing volunteer step: {e}", exc_info=True)
+        
         session["ts"] = time.time()
         from agents.onboarding.wa_loop import SESSIONS
         SESSIONS[phone] = session
@@ -355,11 +566,14 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
         # Complete: check if we should send final response, then transition to evaluation
         log.info(f"[SELECTION] Knowing volunteer complete for {phone}, decision: {decision}")
         
+        now_iso = datetime.now(timezone.utc).isoformat()
+        
         # Only send assistant_text if it doesn't contain a question (to avoid orphaned questions)
         # The "thanks" will be included in the recommended message instead
+        final_msg_id = None
         if assistant_text and "?" not in assistant_text:
             mcp_wa_send = _get_mcp_wa_send()
-            await mcp_wa_send(phone, assistant_text)
+            final_msg_id = await mcp_wa_send(phone, assistant_text)
             session["_last_agent_prompt"] = assistant_text
             
             # Add to history
@@ -370,6 +584,72 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
                 pass
         elif assistant_text and "?" in assistant_text:
             log.info(f"[SELECTION] Skipping question in assistant_text since we're completing: {assistant_text[:50]}...")
+        
+        # Persistence: Store knowing volunteer completion
+        try:
+            from storage.db import get_db_session
+            from storage.session_store import update_session_state_and_tool_state
+            log_event = _get_log_event()
+            
+            with get_db_session() as db:
+                session_id = session.get("_db_session_id")
+                
+                # Read existing selection from tool_state
+                from sqlalchemy import select
+                from storage.tables import serve_agent_sessions
+                stmt = select(serve_agent_sessions.c.tool_state).where(
+                    serve_agent_sessions.c.wa_phone == phone
+                )
+                result = db.execute(stmt).first()
+                existing_selection = {}
+                if result and result[0] and isinstance(result[0], dict):
+                    existing_selection = result[0].get("selection", {})
+                
+                # Get current profile and question index
+                current_profile = session.get("tool_state", {}).get("selection", {}).get("profile", {})
+                question_index = session.get("tool_state", {}).get("selection", {}).get("question_index", 0)
+                discussed_fields = session.get("tool_state", {}).get("selection", {}).get("discussed_fields", set())
+                
+                # Convert set to list for JSON serialization
+                if isinstance(discussed_fields, set):
+                    discussed_fields = list(discussed_fields)
+                
+                selection_update = existing_selection.copy()
+                if "knowing_volunteer" not in selection_update:
+                    selection_update["knowing_volunteer"] = {}
+                selection_update["knowing_volunteer"].update({
+                    "completed_at": now_iso,
+                    "questions_asked": question_index,
+                    "profile": current_profile.copy(),
+                    "discussed_fields": discussed_fields
+                })
+                
+                update_session_state_and_tool_state(
+                    db=db,
+                    wa_phone=phone,
+                    state="SELECTION",
+                    sub_state=SelectionState.EVALUATE,
+                    last_outbound_msg_id=final_msg_id,
+                    tool_state_updates={"selection": selection_update}
+                )
+                
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="SELECTION_KNOWING_VOLUNTEER_COMPLETED",
+                    event_source="selection_agent",
+                    state="SELECTION",
+                    sub_state=SelectionState.KNOWING_VOLUNTEER_LOOP,
+                    status="SUCCESS",
+                    details={
+                        "questions_asked": question_index,
+                        "signals_collected": len([k for k, v in current_profile.items() if v is not None])
+                    },
+                    session_id=session_id
+                )
+        except Exception as e:
+            log.warning(f"[SELECTION] Failed to persist knowing volunteer completion: {e}", exc_info=True)
         
         session["state"] = SelectionState.EVALUATE
         session["ts"] = time.time()
@@ -455,36 +735,76 @@ async def handle_selection_evaluate(phone: str, session: dict):
         session["tool_state"] = {}
     if "selection" not in session["tool_state"]:
         session["tool_state"]["selection"] = {}
+    
+    now_iso = datetime.now(timezone.utc).isoformat()
     session["tool_state"]["selection"]["outcome"] = {
         "recommended": recommended,
         "hold_for_human": hold_for_human,
         "reason_codes": reason_codes,
         "mode": "lite",
-        "signals": profile.copy()
+        "signals": profile.copy(),
+        "evaluated_at": now_iso
     }
     
-    # Log SELECTION_EVALUATED event
+    # Persistence: Store evaluation outcome
     try:
         from storage.db import get_db_session
+        from storage.session_store import update_session_state_and_tool_state
         log_event = _get_log_event()
+        
         with get_db_session() as db:
+            session_id = session.get("_db_session_id")
+            
+            # Read existing selection from tool_state
+            from sqlalchemy import select
+            from storage.tables import serve_agent_sessions
+            stmt = select(serve_agent_sessions.c.tool_state).where(
+                serve_agent_sessions.c.wa_phone == phone
+            )
+            result = db.execute(stmt).first()
+            existing_selection = {}
+            if result and result[0] and isinstance(result[0], dict):
+                existing_selection = result[0].get("selection", {})
+            
+            selection_update = existing_selection.copy()
+            selection_update["outcome"] = {
+                "recommended": recommended,
+                "hold_for_human": hold_for_human,
+                "reason_codes": reason_codes,
+                "mode": "lite",
+                "signals": profile.copy(),
+                "evaluated_at": now_iso
+            }
+            
+            next_state = SelectionState.RECOMMENDED if recommended else SelectionState.NOT_RECOMMENDED
+            
+            update_session_state_and_tool_state(
+                db=db,
+                wa_phone=phone,
+                state="SELECTION",
+                sub_state=next_state,
+                tool_state_updates={"selection": selection_update}
+            )
+            
             log_event(
                 db=db,
                 wa_phone=phone,
                 agent_name=settings.AGENT_NAME,
                 event_type="SELECTION_EVALUATED",
                 event_source="selection_agent",
-                state=SelectionState.EVALUATE,
-                status="completed",
+                state="SELECTION",
+                sub_state=SelectionState.EVALUATE,
+                status="SUCCESS",
                 details={
                     "recommended": recommended,
                     "hold_for_human": hold_for_human,
                     "reason_codes": reason_codes,
                     "signals_present_count": signals_present_count
-                }
+                },
+                session_id=session_id
             )
     except Exception as e:
-        log.warning(f"[SELECTION] Failed to log SELECTION_COMPLETED event: {e}")
+        log.warning(f"[SELECTION] Failed to persist evaluation: {e}", exc_info=True)
     
     # Move to appropriate state
     if recommended:
@@ -521,7 +841,39 @@ If you'd like to continue later, you can message me here anytime.
 Thank you for your interest in SERVE! 💛"""
     
     mcp_wa_send = _get_mcp_wa_send()
-    await mcp_wa_send(phone, exit_msg)
+    exit_msg_id = await mcp_wa_send(phone, exit_msg)
+    
+    # Persistence: Log stop event
+    try:
+        from storage.db import get_db_session
+        from storage.session_store import update_session_state_and_tool_state
+        log_event = _get_log_event()
+        
+        with get_db_session() as db:
+            session_id = session.get("_db_session_id")
+            
+            update_session_state_and_tool_state(
+                db=db,
+                wa_phone=phone,
+                state="SELECTION",
+                sub_state=SelectionState.STOP,
+                last_outbound_msg_id=exit_msg_id
+            )
+            
+            log_event(
+                db=db,
+                wa_phone=phone,
+                agent_name=settings.AGENT_NAME,
+                event_type="SELECTION_STOPPED",
+                event_source="user",
+                state="SELECTION",
+                sub_state=SelectionState.STOP,
+                status="SUCCESS",
+                details={},
+                session_id=session_id
+            )
+    except Exception as e:
+        log.warning(f"[SELECTION] Failed to persist stop: {e}", exc_info=True)
     
     # Mark session as ended
     session["state"] = "CLOSE"
@@ -545,7 +897,39 @@ async def handle_selection_recommended(phone: str, session: dict):
     # Send recommended message with thanks
     mcp_wa_send = _get_mcp_wa_send()
     recommended_msg = get_sel_recommended_msg(name)
-    await mcp_wa_send(phone, recommended_msg)
+    recommended_msg_id = await mcp_wa_send(phone, recommended_msg)
+    
+    # Persistence: Log recommended event
+    try:
+        from storage.db import get_db_session
+        from storage.session_store import update_session_state_and_tool_state
+        log_event = _get_log_event()
+        
+        with get_db_session() as db:
+            session_id = session.get("_db_session_id")
+            
+            update_session_state_and_tool_state(
+                db=db,
+                wa_phone=phone,
+                state="SELECTION",
+                sub_state=SelectionState.RECOMMENDED,
+                last_outbound_msg_id=recommended_msg_id
+            )
+            
+            log_event(
+                db=db,
+                wa_phone=phone,
+                agent_name=settings.AGENT_NAME,
+                event_type="SELECTION_RECOMMENDED",
+                event_source="selection_agent",
+                state="SELECTION",
+                sub_state=SelectionState.RECOMMENDED,
+                status="SUCCESS",
+                details={},
+                session_id=session_id
+            )
+    except Exception as e:
+        log.warning(f"[SELECTION] Failed to persist recommended: {e}", exc_info=True)
     
     # Transition to Fulfillment agent
     session["state"] = "FULFILL_INTRO"  # Fulfillment agent entry state
@@ -577,7 +961,39 @@ async def handle_selection_not_recommended(phone: str, session: dict):
     )
     
     mcp_wa_send = _get_mcp_wa_send()
-    await mcp_wa_send(phone, hold_msg)
+    hold_msg_id = await mcp_wa_send(phone, hold_msg)
+    
+    # Persistence: Log not recommended event
+    try:
+        from storage.db import get_db_session
+        from storage.session_store import update_session_state_and_tool_state
+        log_event = _get_log_event()
+        
+        with get_db_session() as db:
+            session_id = session.get("_db_session_id")
+            
+            update_session_state_and_tool_state(
+                db=db,
+                wa_phone=phone,
+                state="SELECTION",
+                sub_state=SelectionState.NOT_RECOMMENDED,
+                last_outbound_msg_id=hold_msg_id
+            )
+            
+            log_event(
+                db=db,
+                wa_phone=phone,
+                agent_name=settings.AGENT_NAME,
+                event_type="SELECTION_NOT_RECOMMENDED",
+                event_source="selection_agent",
+                state="SELECTION",
+                sub_state=SelectionState.NOT_RECOMMENDED,
+                status="SUCCESS",
+                details={},
+                session_id=session_id
+            )
+    except Exception as e:
+        log.warning(f"[SELECTION] Failed to persist not recommended: {e}", exc_info=True)
     
     # Mark session as ended
     session["state"] = "CLOSE"

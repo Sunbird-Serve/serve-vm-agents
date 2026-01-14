@@ -14,7 +14,8 @@ from ..messages import (
     IDENTITY_NUDGE, IDENTITY_BOUNDARY, IDENTITY_EXIT, format_message,
     IDENTITY_CONFIRM_CONTACT, IDENTITY_EMAIL_CORRECTION, IDENTITY_CONTACT_RETRY,
     IDENTITY_NAME_RECHECK, IDENTITY_REGISTRATION_START, IDENTITY_REGISTRATION_EXISTING,
-    IDENTITY_REGISTRATION_CREATED, IDENTITY_REGISTRATION_FAILED
+    IDENTITY_REGISTRATION_CREATED, IDENTITY_REGISTRATION_FAILED,
+    IDENTITY_REGISTRATION_WAIT_REASSURANCE
 )
 from ..validators import is_yes_response, is_no_response
 from ..config import settings
@@ -962,6 +963,21 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
     
     log.info(f"[IDENTITY] DEBUG: Handler called - text='{text[:50]}...', name_collected={sess.get('_identity_name_collected')}, contact_collected={sess.get('_identity_contact_collected')}, contact_asked={sess.get('_identity_contact_asked')}")
     
+    # Check if registration is in progress - handle user input during wait
+    if sess.get("_registration_in_progress"):
+        if text != "__kick__":
+            # User sent a message during registration - send reassurance once, then ignore
+            if not sess.get("_registration_reassurance_sent"):
+                log.info(f"[IDENTITY] User sent message during registration, sending reassurance to {phone}")
+                await mcp_wa_send(phone, IDENTITY_REGISTRATION_WAIT_REASSURANCE)
+                _add_to_history(phone, bot_msg=IDENTITY_REGISTRATION_WAIT_REASSURANCE)
+                sess["_registration_reassurance_sent"] = True
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+            else:
+                log.info(f"[IDENTITY] Ignoring user message during registration: {text[:30]}...")
+            return  # Don't process further - wait for registration to complete
+    
     # Step A: Ask for name if not collected
     if not sess.get("_identity_name_collected"):
         if text == "__kick__" or not sess.get("_identity_name_asked"):
@@ -1158,9 +1174,29 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
                 # Run registration flow
                 log.info(f"[IDENTITY] Starting registration flow for {mask_phone(phone)}")
                 try:
+                    # Set registration in progress flag
+                    sess["_registration_in_progress"] = True
+                    sess["_registration_reassurance_sent"] = False
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+                    
                     # Send "creating profile" message
                     await mcp_wa_send(phone, IDENTITY_REGISTRATION_START)
                     _add_to_history(phone, bot_msg=IDENTITY_REGISTRATION_START)
+                    
+                    # Schedule timeout handler if registration takes too long (>14 seconds)
+                    async def registration_timeout_handler():
+                        await asyncio.sleep(14.0)
+                        current_sess = SESSIONS.get(phone)
+                        if current_sess and current_sess.get("_registration_in_progress"):
+                            log.info(f"[IDENTITY] Registration taking longer than expected, sending reassurance to {phone}")
+                            try:
+                                await mcp_wa_send(phone, "This is taking slightly longer than usual, but I'm still on it — thanks for your patience!")
+                                _add_to_history(phone, bot_msg="This is taking slightly longer than usual, but I'm still on it — thanks for your patience!")
+                            except Exception as e:
+                                log.warning(f"[IDENTITY] Failed to send timeout reassurance: {e}")
+                    
+                    asyncio.create_task(registration_timeout_handler())
                     
                     # Run registration orchestration
                     reg_result = await run_registration_flow(
@@ -1169,6 +1205,10 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
                         email=extracted_email,
                         sess=sess
                     )
+                    
+                    # Clear registration in progress flag
+                    sess["_registration_in_progress"] = False
+                    sess.pop("_registration_reassurance_sent", None)
                     
                     # Persist registration data to tool_state
                     try:
@@ -1219,6 +1259,9 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
                     
                 except Exception as e:
                     log.error(f"[IDENTITY] Registration flow failed: {e}", exc_info=True)
+                    # Clear registration in progress flag
+                    sess["_registration_in_progress"] = False
+                    sess.pop("_registration_reassurance_sent", None)
                     # Send failure message but continue flow
                     await mcp_wa_send(phone, IDENTITY_REGISTRATION_FAILED)
                     _add_to_history(phone, bot_msg=IDENTITY_REGISTRATION_FAILED)

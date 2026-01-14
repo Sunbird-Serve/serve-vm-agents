@@ -49,23 +49,62 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
     
     # Early return if preferences have already been confirmed (idempotency)
     if sess.get("_prefs_confirmed"):
-        log.warning(f"[PREFS] DUPLICATE CALL DETECTED: Preferences already confirmed for {phone}, "
-                   f"state={sess.get('state')}, skipping handler")
-        # Just ensure state is correct and transition if needed
-        if sess.get("state") != "QA_WINDOW":
-            sess["state"] = "QA_WINDOW"
-            sess["_qa_count"] = 0
-            sess["_qa_topics"] = []
-            sess["_qa_summary_sent"] = False
+        log.warning(
+            f"[PREFS] DUPLICATE CALL DETECTED: Preferences already confirmed for {phone}, "
+            f"state={sess.get('state')}, skipping handler"
+        )
+        # Ensure we are not stuck in PREFERENCES; move to COMPLETE if not already there.
+        if sess.get("state") != "COMPLETE":
+            from ..wa_loop import _handle as onboarding_handle, SESSIONS
+            sess["state"] = "COMPLETE"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
-            await asyncio.sleep(0.5)
-            await _handle(phone, "__kick__")
+            # Kick COMPLETE handler to send final message / trigger downstream flow.
+            await onboarding_handle(phone, "__kick__")
         return
     
     if text == "__kick__" or not sess.get("_prefs_prompted"):
-        await mcp_wa_send(phone, PREFS_INTRO_COLLAB)
+        message_id = await mcp_wa_send(phone, PREFS_INTRO_COLLAB)
         _add_to_history(phone, bot_msg=PREFS_INTRO_COLLAB)
+        
+        # Persistence: Update state and log event
+        try:
+            from datetime import datetime, timezone
+            from storage.db import get_db_session
+            from storage.session_store import update_session_state_and_tool_state
+            from storage.event_logger import log_event
+            from ..config import settings
+            
+            now_iso = datetime.now(timezone.utc).isoformat()
+            with get_db_session() as db:
+                session_id = sess.get("_db_session_id")
+                update_session_state_and_tool_state(
+                    db=db,
+                    wa_phone=phone,
+                    state="ONBOARDING",
+                    sub_state="PREFERENCES",
+                    last_outbound_msg_id=message_id,
+                    tool_state_updates={
+                        "preferences": {
+                            "prompted_at": now_iso
+                        }
+                    }
+                )
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="PREFERENCES_PROMPT_SENT",
+                    event_source="agent",
+                    state="ONBOARDING",
+                    sub_state="PREFERENCES",
+                    status="SUCCESS",
+                    details={},
+                    session_id=session_id
+                )
+        except Exception as e:
+            log.warning(f"[PREFS] Failed to persist prompt: {e}", exc_info=True)
+        
         sess["_prefs_prompted"] = True
         sess.setdefault("_prefs_days", [])
         sess.setdefault("_prefs_time_band", None)
@@ -257,17 +296,16 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
 
     # Double-check idempotency right before sending messages (defense in depth)
     if sess.get("_prefs_confirmed"):
-        log.warning(f"[PREFS] Preferences already confirmed for {phone} (duplicate call detected), skipping messages")
-        # Just ensure state is correct and transition
-        if sess.get("state") != "QA_WINDOW":
-            sess["state"] = "QA_WINDOW"
-            sess["_qa_count"] = 0
-            sess["_qa_topics"] = []
-            sess["_qa_summary_sent"] = False
+        log.warning(
+            f"[PREFS] Preferences already confirmed for {phone} (duplicate call detected), skipping messages"
+        )
+        # Preferences already confirmed; ensure we transition to COMPLETE if not already there.
+        if sess.get("state") != "COMPLETE":
+            from ..wa_loop import _handle as onboarding_handle, SESSIONS
+            sess["state"] = "COMPLETE"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
-            await asyncio.sleep(0.5)
-            await _handle(phone, "__kick__")
+            await onboarding_handle(phone, "__kick__")
         return
 
     # Mark as confirmed IMMEDIATELY before any message sending to prevent race conditions
@@ -300,34 +338,83 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
         days_label=days_str,
         band_label=band_str,
     )
+    summary_msg_id = None
     if summary_msg:
         if not sess.get("_prefs_summary_sent"):
             log.info(f"[PREFS] Sending summary message for {phone}")
             sess["_prefs_summary_sent"] = True
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
-            await mcp_wa_send(phone, summary_msg)
+            summary_msg_id = await mcp_wa_send(phone, summary_msg)
             _add_to_history(phone, bot_msg=summary_msg)
             log.info(f"[PREFS] Summary message sent for {phone}")
         else:
             log.warning(f"[PREFS] DUPLICATE: Summary already sent for {phone}, skipping duplicate")
     
+    # Persistence: Store preferences data and log confirmation event
+    try:
+        from datetime import datetime, timezone
+        from storage.db import get_db_session
+        from storage.session_store import update_session_state_and_tool_state
+        from storage.event_logger import log_event
+        from ..config import settings
+        
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with get_db_session() as db:
+            session_id = sess.get("_db_session_id")
+            # Read existing preferences from tool_state
+            from sqlalchemy import select
+            from storage.tables import serve_agent_sessions
+            stmt = select(serve_agent_sessions.c.tool_state).where(
+                serve_agent_sessions.c.wa_phone == phone
+            )
+            result = db.execute(stmt).first()
+            existing_prefs = {}
+            if result and result[0] and isinstance(result[0], dict):
+                existing_prefs = result[0].get("preferences", {})
+            
+            preferences_update = existing_prefs.copy()
+            preferences_update.update({
+                "days": days,
+                "time_band": time_band,
+                "confirmed_at": now_iso
+            })
+            
+            update_session_state_and_tool_state(
+                db=db,
+                wa_phone=phone,
+                state="ONBOARDING",
+                sub_state="COMPLETE",
+                last_outbound_msg_id=summary_msg_id,
+                tool_state_updates={"preferences": preferences_update}
+            )
+            log_event(
+                db=db,
+                wa_phone=phone,
+                agent_name=settings.AGENT_NAME,
+                event_type="PREFERENCES_CONFIRMED",
+                event_source="user",
+                state="ONBOARDING",
+                sub_state="PREFERENCES",
+                status="SUCCESS",
+                details={"days": days, "time_band": time_band},
+                session_id=session_id
+            )
+    except Exception as e:
+        log.warning(f"[PREFS] Failed to persist preferences: {e}", exc_info=True)
+    
     sess["_prefs_last_prompt"] = None
     sess["_prefs_last_prompt_text"] = None
     sess.pop("_prefs_evening_attempts", None)
 
-    # Transition to QA_WINDOW state
-    log.info(f"[PREFS] Transitioning to QA_WINDOW for {phone}")
-    sess["state"] = "QA_WINDOW"
-    sess["_qa_count"] = 0
-    sess["_qa_topics"] = []
-    sess["_qa_summary_sent"] = False
+    # Previously, we transitioned to QA_WINDOW ("Do you have any questions for me?") immediately
+    # after preferences. That Q&A window is now moved to run after fulfillment instead.
+    # Here, we now transition to COMPLETE so downstream flow can continue.
+    log.info(f"[PREFS] Preferences flow completed for {phone}, transitioning to COMPLETE")
+    from ..wa_loop import _handle as onboarding_handle, SESSIONS
+    sess["state"] = "COMPLETE"
     sess["ts"] = time.time()
     SESSIONS[phone] = sess
-    log.info(f"[PREFS] State transitioned to QA_WINDOW and persisted for {phone}")
-
-    await asyncio.sleep(0.5)
-    log.info(f"[PREFS] Calling _handle(phone, '__kick__') for {phone} to trigger QA_WINDOW")
-    await _handle(phone, "__kick__")
-    log.info(f"[PREFS] Handler completed for {phone}")
+    # Kick COMPLETE handler to finalize onboarding / trigger downstream processing.
+    await onboarding_handle(phone, "__kick__")
     return

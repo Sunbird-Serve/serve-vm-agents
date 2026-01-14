@@ -420,8 +420,48 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
     # Initial prompt - single compact message with interactive buttons
     if text == "__kick__" or not sess.get("_eligibility_prompted"):
         log.info(f"[ELIGIBILITY] Sending single eligibility prompt with buttons to {phone}")
-        await mcp_wa_send(phone, ELIGIBILITY_PROMPT, buttons=ELIGIBILITY_BUTTONS)
+        message_id = await mcp_wa_send(phone, ELIGIBILITY_PROMPT, buttons=ELIGIBILITY_BUTTONS)
         _add_to_history(phone, bot_msg=ELIGIBILITY_PROMPT)
+        
+        # Persistence: Update state and log event
+        try:
+            from datetime import datetime, timezone
+            from storage.db import get_db_session
+            from storage.session_store import update_session_state_and_tool_state
+            from storage.event_logger import log_event
+            from ..config import settings
+            
+            now_iso = datetime.now(timezone.utc).isoformat()
+            with get_db_session() as db:
+                session_id = sess.get("_db_session_id")
+                update_session_state_and_tool_state(
+                    db=db,
+                    wa_phone=phone,
+                    state="ONBOARDING",
+                    sub_state="ELIGIBILITY",
+                    last_outbound_msg_id=message_id,
+                    tool_state_updates={
+                        "eligibility": {
+                            "prompted_at": now_iso,
+                            "mode": "ALIGN"
+                        }
+                    }
+                )
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="ELIGIBILITY_PROMPT_SENT",
+                    event_source="agent",
+                    state="ONBOARDING",
+                    sub_state="ELIGIBILITY",
+                    status="SUCCESS",
+                    details={"buttons": ELIGIBILITY_BUTTONS},
+                    session_id=session_id
+                )
+        except Exception as e:
+            log.warning(f"[ELIGIBILITY] Failed to persist prompt: {e}", exc_info=True)
+        
         sess["_eligibility_prompted"] = True
         sess["_eligibility_mode"] = "ALIGN"  # Track current mode
         sess["_eligibility_clarification_sent"] = False
@@ -442,6 +482,61 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
         if button_click == "YES_WORKS":
             # User confirmed all requirements - proceed to IDENTITY
             log.info(f"[ELIGIBILITY] User confirmed all requirements, proceeding to IDENTITY")
+            
+            # Persistence: Store eligibility response
+            try:
+                from datetime import datetime, timezone
+                from storage.db import get_db_session
+                from storage.session_store import update_session_state_and_tool_state
+                from storage.event_logger import log_event
+                from ..config import settings
+                
+                now_iso = datetime.now(timezone.utc).isoformat()
+                with get_db_session() as db:
+                    session_id = sess.get("_db_session_id")
+                    # Read existing eligibility from tool_state
+                    from sqlalchemy import select
+                    from storage.tables import serve_agent_sessions
+                    stmt = select(serve_agent_sessions.c.tool_state).where(
+                        serve_agent_sessions.c.wa_phone == phone
+                    )
+                    result = db.execute(stmt).first()
+                    existing_eligibility = {}
+                    if result and result[0] and isinstance(result[0], dict):
+                        existing_eligibility = result[0].get("eligibility", {})
+                    
+                    eligibility_update = existing_eligibility.copy()
+                    eligibility_update.update({
+                        "response": "yes",
+                        "passed": True,
+                        "q1_commitment": True,
+                        "q2_age": True,
+                        "q3_device": True,
+                        "responded_at": now_iso
+                    })
+                    
+                    update_session_state_and_tool_state(
+                        db=db,
+                        wa_phone=phone,
+                        state="ONBOARDING",
+                        sub_state="IDENTITY",
+                        tool_state_updates={"eligibility": eligibility_update}
+                    )
+                    log_event(
+                        db=db,
+                        wa_phone=phone,
+                        agent_name=settings.AGENT_NAME,
+                        event_type="ELIGIBILITY_RESPONSE",
+                        event_source="user",
+                        state="ONBOARDING",
+                        sub_state="ELIGIBILITY",
+                        status="SUCCESS",
+                        details={"response": "yes", "passed": True, "raw_text": text},
+                        session_id=session_id
+                    )
+            except Exception as e:
+                log.warning(f"[ELIGIBILITY] Failed to persist response: {e}", exc_info=True)
+            
             profile.setdefault("eligibility", {})["passed"] = True
             sess["profile"] = profile
             sess["state"] = "IDENTITY"
@@ -537,31 +632,73 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
                 log.info(f"[ELIGIBILITY] Requirement {eligibility_mode} not met, exiting")
                 await mcp_wa_send(phone, ELIGIBILITY_EXIT)
                 _add_to_history(phone, bot_msg=ELIGIBILITY_EXIT)
-                sess["state"] = "REJECTED"
-                sess["_eligibility_mode"] = None
-                sess["_eligibility_clarification_sent"] = False
-                sess["_eligibility_missing_req"] = None
-                sess["_eligibility_clarification_step"] = None
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
                 
-                # Persistence: Finalize with REJECTED status
+                # Persistence: Store rejection response
                 try:
+                    from datetime import datetime, timezone
                     from storage.db import get_db_session
-                    from storage.session_store import finalize_onboarding
+                    from storage.session_store import update_session_state_and_tool_state, finalize_onboarding
                     from storage.event_logger import log_event
                     from agents.onboarding.config import settings
                     
+                    now_iso = datetime.now(timezone.utc).isoformat()
                     with get_db_session() as db:
+                        session_id = sess.get("_db_session_id")
+                        # Read existing eligibility from tool_state
+                        from sqlalchemy import select
+                        from storage.tables import serve_agent_sessions
+                        stmt = select(serve_agent_sessions.c.tool_state).where(
+                            serve_agent_sessions.c.wa_phone == phone
+                        )
+                        result = db.execute(stmt).first()
+                        existing_eligibility = {}
+                        if result and result[0] and isinstance(result[0], dict):
+                            existing_eligibility = result[0].get("eligibility", {})
+                        
+                        # Map eligibility_mode to requirement
+                        req_map = {
+                            "ISSUE_AGE": "age",
+                            "ISSUE_DEVICE": "device",
+                            "ISSUE_TIME": "commitment",
+                            "ISSUE_UNPAID": "unpaid"
+                        }
+                        failed_req = req_map.get(eligibility_mode, "unknown")
+                        
+                        eligibility_update = existing_eligibility.copy()
+                        eligibility_update.update({
+                            "response": "no",
+                            "passed": False,
+                            "rejection_reason": failed_req,
+                            "responded_at": now_iso
+                        })
+                        
+                        update_session_state_and_tool_state(
+                            db=db,
+                            wa_phone=phone,
+                            state="REJECTED",
+                            tool_state_updates={"eligibility": eligibility_update}
+                        )
+                        log_event(
+                            db=db,
+                            wa_phone=phone,
+                            agent_name=settings.AGENT_NAME,
+                            event_type="ELIGIBILITY_RESPONSE",
+                            event_source="user",
+                            state="ONBOARDING",
+                            sub_state="ELIGIBILITY",
+                            status="SUCCESS",
+                            details={"response": "no", "passed": False, "failed_requirement": failed_req, "raw_text": text},
+                            session_id=session_id
+                        )
+                        
                         finalize_onboarding(
                             db,
                             wa_phone=phone,
                             eligibility_status="REJECTED",
                             available_days=None,
                             available_time_bands=None,
-                            end_reason=f"eligibility_failed_{eligibility_mode}"
+                            end_reason=f"eligibility_failed_{failed_req}"
                         )
-                        session_id = sess.get("_db_session_id")
                         log_event(
                             db=db,
                             wa_phone=phone,
@@ -570,13 +707,20 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
                             event_source="onboarding_agent",
                             state="REJECTED",
                             status="rejected",
-                            details={"reason": f"eligibility_failed_{eligibility_mode}"},
+                            details={"reason": f"eligibility_failed_{failed_req}"},
                             session_id=session_id
                         )
                         log.info(f"[PERSISTENCE] Finalized rejected session for {phone}")
                 except Exception as e:
                     log.warning(f"[PERSISTENCE] Failed to finalize rejected session for {phone}: {e}", exc_info=True)
                 
+                sess["state"] = "REJECTED"
+                sess["_eligibility_mode"] = None
+                sess["_eligibility_clarification_sent"] = False
+                sess["_eligibility_missing_req"] = None
+                sess["_eligibility_clarification_step"] = None
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
                 return
         
         # Handle ISSUE_OTHER: user typed free text about their issue
@@ -747,31 +891,73 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
             log.info(f"[ELIGIBILITY] Requirement {eligibility_mode} not met via typed response, exiting")
             await mcp_wa_send(phone, ELIGIBILITY_EXIT)
             _add_to_history(phone, bot_msg=ELIGIBILITY_EXIT)
-            sess["state"] = "REJECTED"
-            sess["_eligibility_mode"] = None
-            sess["_eligibility_clarification_sent"] = False
-            sess["_eligibility_missing_req"] = None
-            sess["_eligibility_clarification_step"] = None
-            sess["ts"] = time.time()
-            SESSIONS[phone] = sess
             
-            # Persistence: Finalize with REJECTED status
+            # Persistence: Store rejection response
             try:
+                from datetime import datetime, timezone
                 from storage.db import get_db_session
-                from storage.session_store import finalize_onboarding
+                from storage.session_store import update_session_state_and_tool_state, finalize_onboarding
                 from storage.event_logger import log_event
                 from agents.onboarding.config import settings
                 
+                now_iso = datetime.now(timezone.utc).isoformat()
                 with get_db_session() as db:
+                    session_id = sess.get("_db_session_id")
+                    # Read existing eligibility from tool_state
+                    from sqlalchemy import select
+                    from storage.tables import serve_agent_sessions
+                    stmt = select(serve_agent_sessions.c.tool_state).where(
+                        serve_agent_sessions.c.wa_phone == phone
+                    )
+                    result = db.execute(stmt).first()
+                    existing_eligibility = {}
+                    if result and result[0] and isinstance(result[0], dict):
+                        existing_eligibility = result[0].get("eligibility", {})
+                    
+                    # Map eligibility_mode to requirement or use final_missing_req
+                    req_map = {
+                        "ISSUE_AGE": "age",
+                        "ISSUE_DEVICE": "device",
+                        "ISSUE_TIME": "commitment",
+                        "ISSUE_UNPAID": "unpaid"
+                    }
+                    failed_req = req_map.get(eligibility_mode) or final_missing_req or "unknown"
+                    
+                    eligibility_update = existing_eligibility.copy()
+                    eligibility_update.update({
+                        "response": "no",
+                        "passed": False,
+                        "rejection_reason": failed_req,
+                        "responded_at": now_iso
+                    })
+                    
+                    update_session_state_and_tool_state(
+                        db=db,
+                        wa_phone=phone,
+                        state="REJECTED",
+                        tool_state_updates={"eligibility": eligibility_update}
+                    )
+                    log_event(
+                        db=db,
+                        wa_phone=phone,
+                        agent_name=settings.AGENT_NAME,
+                        event_type="ELIGIBILITY_RESPONSE",
+                        event_source="user",
+                        state="ONBOARDING",
+                        sub_state="ELIGIBILITY",
+                        status="SUCCESS",
+                        details={"response": "no", "passed": False, "failed_requirement": failed_req, "raw_text": text},
+                        session_id=session_id
+                    )
+                    
                     finalize_onboarding(
                         db,
                         wa_phone=phone,
                         eligibility_status="REJECTED",
                         available_days=None,
                         available_time_bands=None,
-                        end_reason=f"eligibility_failed_{eligibility_mode}"
+                        end_reason=f"eligibility_failed_{failed_req}"
                     )
-                    session_id = sess.get("_db_session_id")
                     log_event(
                         db=db,
                         wa_phone=phone,
@@ -780,13 +966,20 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
                         event_source="onboarding_agent",
                         state="REJECTED",
                         status="rejected",
-                        details={"reason": f"eligibility_failed_{eligibility_mode}"},
+                        details={"reason": f"eligibility_failed_{failed_req}"},
                         session_id=session_id
                     )
                     log.info(f"[PERSISTENCE] Finalized rejected session for {phone}")
             except Exception as e:
                 log.warning(f"[PERSISTENCE] Failed to finalize rejected session for {phone}: {e}", exc_info=True)
             
+            sess["state"] = "REJECTED"
+            sess["_eligibility_mode"] = None
+            sess["_eligibility_clarification_sent"] = False
+            sess["_eligibility_missing_req"] = None
+            sess["_eligibility_clarification_step"] = None
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
             return
         else:
             # Unclear response - re-ask the issue-specific question
@@ -808,6 +1001,61 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
         if final_intent == "ELIGIBLE_YES":
             # Clear YES - proceed to IDENTITY (same as YES_WORKS button)
             log.info(f"[ELIGIBILITY] User confirmed all requirements via typed response, proceeding to IDENTITY")
+            
+            # Persistence: Store eligibility response
+            try:
+                from datetime import datetime, timezone
+                from storage.db import get_db_session
+                from storage.session_store import update_session_state_and_tool_state
+                from storage.event_logger import log_event
+                from ..config import settings
+                
+                now_iso = datetime.now(timezone.utc).isoformat()
+                with get_db_session() as db:
+                    session_id = sess.get("_db_session_id")
+                    # Read existing eligibility from tool_state
+                    from sqlalchemy import select
+                    from storage.tables import serve_agent_sessions
+                    stmt = select(serve_agent_sessions.c.tool_state).where(
+                        serve_agent_sessions.c.wa_phone == phone
+                    )
+                    result = db.execute(stmt).first()
+                    existing_eligibility = {}
+                    if result and result[0] and isinstance(result[0], dict):
+                        existing_eligibility = result[0].get("eligibility", {})
+                    
+                    eligibility_update = existing_eligibility.copy()
+                    eligibility_update.update({
+                        "response": "yes",
+                        "passed": True,
+                        "q1_commitment": True,
+                        "q2_age": True,
+                        "q3_device": True,
+                        "responded_at": now_iso
+                    })
+                    
+                    update_session_state_and_tool_state(
+                        db=db,
+                        wa_phone=phone,
+                        state="ONBOARDING",
+                        sub_state="IDENTITY",
+                        tool_state_updates={"eligibility": eligibility_update}
+                    )
+                    log_event(
+                        db=db,
+                        wa_phone=phone,
+                        agent_name=settings.AGENT_NAME,
+                        event_type="ELIGIBILITY_RESPONSE",
+                        event_source="user",
+                        state="ONBOARDING",
+                        sub_state="ELIGIBILITY",
+                        status="SUCCESS",
+                        details={"response": "yes", "passed": True, "raw_text": text},
+                        session_id=session_id
+                    )
+            except Exception as e:
+                log.warning(f"[ELIGIBILITY] Failed to persist response: {e}", exc_info=True)
+            
             profile.setdefault("eligibility", {})["passed"] = True
             sess["profile"] = profile
             sess["state"] = "IDENTITY"

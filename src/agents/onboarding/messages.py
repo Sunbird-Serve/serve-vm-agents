@@ -236,13 +236,15 @@ IDENTITY_EMAIL_CORRECTION = """No worries! Could you share your email again? �
 
 IDENTITY_NAME_RECHECK = """Just checking — what name should I use to address you?"""
 
-IDENTITY_REGISTRATION_START = """Thanks! Creating your SERVE volunteer profile now. This usually takes a few seconds 🙂"""
+IDENTITY_REGISTRATION_START = """Perfect, thanks! I'm just creating your SERVE profile — this may take a few seconds. You don't need to type anything, I'll let you know once it's done ✅"""
 
 IDENTITY_REGISTRATION_EXISTING = """Looks like you already have a SERVE profile — I'll continue from there ✅"""
 
 IDENTITY_REGISTRATION_CREATED = """Done! Your SERVE volunteer profile is created ✅"""
 
 IDENTITY_REGISTRATION_FAILED = """I hit a small issue creating your profile. A coordinator will reach out. Let's continue"""
+
+IDENTITY_REGISTRATION_WAIT_REASSURANCE = """I'm still working on your profile — almost done, thank you for waiting 💛"""
 
 IDENTITY_NUDGE = """I understand your concern 💛  
 
@@ -416,23 +418,23 @@ QA_DEFERRAL_PROMPT = """No worries 😊 I can check back later. When should I re
 
 QA_STOP_ACK = """Understood. I'll stop messages. If you change your mind, just say "Hi" here anytime. 💛"""
 
-QA_SUMMARY_WITH_QUESTIONS = """Loved your questions — I'm glad we could cover them. Next, let's fix your quick orientation slot so you're all set."""
+QA_SUMMARY_WITH_QUESTIONS = """Loved your questions — I'm glad we could cover them."""
 
-QA_SUMMARY_NO_QUESTIONS = """Perfect, you're all set. Let's get your quick orientation slot confirmed so you're ready to teach."""
+QA_SUMMARY_NO_QUESTIONS = """Perfect, you're all set."""
 
 QA_FAQ_ABOUT_SERVE = """SERVE helps thousands of children learn English, Science, and Maths through volunteers like you. You teach online — they learn in school — and our local coordinators make sure everything runs smoothly."""
 
 QA_FAQ_TIME_PROCESS = """You'll teach live online while students sit in their school smart classroom.
 Usually ~2 hours/week."""
 
-QA_FAQ_SUPPORT = """Yes! You'll attend a 30-min online orientation, and a local coordinator supports you during classes."""
+QA_FAQ_SUPPORT = """Yes! Volunteer coordinator will share pedogogy and other information once you get assigned to a class, and a local coordinator supports you during classes."""
 
 QA_FAQ_CERTIFICATE = """We provide a volunteer certificate after you complete the required sessions as per policy."""
 
 QA_FAQ_SUBJECTS_GRADES = """Most volunteers teach English, Math or Science for grades 5–8 (varies by school).
 We'll align your preferences during scheduling."""
 
-QA_FAQ_TECH = """A phone or laptop with stable internet is enough. We'll share the Meet link for sessions."""
+QA_FAQ_TECH = """A tablet or laptop with stable internet is enough. We'll share the Meet link for sessions."""
 
 # ---------- Section 6: Orientation Scheduling ----------
 ASK_AVAILABILITY = """One last step: a short orientation (about 30 minutes) is mandatory for all volunteers.

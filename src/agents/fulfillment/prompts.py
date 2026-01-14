@@ -3,29 +3,38 @@ Fulfillment Agent - Prompts and Message Templates
 """
 from .types import NeedCard
 
-# FULFILL_INTRO message
-FULFILL_INTRO_MSG = """Ready to see open opportunities you can pick from? 😊
+# FULFILL_INTRO message (shown at FULFILL_START)
+FULFILL_INTRO_MSG = """Here are some open teaching opportunities you can choose from 😊
 
-Reply Yes to continue."""
+Reply with the number to nominate yourself."""
 
-# FULFILL_LIST header
-FULFILL_LIST_HEADER = "Open opportunities (reply 1/2/3):"
+# FULFILL_LIST header and footer copy
+FULFILL_LIST_HEADER = "Open opportunities you can consider:"
+
+FULFILL_LIST_FOOTER = """This is just to understand your preference — we can always adjust or discuss later.
+Reply 1/2/3... or type 'Not now' to decide later."""
 
 # FULFILL_INVALID_PICK message
-FULFILL_INVALID_PICK_MSG = "Please reply with a number like 1 or 2 😊"
+FULFILL_INVALID_PICK_MSG = "Please reply with a number like 1 or 2 😊 (or type 'Not now' to decide later)"
 
-# FULFILL_CONFIRM_SUCCESS message
-FULFILL_CONFIRM_SUCCESS_MSG = """Done ✅ I've placed your nomination for this opportunity.
+# FULFILL_CONFIRM_SUCCESS message (nomination success)
+FULFILL_CONFIRM_SUCCESS_MSG = """Done! 🎉
 
-You'll receive the session details once it's confirmed."""
+I’ve nominated you for *{need_title}*.
+A SERVE coordinator will review this and get in touch with you soon with next steps.
+Thank you for stepping forward to make a difference 🌱"""
 
-# FULFILL_CONFIRM_FAILED message
-FULFILL_CONFIRM_FAILED_MSG = """Hmm, I couldn't nominate right now.
+# FULFILL_CONFIRM_FAILED message (nomination error)
+FULFILL_CONFIRM_FAILED_MSG = """Sorry — I hit a small issue while nominating you.
+A coordinator will reach out soon.
+You can also try again later by messaging me here."""
 
-Please try again in a moment."""
+# FULFILL_EXIT / DEFERRED message
+FULFILL_EXIT_MSG = """That’s completely okay 😊
 
-# FULFILL_EXIT message
-FULFILL_EXIT_MSG = """No problem 🌿 If you'd like, you can come back anytime and type 'needs' to see open opportunities."""
+There’s no rush.
+You can come back anytime to explore opportunities.
+Thank you for taking the time to go through SERVE today 🌱"""
 
 
 def format_need_list(needs: list[NeedCard], max_items: int = 5) -> str:
@@ -40,7 +49,7 @@ def format_need_list(needs: list[NeedCard], max_items: int = 5) -> str:
         Formatted string with numbered list
     """
     if not needs:
-        return "No open opportunities at the moment. Check back later! 😊"
+        return "No open opportunities right now. A coordinator will reach out soon."
     
     # Limit to max_items
     display_needs = needs[:max_items]
@@ -72,5 +81,8 @@ def format_need_list(needs: list[NeedCard], max_items: int = 5) -> str:
                 lines.append(f"   {single_item}")
         
         lines.append("")  # Empty line between items
+    
+    # Append footer with instructions
+    lines.append(FULFILL_LIST_FOOTER)
     
     return "\n".join(lines)
