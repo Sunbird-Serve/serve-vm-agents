@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Message Templates for Onboarding Agent
 
@@ -38,9 +39,16 @@ WELCOME_MAYBE_LATER = """No worries! You can come back anytime using this same l
 
 Just send 'start' whenever you're ready."""
 
-WELCOME_INTRO = """Hi! 👋 I'm SIA.
+WELCOME_INTRO = """Hi! I'm SIA from Project SERVE - an initiative where volunteers connect with children in government schools through live online learning.
 
-Welcome to Sunbird SERVE - a platform where volunteers connect with children in government schools through live online learning."""
+Whenever you're ready, just reply and we'll begin."""
+
+WELCOME_INSTRUCTIONS = """You can simply reply with:
+• Hi
+• Yes
+• Ready
+
+and I'll take it from there 🙂"""
 
 WELCOME_SERVE_OVERVIEW = """Beautiful 🌼
 
@@ -56,7 +64,7 @@ WELCOME_CONSENT_REMINDER = """Quick reminder — shall we continue with the onbo
 
 
 # ---------- Section 2: Intent (Purpose Acknowledgement) ----------
-INTENT_PROMPT = """Amazing! Just Curious, What made you check this out today?"""
+INTENT_PROMPT = """Amazing! Before we dive in, just curious! What made you check this out today?"""
 
 INTENT_FOLLOWUP = """If you'd like, I can quickly walk you through what volunteering with SERVE looks like."""
 
@@ -93,17 +101,19 @@ CLASS_PREVIEW_ASK_BUTTONS = ["Yes, show me", "Skip for now"]
 
 
 # ---------- Section 2.4: Video ----------
-VIDEO_INTRO = """Here's a short glimpse of how a SERVE class usually looks 🙂"""
+VIDEO_INTRO = """Here's a short glimpse of how a SERVE class usually looks 💛
+Take a look when you're ready — just reply *Done* after watching."""
 
-VIDEO_DONE_PROMPT = """Take a look when you're ready — just reply *Done* after watching."""
+VIDEO_DONE_PROMPT = """Thanks for watching!
+What you just saw is a real SERVE classroom - children learning live with a volunteer like you."""
 
 VIDEO_ERROR_MSG = """I'm having trouble playing the video right now, but we can still continue."""
 
 
 # ---------- Section 2.5: Needs Preview ----------
-NEEDS_PREVIEW_HEADER = """Right now, these are some of the kinds of classes where volunteers are needed 👇"""
+NEEDS_PREVIEW_HEADER = """To give you a sense of how volunteering usually looks, here are a couple of current examples 👇"""
 
-NEEDS_PREVIEW_DISCLAIMER = """This is just a preview — we'll match you properly a bit later 🙂"""
+NEEDS_PREVIEW_DISCLAIMER = """This is just a preview — Later, we'll understand your comfort and availability and match you thoughtfully. """
 
 NEEDS_PREVIEW_ERROR_MSG = """I'm having trouble fetching the latest list right now — but we can still continue."""
 
@@ -131,7 +141,7 @@ ELIGIBILITY_COMMITMENT_PERSUASION = """That's completely okay — even small amo
 
 Many volunteers try one session on Saturday and another during the week."""
 
-ELIGIBILITY_PROMPT = """Just so you can decide if this feels right for you - 😊  
+ELIGIBILITY_PROMPT = """Just so you can decide if this feels right for you  
 
 Volunteering with SERVE usually means:
 
@@ -205,26 +215,34 @@ Thank you for your interest, and wishing you a lovely day 🌼"""
 # ---------- Section 4: Identity Collection ----------
 IDENTITY_NAME_PROMPT = """Lovely!  
 
-btw, may I know your **name**? 🙂"""
+May I know your **name**? 🙂"""
 
 IDENTITY_CONTACT_PROMPT = """Thanks {name}!  
-
-I have your phone number: **{phone}**  
 
 Could you share your **email**?  
 
 This helps create your volunteer profile and keep you updated on sessions."""
 
-IDENTITY_CONTACT_RETRY = """Could you share your email? 🙂"""
+IDENTITY_CONTACT_RETRY = """Could you share your email?"""
 
 IDENTITY_CONFIRM_CONTACT = """Got it! 
 
 Phone: **{phone}**  
 Email: **{email}**  
 
-Is this correct?"""
+Is this correct? Reply Yes or No"""
 
 IDENTITY_EMAIL_CORRECTION = """No worries! Could you share your email again? 🙂"""
+
+IDENTITY_NAME_RECHECK = """Just checking — what name should I use to address you?"""
+
+IDENTITY_REGISTRATION_START = """Thanks! Creating your SERVE volunteer profile now. This usually takes a few seconds 🙂"""
+
+IDENTITY_REGISTRATION_EXISTING = """Looks like you already have a SERVE profile — I'll continue from there ✅"""
+
+IDENTITY_REGISTRATION_CREATED = """Done! Your SERVE volunteer profile is created ✅"""
+
+IDENTITY_REGISTRATION_FAILED = """I hit a small issue creating your profile. A coordinator will reach out. Let's continue"""
 
 IDENTITY_NUDGE = """I understand your concern 💛  
 

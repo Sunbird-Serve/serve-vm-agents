@@ -7,11 +7,14 @@ import logging
 import time
 import re
 import asyncio
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Tuple
 from ..messages import (
     IDENTITY_NAME_PROMPT, IDENTITY_CONTACT_PROMPT,
     IDENTITY_NUDGE, IDENTITY_BOUNDARY, IDENTITY_EXIT, format_message,
-    IDENTITY_CONFIRM_CONTACT, IDENTITY_EMAIL_CORRECTION, IDENTITY_CONTACT_RETRY
+    IDENTITY_CONFIRM_CONTACT, IDENTITY_EMAIL_CORRECTION, IDENTITY_CONTACT_RETRY,
+    IDENTITY_NAME_RECHECK, IDENTITY_REGISTRATION_START, IDENTITY_REGISTRATION_EXISTING,
+    IDENTITY_REGISTRATION_CREATED, IDENTITY_REGISTRATION_FAILED
 )
 from ..validators import is_yes_response, is_no_response
 from ..config import settings
@@ -437,53 +440,508 @@ def should_use_llm_for_contacts(text: str, intent: str) -> bool:
     return False
 
 
-async def save_profile(name: str, phone: str, email: str) -> Tuple[bool, Optional[str]]:
+def validate_name_strict(text: str) -> bool:
     """
-    Call saveProfile MCP tool to save volunteer profile.
+    Strict name validation - rejects common non-name phrases.
     
     Args:
-        name: Volunteer name
-        phone: Phone number
+        text: User's message
+        
+    Returns:
+        True if valid name, False if invalid
+    """
+    text_lower = text.lower().strip()
+    
+    # Check for common non-name phrases
+    non_name_phrases = [
+        "i don't know", "i dont know", "idk", "don't know", "dont know",
+        "not sure", "unsure", "skip", "later", "no", "none", "nothing",
+        "n/a", "na", "not applicable", "prefer not", "rather not",
+        "ok", "yes", "okay", "sure"
+    ]
+    
+    for phrase in non_name_phrases:
+        if phrase in text_lower:
+            return False
+    
+    # Use existing validate_name function
+    return validate_name(text)
+
+
+def validate_email_strict(email: str) -> bool:
+    """
+    Strict email validation.
+    
+    Args:
+        email: Email string
+        
+    Returns:
+        True if valid email format, False otherwise
+    """
+    return is_valid_email(email)
+
+
+def mask_email(email: str) -> str:
+    """Mask email for logging (e.g., user@example.com -> u***@e***.com)"""
+    if not email or "@" not in email:
+        return "***"
+    parts = email.split("@")
+    if len(parts) != 2:
+        return "***"
+    local, domain = parts
+    if len(local) > 0:
+        masked_local = local[0] + "***"
+    else:
+        masked_local = "***"
+    
+    domain_parts = domain.split(".")
+    if len(domain_parts) > 0:
+        masked_domain = domain_parts[0][0] + "***" + "." + ".".join(domain_parts[1:])
+    else:
+        masked_domain = "***"
+    
+    return f"{masked_local}@{masked_domain}"
+
+
+def mask_phone(phone: str) -> str:
+    """Mask phone for logging (show last 4 digits only)"""
+    if not phone or len(phone) < 4:
+        return "***"
+    return "***" + phone[-4:]
+
+
+# ---------- MCP Registration Helpers ----------
+async def mcp_serve_volunteer_email_exists(email: str) -> Tuple[bool, Optional[str]]:
+    """
+    Check if volunteer exists in SERVE by email.
+    
+    Args:
         email: Email address
         
     Returns:
-        (success: bool, error_message: Optional[str])
+        (exists: bool, volunteer_id: Optional[str])
     """
-    MCP_BASE = settings.MCP_BASE
-    MCP_JSONRPC_ENDPOINT = f"{MCP_BASE}/mcp/v1/jsonrpc"
+    try:
+        from ..wa_loop import _mcp_call
+        
+        result = await _mcp_call(
+            "serve.volunteer.email_exists",
+            {"email": email},
+            timeout=10
+        )
+        
+        exists = result.get("exists", False)
+        volunteer_id = result.get("volunteer_id") or result.get("osid")
+        
+        log.info(f"[REG] SERVE email check: exists={exists}, volunteer_id={volunteer_id}")
+        return exists, volunteer_id
+    except Exception as e:
+        log.error(f"[REG] SERVE email_exists failed: {e}", exc_info=True)
+        raise
+
+
+async def mcp_firebase_email_exists(email: str) -> Tuple[bool, Optional[str]]:
+    """
+    Check if email exists in Firebase.
     
-    req_id = str(uuid.uuid4())
-    payload = {
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "method": "tools/call",
-        "params": {
-            "name": "saveProfile",
-            "arguments": {
+    Args:
+        email: Email address
+        
+    Returns:
+        (exists: bool, firebase_uid: Optional[str])
+    """
+    try:
+        from ..wa_loop import _mcp_call
+        
+        result = await _mcp_call(
+            "firebase.auth.email_exists",
+            {"email": email},
+            timeout=10
+        )
+        
+        exists = result.get("exists", False)
+        firebase_uid = result.get("firebase_uid") or result.get("uid")
+        
+        log.info(f"[REG] Firebase email check: exists={exists}, firebase_uid={firebase_uid}")
+        return exists, firebase_uid
+    except Exception as e:
+        log.error(f"[REG] Firebase email_exists failed: {e}", exc_info=True)
+        raise
+
+
+async def mcp_firebase_ensure_user(email: str, display_name: str, generate_reset_link: bool = True) -> Tuple[str, Optional[str]]:
+    """
+    Ensure Firebase user exists (create if missing).
+    
+    Args:
+        email: Email address
+        display_name: Display name
+        generate_reset_link: Whether to generate reset link
+        
+    Returns:
+        (firebase_uid: str, reset_link: Optional[str])
+    """
+    try:
+        from ..wa_loop import _mcp_call
+        
+        result = await _mcp_call(
+            "firebase.auth.ensure_user",
+            {
+                "email": email,
+                "display_name": display_name,
+                "create_if_missing": True,
+                "generate_reset_link": generate_reset_link
+            },
+            timeout=15
+        )
+        
+        firebase_uid = result.get("firebase_uid") or result.get("uid")
+        reset_link = result.get("reset_link")
+        
+        if not firebase_uid:
+            raise RuntimeError("Firebase ensure_user returned no firebase_uid")
+        
+        log.info(f"[REG] Firebase user ensured: firebase_uid={firebase_uid}, reset_link_sent={reset_link is not None}")
+        return firebase_uid, reset_link
+    except Exception as e:
+        log.error(f"[REG] Firebase ensure_user failed: {e}", exc_info=True)
+        raise
+
+
+async def mcp_serve_volunteer_register(
+    name: str,
+    email: str,
+    wa_phone: str,
+    idempotency_key: str
+) -> str:
+    """
+    Register volunteer in SERVE (create user + profile).
+    
+    Args:
+        name: Volunteer name
+        email: Email address
+        wa_phone: WhatsApp phone number
+        idempotency_key: Idempotency key
+        
+    Returns:
+        volunteer_id (osid)
+    """
+    try:
+        from ..wa_loop import _mcp_call
+        
+        result = await _mcp_call(
+            "serve.volunteer.register",
+            {
                 "name": name,
-                "phone": phone,
-                "email": email
-            }
-        }
+                "email": email,
+                "wa_phone": wa_phone,
+                "day_preferred": [],
+                "time_preferred": [],
+                "agency_id": None,
+                "idempotency_key": idempotency_key
+            },
+            timeout=20
+        )
+        
+        volunteer_id = result.get("volunteer_id") or result.get("osid")
+        
+        if not volunteer_id:
+            raise RuntimeError("serve.volunteer.register returned no volunteer_id")
+        
+        log.info(f"[REG] SERVE volunteer registered: volunteer_id={volunteer_id}")
+        return volunteer_id
+    except Exception as e:
+        log.error(f"[REG] SERVE volunteer.register failed: {e}", exc_info=True)
+        raise
+
+
+async def run_registration_flow(
+    phone: str,
+    name: str,
+    email: str,
+    sess: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Run complete registration flow: check SERVE, ensure Firebase, register if needed.
+    
+    Args:
+        phone: WhatsApp phone number
+        name: Volunteer name
+        email: Email address
+        sess: Session dict
+        
+    Returns:
+        Registration result dict with status, volunteer_id, firebase_uid, etc.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    result = {
+        "name": name,
+        "email": email,
+        "wa_phone": phone,
+        "serve": {
+            "exists": False,
+            "volunteer_id": None,
+            "checked_at": now_iso
+        },
+        "firebase": {
+            "exists": False,
+            "firebase_uid": None,
+            "reset_link_sent": False
+        },
+        "status": "failed",
+        "last_error": None
     }
     
+    # Step 1: Check SERVE volunteer exists
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(MCP_JSONRPC_ENDPOINT, json=payload)
-            r.raise_for_status()
-            response = r.json()
+        serve_exists, volunteer_id = await mcp_serve_volunteer_email_exists(email)
+        result["serve"]["exists"] = serve_exists
+        result["serve"]["volunteer_id"] = volunteer_id
+        
+        # Log event
+        try:
+            from storage.db import get_db_session
+            from storage.event_logger import log_event
+            from ..config import settings
             
-            if "error" in response:
-                error = response["error"]
-                log.error(f"[IDENTITY] saveProfile MCP error: {error}")
-                return False, error.get("message", "Unknown error")
-            
-            log.info(f"[IDENTITY] saveProfile succeeded for {phone}")
-            return True, None
+            with get_db_session() as db:
+                session_id = sess.get("_db_session_id")
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="REG_SERVE_EMAIL_CHECKED",
+                    event_source="tool",
+                    state="IDENTITY",
+                    status="SUCCESS",
+                    details={
+                        "exists": serve_exists,
+                        "volunteer_id": volunteer_id,
+                        "email": mask_email(email)
+                    },
+                    session_id=session_id
+                )
+        except Exception as e:
+            log.warning(f"[REG] Failed to log REG_SERVE_EMAIL_CHECKED: {e}")
+        
     except Exception as e:
         error_msg = str(e)
-        log.error(f"[IDENTITY] saveProfile failed: {error_msg}")
-        return False, error_msg
+        log.error(f"[REG] SERVE email check failed: {error_msg}")
+        result["last_error"] = f"SERVE email check failed: {error_msg}"
+        # Continue to Firebase step even if SERVE check fails
+    
+    # Step 2: Ensure Firebase user exists
+    try:
+        firebase_exists, firebase_uid = await mcp_firebase_email_exists(email)
+        result["firebase"]["exists"] = firebase_exists
+        result["firebase"]["firebase_uid"] = firebase_uid
+        
+        if not firebase_exists:
+            # Create Firebase user
+            try:
+                firebase_uid, reset_link = await mcp_firebase_ensure_user(
+                    email=email,
+                    display_name=name,
+                    generate_reset_link=True
+                )
+                result["firebase"]["firebase_uid"] = firebase_uid
+                result["firebase"]["reset_link_sent"] = reset_link is not None
+                result["firebase"]["exists"] = True
+                
+                # Log event
+                try:
+                    from storage.db import get_db_session
+                    from storage.event_logger import log_event
+                    from ..config import settings
+                    
+                    with get_db_session() as db:
+                        session_id = sess.get("_db_session_id")
+                        log_event(
+                            db=db,
+                            wa_phone=phone,
+                            agent_name=settings.AGENT_NAME,
+                            event_type="REG_FIREBASE_ENSURED",
+                            event_source="tool",
+                            state="IDENTITY",
+                            status="SUCCESS",
+                            details={
+                                "created": True,
+                                "firebase_uid": firebase_uid,
+                                "reset_link_sent": reset_link is not None,
+                                "email": mask_email(email)
+                            },
+                            session_id=session_id
+                        )
+                except Exception as e:
+                    log.warning(f"[REG] Failed to log REG_FIREBASE_ENSURED: {e}")
+            except Exception as e:
+                error_msg = str(e)
+                log.error(f"[REG] Firebase ensure_user failed: {error_msg}")
+                result["last_error"] = f"Firebase ensure failed: {error_msg}"
+                # Continue even if Firebase creation fails
+        else:
+            # Firebase user already exists
+            result["firebase"]["firebase_uid"] = firebase_uid
+            
+            # Log event
+            try:
+                from storage.db import get_db_session
+                from storage.event_logger import log_event
+                from ..config import settings
+                
+                with get_db_session() as db:
+                    session_id = sess.get("_db_session_id")
+                    log_event(
+                        db=db,
+                        wa_phone=phone,
+                        agent_name=settings.AGENT_NAME,
+                        event_type="REG_FIREBASE_ENSURED",
+                        event_source="tool",
+                        state="IDENTITY",
+                        status="SUCCESS",
+                        details={
+                            "created": False,
+                            "firebase_uid": firebase_uid,
+                            "email": mask_email(email)
+                        },
+                        session_id=session_id
+                    )
+            except Exception as e:
+                log.warning(f"[REG] Failed to log REG_FIREBASE_ENSURED: {e}")
+    except Exception as e:
+        error_msg = str(e)
+        log.error(f"[REG] Firebase email check/ensure failed: {error_msg}")
+        if not result["last_error"]:
+            result["last_error"] = f"Firebase check/ensure failed: {error_msg}"
+        # Continue to SERVE registration step
+    
+    # Step 3: Register in SERVE if not exists
+    if not result["serve"]["exists"]:
+        try:
+            idempotency_key = f"{phone}:{email}:serve_register"
+            volunteer_id = await mcp_serve_volunteer_register(
+                name=name,
+                email=email,
+                wa_phone=phone,
+                idempotency_key=idempotency_key
+            )
+            result["serve"]["volunteer_id"] = volunteer_id
+            result["serve"]["exists"] = True
+            result["status"] = "created"
+            
+            # Log event
+            try:
+                from storage.db import get_db_session
+                from storage.event_logger import log_event
+                from ..config import settings
+                
+                with get_db_session() as db:
+                    session_id = sess.get("_db_session_id")
+                    log_event(
+                        db=db,
+                        wa_phone=phone,
+                        agent_name=settings.AGENT_NAME,
+                        event_type="REG_SERVE_REGISTERED",
+                        event_source="tool",
+                        state="IDENTITY",
+                        status="SUCCESS",
+                        details={
+                            "created": True,
+                            "volunteer_id": volunteer_id,
+                            "email": mask_email(email)
+                        },
+                        session_id=session_id
+                    )
+            except Exception as e:
+                log.warning(f"[REG] Failed to log REG_SERVE_REGISTERED: {e}")
+        except Exception as e:
+            error_msg = str(e)
+            log.error(f"[REG] SERVE registration failed: {error_msg}")
+            result["last_error"] = f"SERVE registration failed: {error_msg}"
+            result["status"] = "failed"
+            
+            # Log failure event
+            try:
+                from storage.db import get_db_session
+                from storage.event_logger import log_event
+                from ..config import settings
+                
+                with get_db_session() as db:
+                    session_id = sess.get("_db_session_id")
+                    log_event(
+                        db=db,
+                        wa_phone=phone,
+                        agent_name=settings.AGENT_NAME,
+                        event_type="REG_FAILED",
+                        event_source="tool",
+                        state="IDENTITY",
+                        status="FAILURE",
+                        details={
+                            "error": error_msg,
+                            "email": mask_email(email)
+                        },
+                        session_id=session_id
+                    )
+            except Exception as e:
+                log.warning(f"[REG] Failed to log REG_FAILED: {e}")
+    else:
+        # SERVE volunteer already exists
+        result["status"] = "existing"
+        
+        # Log event
+        try:
+            from storage.db import get_db_session
+            from storage.event_logger import log_event
+            from ..config import settings
+            
+            with get_db_session() as db:
+                session_id = sess.get("_db_session_id")
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="REG_SERVE_REGISTERED",
+                    event_source="tool",
+                    state="IDENTITY",
+                    status="SUCCESS",
+                    details={
+                        "created": False,
+                        "volunteer_id": result["serve"]["volunteer_id"],
+                        "email": mask_email(email)
+                    },
+                    session_id=session_id
+                )
+        except Exception as e:
+            log.warning(f"[REG] Failed to log REG_SERVE_REGISTERED: {e}")
+    
+    # Log completion event
+    try:
+        from storage.db import get_db_session
+        from storage.event_logger import log_event
+        from ..config import settings
+        
+        with get_db_session() as db:
+            session_id = sess.get("_db_session_id")
+            log_event(
+                db=db,
+                wa_phone=phone,
+                agent_name=settings.AGENT_NAME,
+                event_type="REG_COMPLETED",
+                event_source="agent",
+                state="IDENTITY",
+                status="SUCCESS" if result["status"] != "failed" else "FAILURE",
+                details={
+                    "status": result["status"],
+                    "volunteer_id": result["serve"]["volunteer_id"],
+                    "firebase_uid": result["firebase"]["firebase_uid"],
+                    "email": mask_email(email)
+                },
+                session_id=session_id
+            )
+    except Exception as e:
+        log.warning(f"[REG] Failed to log REG_COMPLETED: {e}")
+    
+    return result
 
 
 async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: Dict[str, Any]) -> None:
@@ -580,22 +1038,56 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
                 return
             
             else:
-                # NAME_UNCLEAR - check if it's invalid (non-name phrase, digits, @, etc.)
-                is_invalid = not validate_name(text)
+                # NAME_UNCLEAR - check if it's invalid using strict validation
+                is_invalid = not validate_name_strict(text)
+                
+                retry_count = sess.get("_identity_name_retry_count", 0)
                 
                 if is_invalid:
-                    # Invalid input (non-name phrase, digits, @, etc.) - use polite re-ask message
-                    log.info(f"[IDENTITY] Invalid name input detected (non-name phrase/digits/@), re-asking politely")
-                    await mcp_wa_send(phone, IDENTITY_NAME_INVALID)
-                    _add_to_history(phone, bot_msg=IDENTITY_NAME_INVALID)
-                    sess["ts"] = time.time()
-                    SESSIONS[phone] = sess
-                    return
+                    if retry_count < 1:
+                        # First invalid attempt - re-ask politely
+                        log.info(f"[IDENTITY] Invalid name input detected (attempt {retry_count + 1}), re-asking")
+                        sess["_identity_name_retry_count"] = retry_count + 1
+                        await mcp_wa_send(phone, IDENTITY_NAME_RECHECK)
+                        _add_to_history(phone, bot_msg=IDENTITY_NAME_RECHECK)
+                        sess["ts"] = time.time()
+                        SESSIONS[phone] = sess
+                        return
+                    else:
+                        # Second invalid attempt - exit gracefully
+                        log.info(f"[IDENTITY] Name still invalid after 2 attempts, exiting gracefully")
+                        name = profile.get("name", "there")
+                        
+                        # Send exit message with community link
+                        exit_msg = format_message(IDENTITY_EXIT, name=name)
+                        await mcp_wa_send(phone, exit_msg)
+                        _add_to_history(phone, bot_msg=exit_msg)
+                        
+                        sess["state"] = "REJECTED"
+                        sess["ts"] = time.time()
+                        SESSIONS[phone] = sess
+                        
+                        # Persistence: Mark as refused
+                        try:
+                            from storage.db import get_db_session
+                            from storage.session_store import update_session_state_and_tool_state
+                            
+                            with get_db_session() as db:
+                                update_session_state_and_tool_state(
+                                    db=db,
+                                    wa_phone=phone,
+                                    state="REJECTED",
+                                    sub_state=None,
+                                    ended=True,
+                                    end_reason="refused_contacts"
+                                )
+                        except Exception as e:
+                            log.warning(f"[IDENTITY] Failed to persist rejection: {e}")
+                        return
                 else:
                     # NAME_UNCLEAR but not obviously invalid - retry once
-                    retry_count = sess.get("_identity_name_retry_count", 0)
                     if retry_count < 1:
-                        log.info(f"[IDENTITY] Invalid name received, retrying ({retry_count + 1})")
+                        log.info(f"[IDENTITY] Name unclear, retrying ({retry_count + 1})")
                         sess["_identity_name_retry_count"] = retry_count + 1
                         await mcp_wa_send(phone, IDENTITY_NAME_RETRY)
                         _add_to_history(phone, bot_msg=IDENTITY_NAME_RETRY)
@@ -622,58 +1114,129 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
             stored_email = sess.get("_identity_pending_email")
             
             if is_yes_response(text):
-                # Confirmed - proceed to save
+                # Confirmed - proceed to registration
                 log.info(f"[IDENTITY] User confirmed contact info")
                 extracted_email = stored_email
                 extracted_phone = phone  # Use WhatsApp phone directly
-                
-                # Both are valid - save profile (bypassed for now)
                 name = profile.get("name", "")
+                
+                if not name:
+                    log.warning(f"[IDENTITY] Name missing in profile, using empty string")
+                
                 log.info(f"[IDENTITY] Phone and email confirmed: {extracted_phone}, {extracted_email}")
                 
-                # Persistence: Update identity temp fields (checkpoint 2)
+                # Log identity collected event
                 try:
                     from storage.db import get_db_session
-                    from storage.session_store import update_identity_temp
+                    from storage.event_logger import log_event
+                    from ..config import settings
                     
                     with get_db_session() as db:
-                        update_identity_temp(
-                            db,
+                        session_id = sess.get("_db_session_id")
+                        log_event(
+                            db=db,
                             wa_phone=phone,
-                            temp_name=name if name else None,
-                            temp_email=extracted_email,
-                            temp_phone=extracted_phone
+                            agent_name=settings.AGENT_NAME,
+                            event_type="REG_IDENTITY_COLLECTED",
+                            event_source="agent",
+                            state="IDENTITY",
+                            status="SUCCESS",
+                            details={
+                                "name": name,
+                                "email": mask_email(extracted_email),
+                                "phone": mask_phone(extracted_phone)
+                            },
+                            session_id=session_id
                         )
-                        log.info(f"[PERSISTENCE] Updated identity temp fields for {phone}")
                 except Exception as e:
-                    log.warning(f"[PERSISTENCE] Failed to update identity for {phone}: {e}", exc_info=True)
-                    # Continue without DB - don't block flow
+                    log.warning(f"[REG] Failed to log REG_IDENTITY_COLLECTED: {e}")
                 
                 # Clear confirmation flags
                 sess.pop("_identity_waiting_confirmation", None)
                 sess.pop("_identity_pending_email", None)
                 
-                # TODO: Uncomment when saveProfile MCP tool is implemented
-                # Try to save profile
-                # success, error = await save_profile(name, extracted_phone, extracted_email)
-                
-                # For now, bypass saveProfile and proceed
-                log.info(f"[IDENTITY] saveProfile bypassed (not implemented yet), proceeding anyway")
-                profile["phone"] = extracted_phone
-                profile["email"] = extracted_email
-                sess["profile"] = profile
-                sess["_identity_contact_collected"] = True
-                sess["_identity_nudge_sent"] = False  # Reset for next time
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
-                
-                # Transition to next state (Preferences)
-                log.info(f"[IDENTITY] Proceeding to PREFERENCES (saveProfile bypassed)")
-                sess["state"] = "PREFERENCES"
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
-                await _handle(phone, "__kick__")
-                return
+                # Run registration flow
+                log.info(f"[IDENTITY] Starting registration flow for {mask_phone(phone)}")
+                try:
+                    # Send "creating profile" message
+                    await mcp_wa_send(phone, IDENTITY_REGISTRATION_START)
+                    _add_to_history(phone, bot_msg=IDENTITY_REGISTRATION_START)
+                    
+                    # Run registration orchestration
+                    reg_result = await run_registration_flow(
+                        phone=extracted_phone,
+                        name=name,
+                        email=extracted_email,
+                        sess=sess
+                    )
+                    
+                    # Persist registration data to tool_state
+                    try:
+                        from storage.db import get_db_session
+                        from storage.session_store import update_session_state_and_tool_state
+                        from ..config import settings
+                        
+                        with get_db_session() as db:
+                            update_session_state_and_tool_state(
+                                db=db,
+                                wa_phone=phone,
+                                state="IDENTITY",
+                                sub_state="REGISTRATION",
+                                tool_state_updates={"registration": reg_result}
+                            )
+                    except Exception as e:
+                        log.warning(f"[REG] Failed to persist registration data: {e}", exc_info=True)
+                    
+                    # Send appropriate message based on registration status
+                    if reg_result["status"] == "existing":
+                        await mcp_wa_send(phone, IDENTITY_REGISTRATION_EXISTING)
+                        _add_to_history(phone, bot_msg=IDENTITY_REGISTRATION_EXISTING)
+                    elif reg_result["status"] == "created":
+                        await mcp_wa_send(phone, IDENTITY_REGISTRATION_CREATED)
+                        _add_to_history(phone, bot_msg=IDENTITY_REGISTRATION_CREATED)
+                    elif reg_result["status"] == "failed":
+                        await mcp_wa_send(phone, IDENTITY_REGISTRATION_FAILED)
+                        _add_to_history(phone, bot_msg=IDENTITY_REGISTRATION_FAILED)
+                    
+                    # Store in profile and session
+                    profile["phone"] = extracted_phone
+                    profile["email"] = extracted_email
+                    if reg_result["serve"]["volunteer_id"]:
+                        profile["volunteer_id"] = reg_result["serve"]["volunteer_id"]
+                    sess["profile"] = profile
+                    sess["_identity_contact_collected"] = True
+                    sess["_identity_nudge_sent"] = False  # Reset for next time
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+                    
+                    # Transition to next state (Preferences) - continue even if registration failed
+                    log.info(f"[IDENTITY] Registration completed with status={reg_result['status']}, proceeding to PREFERENCES")
+                    sess["state"] = "PREFERENCES"
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+                    await _handle(phone, "__kick__")
+                    return
+                    
+                except Exception as e:
+                    log.error(f"[IDENTITY] Registration flow failed: {e}", exc_info=True)
+                    # Send failure message but continue flow
+                    await mcp_wa_send(phone, IDENTITY_REGISTRATION_FAILED)
+                    _add_to_history(phone, bot_msg=IDENTITY_REGISTRATION_FAILED)
+                    
+                    # Store in profile anyway
+                    profile["phone"] = extracted_phone
+                    profile["email"] = extracted_email
+                    sess["profile"] = profile
+                    sess["_identity_contact_collected"] = True
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+                    
+                    # Continue to next state
+                    sess["state"] = "PREFERENCES"
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+                    await _handle(phone, "__kick__")
+                    return
             elif is_no_response(text):
                 # Not confirmed - ask for email again
                 log.info(f"[IDENTITY] User said no to confirmation, asking for email again")
@@ -705,14 +1268,50 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
         extracted_email = extract_email(text)
         log.info(f"[IDENTITY] Email extraction: {extracted_email}")
         
-        # Step 1.5: Handle invalid email format IMMEDIATELY
-        if extracted_email and not is_valid_email(extracted_email):
+        # Step 1.5: Handle invalid email format IMMEDIATELY with retry logic
+        if extracted_email and not validate_email_strict(extracted_email):
             log.info(f"[IDENTITY] Invalid email format provided")
-            await mcp_wa_send(phone, IDENTITY_INVALID_EMAIL)
-            _add_to_history(phone, bot_msg=IDENTITY_INVALID_EMAIL)
-            sess["ts"] = time.time()
-            SESSIONS[phone] = sess
-            return
+            retry_count = sess.get("_identity_email_retry_count", 0)
+            
+            if retry_count < 1:
+                # First invalid attempt - re-ask
+                sess["_identity_email_retry_count"] = retry_count + 1
+                await mcp_wa_send(phone, IDENTITY_INVALID_EMAIL)
+                _add_to_history(phone, bot_msg=IDENTITY_INVALID_EMAIL)
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            else:
+                # Second invalid attempt - exit gracefully
+                log.info(f"[IDENTITY] Email still invalid after 2 attempts, exiting gracefully")
+                name = profile.get("name", "there")
+                
+                # Send exit message with community link
+                exit_msg = format_message(IDENTITY_EXIT, name=name)
+                await mcp_wa_send(phone, exit_msg)
+                _add_to_history(phone, bot_msg=exit_msg)
+                
+                sess["state"] = "REJECTED"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                
+                # Persistence: Mark as refused
+                try:
+                    from storage.db import get_db_session
+                    from storage.session_store import update_session_state_and_tool_state
+                    
+                    with get_db_session() as db:
+                        update_session_state_and_tool_state(
+                            db=db,
+                            wa_phone=phone,
+                            state="REJECTED",
+                            sub_state=None,
+                            ended=True,
+                            end_reason="refused_contacts"
+                        )
+                except Exception as e:
+                    log.warning(f"[IDENTITY] Failed to persist rejection: {e}")
+                return
         
         # Step 2: LLM fallback if email not found
         if not extracted_email:
@@ -783,16 +1382,18 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
                     if llm_intent == "CONTACTS_PROVIDED" or llm_intent == "EMAIL_PROVIDED":
                         # Re-extract email with LLM context
                         email = extract_email(text)
-                        if email and is_valid_email(email):
+                        if email and validate_email_strict(email):
                             extracted_email = email
                             log.info(f"[IDENTITY] LLM helped extract email")
                 except Exception as e:
                     log.warning(f"[IDENTITY] LLM classification failed: {e}")
         
         # Step 3: Handle based on email extraction result
-        if extracted_email and is_valid_email(extracted_email):
+        if extracted_email and validate_email_strict(extracted_email):
             # Valid email provided - show confirmation
             log.info(f"[IDENTITY] Valid email provided: {extracted_email}")
+            # Reset email retry count on valid email
+            sess["_identity_email_retry_count"] = 0
             display_phone = phone
             if not display_phone.startswith("+"):
                 if len(display_phone) == 10:

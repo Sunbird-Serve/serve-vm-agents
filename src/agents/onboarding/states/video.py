@@ -2,10 +2,12 @@
 VIDEO State Handler
 Show class preview video and wait for done/skip.
 Do NOT block if user doesn't watch - proceed on any response.
+If no response after 30 seconds, auto-proceed to NEEDS_PREVIEW.
 """
 import logging
 import time
 import re
+import asyncio
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
@@ -26,13 +28,15 @@ def classify_video_intent(text: str) -> str:
         return "STOP"
     
     # Any response -> VIDEO_DONE (don't block)
+    # Includes: done, watched, okay, sure, anything, etc.
     done_keywords = ["done", "watched", "viewed", "finished", "completed", "ok", "okay", 
-                     "yes", "y", "skip", "next", "continue", "proceed", "ready"]
+                     "yes", "y", "sure", "anything", "skip", "next", "continue", "proceed", "ready",
+                     "alright", "fine", "good", "great", "nice"]
     
     if any(keyword in text_lower for keyword in done_keywords):
         return "VIDEO_DONE"
     
-    # Default: proceed anyway (don't block)
+    # Default: proceed anyway (don't block) - treat any text as valid response
     return "VIDEO_DONE"
 
 
@@ -149,16 +153,6 @@ async def handle_video(
             except:
                 pass
         
-        # Send done prompt
-        log.info(f"[VIDEO] Sending done prompt to {phone}")
-        done_msg_id = None
-        try:
-            done_msg_id = await mcp_wa_send(phone, VIDEO_DONE_PROMPT)
-            _add_to_history(phone, bot_msg=VIDEO_DONE_PROMPT)
-            log.info(f"[VIDEO] Done prompt sent successfully")
-        except Exception as e:
-            log.error(f"[VIDEO] Failed to send done prompt: {e}", exc_info=True)
-        
         # Persistence: Update state and tool_state
         now_iso = datetime.now(timezone.utc).isoformat()
         try:
@@ -197,22 +191,48 @@ async def handle_video(
                     wa_phone=phone,
                     state="ONBOARDING",
                     sub_state="VIDEO",
-                    last_outbound_msg_id=done_msg_id or intro_msg_id,
+                    last_outbound_msg_id=intro_msg_id,
                     tool_state_updates=tool_state_updates
                 )
         except Exception as e:
             log.warning(f"[VIDEO] Failed to persist: {e}", exc_info=True)
         
         sess["_video_sent"] = True
+        sess["_video_response_received"] = False
         sess["state"] = "VIDEO"
         sess["sub_state"] = "VIDEO"
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
+        
+        # Schedule 30-second timeout to auto-proceed if no response
+        async def video_timeout_handler():
+            await asyncio.sleep(30.0)
+            
+            # Check if still in VIDEO state and no response received
+            current_sess = SESSIONS.get(phone)
+            if (current_sess and 
+                current_sess.get("state") == "VIDEO" and 
+                not current_sess.get("_video_response_received")):
+                log.info(f"[VIDEO] 30-second timeout reached, auto-proceeding to NEEDS_PREVIEW for {phone}")
+                current_sess["state"] = "NEEDS_PREVIEW"
+                current_sess["sub_state"] = "NEEDS_PREVIEW"
+                current_sess["ts"] = time.time()
+                SESSIONS[phone] = current_sess
+                # Trigger NEEDS_PREVIEW state handler
+                await _handle(phone, "__kick__")
+        
+        # Create background task for timeout (non-blocking)
+        asyncio.create_task(video_timeout_handler())
         return
     
-    # Handle user response - any response -> proceed to NEEDS_PREVIEW
+    # Handle user response - send VIDEO_DONE_PROMPT, then proceed to NEEDS_PREVIEW
     intent = classify_video_intent(text)
     log.info(f"[VIDEO] User response classified as: {intent}")
+    
+    # Mark response as received to prevent timeout
+    sess["_video_response_received"] = True
+    sess["ts"] = time.time()
+    SESSIONS[phone] = sess
     
     if intent == "STOP":
         # Persistence: Log optout event
@@ -245,6 +265,16 @@ async def handle_video(
         await mcp_wa_send(phone, stop_msg)
         _add_to_history(phone, bot_msg=stop_msg)
         return
+    
+    # Send VIDEO_DONE_PROMPT before proceeding
+    log.info(f"[VIDEO] Sending done prompt to {phone}")
+    done_msg_id = None
+    try:
+        done_msg_id = await mcp_wa_send(phone, VIDEO_DONE_PROMPT)
+        _add_to_history(phone, bot_msg=VIDEO_DONE_PROMPT)
+        log.info(f"[VIDEO] Done prompt sent successfully")
+    except Exception as e:
+        log.error(f"[VIDEO] Failed to send done prompt: {e}", exc_info=True)
     
     # Persistence: Store video ack and log event
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -286,6 +316,7 @@ async def handle_video(
                 wa_phone=phone,
                 state="ONBOARDING",
                 sub_state="NEEDS_PREVIEW",
+                last_outbound_msg_id=done_msg_id,
                 tool_state_updates=tool_state_updates
             )
             log_event(
@@ -304,7 +335,7 @@ async def handle_video(
         log.warning(f"[VIDEO] Failed to persist: {e}", exc_info=True)
     
     # Any other response -> proceed to NEEDS_PREVIEW (don't block)
-    log.info(f"[VIDEO] Proceeding to NEEDS_PREVIEW (don't block on video watching)")
+    log.info(f"[VIDEO] Proceeding to NEEDS_PREVIEW after user response")
     sess["state"] = "NEEDS_PREVIEW"
     sess["sub_state"] = "NEEDS_PREVIEW"
     sess["ts"] = time.time()

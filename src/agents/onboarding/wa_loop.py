@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 WhatsApp Onboarding Agent - client-led orchestrator
 
@@ -25,7 +26,7 @@ from jsonschema import ValidationError
 from .config import settings
 from .messages import (
     WELCOME, WELCOME_MAYBE_LATER,
-    WELCOME_INTRO, WELCOME_SERVE_OVERVIEW, WELCOME_CONSENT_ACK,
+    WELCOME_INTRO, WELCOME_INSTRUCTIONS, WELCOME_SERVE_OVERVIEW, WELCOME_CONSENT_ACK,
     INTENT_PROMPT, INTENT_EXIT,
     ELIGIBILITY_PROMPT, ELIGIBILITY_EXIT,
     ELIGIBILITY_INTRO, ELIGIBILITY_Q1, ELIGIBILITY_Q2, ELIGIBILITY_Q3,
@@ -142,8 +143,13 @@ async def _mcp_list_tools():
     
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(MCP_JSONRPC_ENDPOINT, json=payload)
+            r = await client.post(
+                MCP_JSONRPC_ENDPOINT, 
+                json=payload,
+                headers={"Content-Type": "application/json; charset=utf-8"}
+            )
             r.raise_for_status()
+            r.encoding = "utf-8"
             response = r.json()
             
             if "error" in response:
@@ -186,8 +192,13 @@ async def _mcp_initialize():
     
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(MCP_JSONRPC_ENDPOINT, json=init_payload)
+            r = await client.post(
+                MCP_JSONRPC_ENDPOINT, 
+                json=init_payload,
+                headers={"Content-Type": "application/json; charset=utf-8"}
+            )
             r.raise_for_status()
+            r.encoding = "utf-8"
             init_response = r.json()
             
             if "error" in init_response:
@@ -209,8 +220,13 @@ async def _mcp_initialize():
                 "method": "notifications/initialized"
             }
             
-            r = await client.post(MCP_JSONRPC_ENDPOINT, json=initialized_payload)
+            r = await client.post(
+                MCP_JSONRPC_ENDPOINT, 
+                json=initialized_payload,
+                headers={"Content-Type": "application/json; charset=utf-8"}
+            )
             r.raise_for_status()
+            r.encoding = "utf-8"
             
             MCP_INITIALIZED = True
             log.info("[MCP] MCP session initialized successfully")
@@ -251,8 +267,15 @@ async def _mcp_call(tool_name: str, arguments: dict, timeout: int = 15) -> dict:
         log.info(f"[MCP] Calling tool={tool_name}")
         
         async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(MCP_JSONRPC_ENDPOINT, json=payload)
+            # Ensure UTF-8 encoding for JSON payload
+            r = await client.post(
+                MCP_JSONRPC_ENDPOINT, 
+                json=payload,
+                headers={"Content-Type": "application/json; charset=utf-8"}
+            )
             r.raise_for_status()
+            # Ensure response is decoded as UTF-8
+            r.encoding = "utf-8"
             response = r.json()
             
             # Check for JSON-RPC error
@@ -406,15 +429,17 @@ def _sanitize_llm_message(text: str) -> str:
 
 # ---------- MCP Tool Wrappers ----------
 def _wa_sanitize(text: str) -> str:
-    """Best-effort sanitize to avoid server-side encoding issues (temporary guard)."""
+    """Sanitize text while preserving UTF-8 encoding and emojis."""
     if not isinstance(text, str):
         return str(text)
+    # Normalize some special characters but preserve UTF-8/emojis
     safe = text.replace("–", "-").replace("—", "-")
-    # If MCP bridge/tool can't handle emoji/non-ASCII, drop them
+    # Ensure text is valid UTF-8 (don't strip emojis/non-ASCII)
     try:
-        safe.encode("latin-1")
-    except Exception:
-        safe = safe.encode("ascii", "ignore").decode()
+        safe.encode("utf-8")
+    except UnicodeEncodeError:
+        # If encoding fails, try to fix invalid characters but preserve valid UTF-8
+        safe = safe.encode("utf-8", "replace").decode("utf-8")
     return safe
 
 
@@ -2087,54 +2112,36 @@ async def _handle(phone: str, text: str):
         _add_to_history(phone, bot_msg=RESTARTING)
         return
     
-    # ========== WELCOME & CONSENT STATE ==========
-    # State 1: First outbound message - no question, just warm greeting
+    # ========== WELCOME STATE ==========
+    # State 1: First outbound message - warm greeting, then wait for user reply
     if state == "WELCOME":
         if text == "__kick__" or not sess.get("_greet_sent"):
             log.info(f"[GREET] Sending welcome message to {phone}")
 
-            # Send the new State 1 message (no formatting needed, static message)
+            # Send the welcome intro message
             intro_msg = WELCOME_INTRO
             await mcp_wa_send(phone, intro_msg)
             _add_to_history(phone, bot_msg=intro_msg)
 
+            # Immediately send instructions message
+            instructions_msg = WELCOME_INSTRUCTIONS
+            await mcp_wa_send(phone, instructions_msg)
+            _add_to_history(phone, bot_msg=instructions_msg)
+
             sess["_greet_sent"] = True
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
-            
-            # Schedule delayed READINESS_CHECK message after ~1 second
-            async def delayed_readiness_transition():
-                # Wait for ~1 second (1000ms) - natural typing pause
-                await asyncio.sleep(1.0)
-                
-                # Check if still in WELCOME state
-                current_sess = SESSIONS.get(phone)
-                if current_sess and current_sess.get("state") == "WELCOME" and not current_sess.get("_readiness_check_prompted"):
-                    log.info(f"[GREET] Auto-transitioning to READINESS_CHECK after delay for {phone}")
-                    current_sess["state"] = "READINESS_CHECK"
-                    current_sess["ts"] = time.time()
-                    SESSIONS[phone] = current_sess
-                    # Trigger READINESS_CHECK state handler
-                    await _handle(phone, "__kick__")
-            
-            # Create background task for delayed transition (non-blocking)
-            # This allows the function to return immediately while delay runs in background
-            asyncio.create_task(delayed_readiness_transition())
             return
         else:
-            # User responded after State 1 message - transition to READINESS_CHECK state immediately
-            log.info(f"[GREET] User responded after State 1 message, transitioning to READINESS_CHECK")
-            sess["state"] = "READINESS_CHECK"
+            # User replied after welcome message – transition directly to INTENT
+            log.info(f"[GREET] User responded after welcome message, transitioning to INTENT")
+            sess["state"] = "INTENT"
+            sess["sub_state"] = "INTENT"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
-            # Trigger READINESS_CHECK state handler
+            # Trigger INTENT state handler
             await _handle(phone, "__kick__")
             return
-    
-    # ========== READINESS_CHECK STATE (State 1.5: Ready for chat now vs later) ==========
-    if state == "READINESS_CHECK":
-        await handle_readiness_check(phone, text, sess, profile)
-        return
     
     # ========== INTENT STATE (State 2: Purpose Acknowledgement) ==========
     if state == "INTENT":

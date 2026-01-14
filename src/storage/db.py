@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 Database connection and session management using SQLAlchemy 2.0
 """
@@ -27,11 +28,17 @@ if not DATABASE_URL:
     DATABASE_URL = "postgresql+psycopg://user:pass@localhost:5432/serve_agents"
 
 # Create engine with pool_pre_ping for connection health checks
+# Ensure UTF-8 encoding for database connections
+connect_args = {}
+if "postgresql" in DATABASE_URL.lower():
+    connect_args["client_encoding"] = "utf8"
+
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
     poolclass=NullPool,  # Use NullPool for async compatibility
-    echo=False  # Set to True for SQL debugging
+    echo=False,  # Set to True for SQL debugging
+    connect_args=connect_args
 )
 
 # Create sessionmaker
