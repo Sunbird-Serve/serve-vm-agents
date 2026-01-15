@@ -18,9 +18,11 @@ from .prompts import (
     FULFILL_CONFIRM_SUCCESS_MSG,
     FULFILL_CONFIRM_FAILED_MSG,
     FULFILL_EXIT_MSG,
+    FULFILL_DEFERRED_MSG,
     format_need_list,
 )
 from .config import settings
+from agents.onboarding.validators import is_defer_response, is_resume_response
 
 log = logging.getLogger(__name__)
 
@@ -348,6 +350,31 @@ async def handle_fulfillment(phone: str, text: str, session: dict):
     state = session.get("state", FulfillmentState.INTRO)
     
     log.info(f"[FULFILLMENT] Handling state={state} for {phone}, text='{text[:30]}...'")
+
+    # Resume/pause handling
+    mcp_wa_send = _get_mcp_wa_send()
+    if text != "__kick__":
+        if session.get("_paused"):
+            session["_paused"] = False
+            session.pop("_pause_reason", None)
+            if is_resume_response(text):
+                last_prompt = session.get("_last_agent_prompt")
+                if last_prompt:
+                    await mcp_wa_send(phone, last_prompt)
+                    session["ts"] = time.time()
+                    from agents.onboarding.wa_loop import SESSIONS
+                    SESSIONS[phone] = session
+                    return
+
+        if is_defer_response(text):
+            await mcp_wa_send(phone, FULFILL_DEFERRED_MSG)
+            session["_paused"] = True
+            session["_pause_reason"] = "user_deferred"
+            session["_paused_state"] = state
+            session["ts"] = time.time()
+            from agents.onboarding.wa_loop import SESSIONS
+            SESSIONS[phone] = session
+            return
     
     # Route to appropriate state handler
     if state == FulfillmentState.INTRO:
@@ -450,6 +477,7 @@ async def handle_fulfill_list(phone: str, text: str, session: dict):
         # Send list
         mcp_wa_send = _get_mcp_wa_send()
         list_msg_id = await mcp_wa_send(phone, list_message)
+        session["_last_agent_prompt"] = list_message
         
         # Store needs in session for validation
         session["fulfillment"] = session.get("fulfillment", {})
@@ -553,7 +581,7 @@ async def handle_fulfill_wait_pick(phone: str, text: str, session: dict):
                     db=db,
                     wa_phone=phone,
                     state="FULFILLMENT",
-                    sub_state=FulfillmentState.EXIT,
+                    sub_state=FulfillmentState.WAIT_PICK,
                     tool_state_updates=tool_state_updates,
                 )
                 
@@ -573,12 +601,13 @@ async def handle_fulfill_wait_pick(phone: str, text: str, session: dict):
         except Exception as e:
             log.warning(f"[FULFILLMENT] Failed to persist FULFILL_DEFERRED: {e}", exc_info=True)
         
-        # Send graceful closing and exit
-        session["state"] = FulfillmentState.EXIT
+        # Pause flow and allow resume later
+        await mcp_wa_send(phone, FULFILL_DEFERRED_MSG)
+        session["_paused"] = True
+        session["_pause_reason"] = "user_deferred"
         session["ts"] = time.time()
         from agents.onboarding.wa_loop import SESSIONS
         SESSIONS[phone] = session
-        await handle_fulfill_exit(phone, session)
         return
     
     # Helper: detect question

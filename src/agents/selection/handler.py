@@ -17,7 +17,9 @@ from .prompts import (
     get_sel_recommended_msg,
     WELCOME_VIDEO_URL,
     SEL_NOT_RECOMMENDED_MSG,
+    SEL_DEFERRED_MSG,
 )
+from agents.onboarding.validators import is_defer_response, is_resume_response
 from .config import settings
 from .knowing_volunteer_engine import (
     run_knowing_volunteer_step,
@@ -73,6 +75,31 @@ async def handle_selection(phone: str, text: str, session: dict):
     state = session.get("state", SelectionState.START)
     
     log.info(f"[SELECTION] Handling state={state} for {phone}, text='{text[:30]}...'")
+
+    # Resume/pause handling
+    mcp_wa_send = _get_mcp_wa_send()
+    if text != "__kick__":
+        if session.get("_paused"):
+            session["_paused"] = False
+            session.pop("_pause_reason", None)
+            if is_resume_response(text):
+                last_prompt = session.get("_last_agent_prompt")
+                if last_prompt:
+                    await mcp_wa_send(phone, last_prompt)
+                    session["ts"] = time.time()
+                    from agents.onboarding.wa_loop import SESSIONS
+                    SESSIONS[phone] = session
+                    return
+
+        if is_defer_response(text):
+            await mcp_wa_send(phone, SEL_DEFERRED_MSG)
+            session["_paused"] = True
+            session["_pause_reason"] = "user_deferred"
+            session["_paused_state"] = state
+            session["ts"] = time.time()
+            from agents.onboarding.wa_loop import SESSIONS
+            SESSIONS[phone] = session
+            return
     
     # Route to appropriate state handler
     if state == SelectionState.START:
@@ -127,6 +154,7 @@ async def handle_selection_start(phone: str, text: str, session: dict):
         done_prompt = get_sel_video_done_prompt()
         combined_video_msg = f"{WELCOME_VIDEO_URL}\n\n{done_prompt}"
         video_msg_id = await mcp_wa_send(phone, combined_video_msg)
+        session["_last_agent_prompt"] = combined_video_msg
         
         # Persistence: Store selection start and video sent
         try:

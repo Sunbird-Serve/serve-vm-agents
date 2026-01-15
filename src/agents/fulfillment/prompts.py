@@ -36,6 +36,10 @@ There’s no rush.
 You can come back anytime to explore opportunities.
 Thank you for taking the time to go through SERVE today 🌱"""
 
+# Generic pause message (resume later)
+FULFILL_DEFERRED_MSG = """No worries — take your time.
+Whenever you're ready, just reply here and we’ll continue from where you left off."""
+
 
 def format_need_list(needs: list[NeedCard], max_items: int = 5) -> str:
     """

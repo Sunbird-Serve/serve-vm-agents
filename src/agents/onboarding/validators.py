@@ -4,6 +4,7 @@ Validators and Normalizers for Onboarding Data
 Validates extracted data against business rules and normalizes formats.
 """
 import logging
+import re
 from typing import Tuple
 
 log = logging.getLogger(__name__)
@@ -274,4 +275,30 @@ def is_no_response(text: str) -> bool:
 def normalize_phone(phone: str) -> str:
     """Normalize phone number (remove + and whitespace)"""
     return (phone or "").lstrip("+").strip()
+
+
+def is_defer_response(text: str) -> bool:
+    """Detect if user wants to respond later or pause the flow."""
+    if not text:
+        return False
+    text_lower = text.lower().strip()
+    explicit_pattern = (
+        r"\b("
+        r"maybe\s+later|not\s+now|not\s+today|not\s+right\s+now|"
+        r"another\s+time|respond\s+later|reply\s+later|"
+        r"busy|remind\s+me|come\s+back|ping\s+me\s+later"
+        r")\b"
+    )
+    if re.search(explicit_pattern, text_lower):
+        return True
+    # Accept short, explicit deferral-only replies like "later"
+    return text_lower in {"later"}
+
+
+def is_resume_response(text: str) -> bool:
+    """Detect if user explicitly wants to resume/continue."""
+    if not text:
+        return False
+    pattern = r"\b(resume|continue|start|ready|back|let's\s+start|lets\s+start)\b"
+    return bool(re.search(pattern, text.lower()))
 

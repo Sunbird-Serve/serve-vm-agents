@@ -28,6 +28,10 @@ def get_sel_about_you(name: str = "there") -> str:
     return f"Let's start with something simple, {name}. Tell me a little about yourself — anything you'd like to share"
 
 
+SEL_DEFERRED_MSG = """No worries — take your time.
+Whenever you're ready, just reply here and we’ll pick up from where we left off."""
+
+
 # Recommended message
 def get_sel_recommended_msg(name: str = "there") -> str:
     """Get recommended message with name"""

@@ -50,6 +50,9 @@ WELCOME_INSTRUCTIONS = """You can simply reply with:
 
 and I'll take it from there 🙂"""
 
+GENERIC_DEFERRED_MSG = """No worries — take your time.
+Whenever you're ready, just reply here and we'll continue from where you left off."""
+
 WELCOME_SERVE_OVERVIEW = """Beautiful 🌼
 
 SERVE connects volunteers like you with students in government and rural schools. You teach online, students join from their classroom.
