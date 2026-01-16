@@ -301,17 +301,17 @@ def classify_name_response(text: str) -> Tuple[str, Optional[str]]:
     """
     text_lower = text.lower().strip()
     
-    # Check for QUERY
-    if "?" in text or re.search(r"^(what|how|when|why|where|who|which|can|could|do|does|is|are)\b", text, re.I):
-        return ("QUERY", None)
-    
-    # Extract and validate name
+    # Extract and validate name first (allow name + question in same message)
     name, is_valid = extract_name(text)
     
     if is_valid and name:
         return ("NAME_OK", name)
-    else:
-        return ("NAME_UNCLEAR", None)
+    
+    # Check for QUERY only if no valid name extracted
+    if "?" in text or re.search(r"^(what|how|when|why|where|who|which|can|could|do|does|is|are)\b", text, re.I):
+        return ("QUERY", None)
+    
+    return ("NAME_UNCLEAR", None)
 
 
 def classify_contacts_response(text: str) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
@@ -324,10 +324,6 @@ def classify_contacts_response(text: str) -> Tuple[str, Optional[str], Optional[
         invalid_field can be: "email", "phone", or None
     """
     text_lower = text.lower().strip()
-    
-    # Check for QUERY
-    if "?" in text or re.search(r"^(what|how|when|why|where|who|which|can|could|do|does|is|are)\b", text, re.I):
-        return ("QUERY", None, None, None)
     
     # Check for REFUSE_CONTACTS
     refusal_patterns = [
@@ -391,6 +387,10 @@ def classify_contacts_response(text: str) -> Tuple[str, Optional[str], Optional[
         return ("CONTACTS_PARTIAL", extracted_phone, None, None)
     elif extracted_email and is_valid_email(extracted_email):
         return ("CONTACTS_PARTIAL", None, extracted_email, None)
+    
+    # Check for QUERY only if no valid data extracted
+    if "?" in text or re.search(r"^(what|how|when|why|where|who|which|can|could|do|does|is|are)\b", text, re.I):
+        return ("QUERY", None, None, None)
     
     # Ambiguous
     if len(text.strip()) > 3:

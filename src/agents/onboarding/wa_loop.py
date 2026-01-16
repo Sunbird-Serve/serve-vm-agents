@@ -1021,12 +1021,12 @@ async def _generate_qa_summary_phone(
     had_questions: bool,
     topics: list[str],
 ) -> str | None:
-    """Deterministic reflection before orientation."""
+    """Deterministic reflection before wrap-up."""
     return QA_SUMMARY_WITH_QUESTIONS if had_questions else QA_SUMMARY_NO_QUESTIONS
 
 
 async def _send_orientation_summary(phone: str, sess: dict, profile: dict):
-    """Send summary before moving into orientation scheduling."""
+    """Send summary before wrap-up."""
     if sess.get("_qa_summary_sent"):
         return
 
@@ -1609,8 +1609,8 @@ async def mcp_llm_qa(question: str, snippets: list[dict], policy_version: str | 
 1. Answer in 2–4 short lines using the provided snippets/policy context.
 2. Do NOT invent facts or promise payment (this role is volunteer-only).
 3. Keep the tone warm, supportive, and clear.
-4. If the snippets don't fully cover the question, invite them to ask the coordinator during orientation.
-5. Always end with: "Shall we schedule your orientation?"
+4. If the snippets don't fully cover the question, invite them to message here anytime for help.
+5. Do not mention orientation, scheduling, or internal stages.
 6. Output plain text only (no JSON/markdown)."""
 
     context_obj = {
@@ -1625,7 +1625,7 @@ async def mcp_llm_qa(question: str, snippets: list[dict], policy_version: str | 
 
 User question: {question}
 
-Generate a warm, concise answer (2-4 lines) using the snippets above. End with 'Shall we schedule your orientation?'"""
+Generate a warm, concise answer (2-4 lines) using the snippets above. Avoid mentioning orientation, scheduling, or internal stages."""
     
     try:
         few_shots = FEW_SHOT_EXAMPLES.get("FAQ", [])
@@ -1868,7 +1868,7 @@ async def _book_slot_and_finish(phone: str, chosen_slot: dict, profile: dict, na
     end_iso = chosen_slot.get("end_iso")
     label = chosen_slot.get("label")
     
-    title = "Serve Vriddhi - Volunteer Orientation"
+    title = "Serve Vriddhi - Volunteer Welcome Session"
     attendees = [phone]
     
     try:
@@ -1880,11 +1880,11 @@ async def _book_slot_and_finish(phone: str, chosen_slot: dict, profile: dict, na
         
         # Send final confirmation (keep quick acknowledgement + final details)
         confirmation_lines = [
-            f"Orientation: {label}",
-            f"Meet link: {meet_url}",
+            f"Session: {label}",
+            f"Join link: {meet_url}",
             "",
             f"Welcome to the SERVE Volunteer Community, {name}!",
-            "Every hour you share helps a child learn better. See you at the orientation!"
+            "Every hour you share helps a child learn better. See you soon!"
         ]
         confirm_msg = "\n".join(confirmation_lines).strip()
         await mcp_wa_send(phone, confirm_msg)
@@ -2434,6 +2434,54 @@ async def _handle(phone: str, text: str):
         SESSIONS[phone] = sess
         return
     
+    # Per-turn flag for state-level FAQ handling
+    if text != "__kick__":
+        sess["_state_handled_question"] = False
+        SESSIONS[phone] = sess
+    
+    def _is_question(text_value: str) -> bool:
+        if not text_value:
+            return False
+        return bool(
+            "?" in text_value
+            or re.search(r"^(what|how|when|why|where|who|which|can|could|do|does|is|are)\b", text_value, re.I)
+        )
+    
+    async def _maybe_answer_global_faq(text_value: str) -> bool:
+        """Return True if global FAQ answered the question."""
+        try:
+            top = retrieve(text_value, k=3)
+            if top:
+                ans = await compose_answer(text_value, top)
+                if ans:
+                    await mcp_wa_send(phone, ans)
+                    _add_to_history(phone, bot_msg=ans)
+                    sess["_state_handled_question"] = True
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+                    # If there was a pending question that we re-asked,
+                    # let that handler own the flow and stop here.
+                    if await _reask_pending_question(phone, state, sess):
+                        return True
+                    return True
+            else:
+                log.info("[FAQ] No KB match; skipping FAQ answer")
+        except Exception as e:
+            log.warning(f"[FAQ] Failed to answer FAQ: {e}")
+        return False
+    
+    async def _handle_offtopic_redirect() -> None:
+        redirect_msg = (
+            "I’m here to help with SERVE volunteering. If you’d like to continue, "
+            "I can guide you through the next step."
+        )
+        await mcp_wa_send(phone, redirect_msg)
+        _add_to_history(phone, bot_msg=redirect_msg)
+        sess["_state_handled_question"] = True
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+        await _reask_pending_question(phone, state, sess)
+
     # Lightweight FAQ intercept (strict: only explicit questions)
     # Behavior: answer FAQ and then continue normal state flow (no pause),
     # except when _reask_pending_question explicitly handles the follow-up and returns True.
@@ -2444,7 +2492,9 @@ async def _handle(phone: str, text: str):
         text != "__kick__"
         and state != "QA_WINDOW"
         and not deferral_like
-        and ("?" in text or re.search(r"^(what|how|when|why|where|who|which|can|could|do|does|is|are)\b", text, re.I))
+        and _is_question(text)
+        and state not in {"WELCOME", "VIDEO", "ELIGIBILITY"}
+        and not sess.get("_state_handled_question")
     ):
         # If we're in commitment (ELIGIBILITY_PART2) and the question is about "same day 2 hours",
         # skip FAQ so the commitment handler can respond with the correct policy clarification.
@@ -2455,24 +2505,10 @@ async def _handle(phone: str, text: str):
             )
         )
         if not same_day_commitment:
-            try:
-                top = retrieve(text, k=3)
-                if top:
-                    ans = await compose_answer(text, top)
-                    if ans:
-                        await mcp_wa_send(phone, ans)
-                        _add_to_history(phone, bot_msg=ans)
-                        # If there was a pending question that we re-asked,
-                        # let that handler own the flow and stop here.
-                        if await _reask_pending_question(phone, state, sess):
-                            return
-                        # Otherwise, continue with normal state handling.
-                        sess["ts"] = time.time()
-                        SESSIONS[phone] = sess
-                else:
-                    log.info("[FAQ] No KB match; skipping FAQ answer")
-            except Exception as e:
-                log.warning(f"[FAQ] Failed to answer FAQ: {e}")
+            answered = await _maybe_answer_global_faq(text)
+            if not answered:
+                await _handle_offtopic_redirect()
+                return
 
     # Unified parse hook: opportunistic fast-forward (skip for trivial rule hits)
     parsed = {}
@@ -2632,6 +2668,36 @@ async def _handle(phone: str, text: str):
             SESSIONS[phone] = sess
             return
         else:
+            # Welcome FAQ handling: answer common questions and keep in WELCOME
+            if _is_question(text):
+                welcome_faq = [
+                    (r"\b(what is this|what is serve|what is this about|about serve)\b", "This is SERVE’s volunteer onboarding on WhatsApp — I’ll guide you step by step."),
+                    (r"\b(how long|how much time|how long will this take)\b", "About 5–10 minutes if you’re ready now."),
+                    (r"\b(what will you ask|what do i need to do|what is the process)\b", "Just a few basics — your interest, availability, and contact details."),
+                    (r"\b(is this paid|paid role|payment|stipend)\b", "It’s a volunteer role with no payment."),
+                    (r"\b(laptop|tablet|device|phone)\b", "You’ll need a tablet or laptop with stable internet for classes."),
+                ]
+                answered = False
+                for pattern, answer in welcome_faq:
+                    if re.search(pattern, text_lower_global):
+                        await mcp_wa_send(phone, answer)
+                        _add_to_history(phone, bot_msg=answer)
+                        sess["_state_handled_question"] = True
+                        answered = True
+                        break
+                
+                if not answered:
+                    answered = await _maybe_answer_global_faq(text)
+                    if not answered:
+                        await _handle_offtopic_redirect()
+                
+                # Re-ask how to continue and stay in WELCOME
+                await mcp_wa_send(phone, WELCOME_INSTRUCTIONS)
+                _add_to_history(phone, bot_msg=WELCOME_INSTRUCTIONS)
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            
             # User replied after welcome message – transition directly to INTENT
             log.info(f"[GREET] User responded after welcome message, transitioning to INTENT")
             sess["state"] = "INTENT"
@@ -2650,6 +2716,11 @@ async def _handle(phone: str, text: str):
     # ========== VIDEO STATE (State 2.5: Show class preview video) ==========
     if state == "VIDEO":
         await handle_video(phone, text, sess, profile)
+        updated_sess = SESSIONS.get(phone, sess)
+        if _is_question(text) and not updated_sess.get("_state_handled_question"):
+            answered = await _maybe_answer_global_faq(text)
+            if not answered:
+                await _handle_offtopic_redirect()
         return
     
     # ========== NEEDS_PREVIEW STATE (State 2.7: Show needs preview) ==========
@@ -2665,6 +2736,11 @@ async def _handle(phone: str, text: str):
     # ========== ELIGIBILITY STATE (State 3: Eligibility Check) ==========
     if state == "ELIGIBILITY":
         await handle_eligibility(phone, text, sess, profile)
+        updated_sess = SESSIONS.get(phone, sess)
+        if _is_question(text) and not updated_sess.get("_state_handled_question"):
+            answered = await _maybe_answer_global_faq(text)
+            if not answered:
+                await _handle_offtopic_redirect()
         return
     
     # ========== IDENTITY STATE (State 4: Name, Phone, Email Collection) ==========
@@ -4060,7 +4136,7 @@ async def _handle(phone: str, text: str):
             # Fallback if LLM failed or no snippets
             if not answer:
                 answer = (
-                    "I might not have the perfect answer right now. Our coordinator will cover this in orientation."
+                    "I might not have the perfect answer right now. You can message here anytime and we’ll help."
                 )
             
             if "custom" not in qa_topics:
@@ -4104,7 +4180,7 @@ async def _handle(phone: str, text: str):
             return
         
         # Should not reach here, but handle gracefully
-        unclear = "I'd be happy to answer your question. Could you rephrase it, or would you like to proceed with scheduling orientation?"
+        unclear = "I'd be happy to answer your question. Could you rephrase it, or would you like to continue?"
         await mcp_wa_send(phone, unclear)
         _add_to_history(phone, bot_msg=unclear)
         sess["ts"] = time.time()

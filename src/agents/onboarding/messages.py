@@ -407,7 +407,7 @@ QA_ENTRY_PROMPT = """Do you have any quick questions for me? (training, certific
 
 I'll keep it short and clear. 🙂"""
 
-QA_MANDATORY_ORIENT = """One last step: a short orientation (about 30 minutes) is mandatory for all volunteers.
+QA_MANDATORY_ORIENT = """One last step: a short WhatsApp check-in (about 10–15 minutes) is required for all volunteers.
 
 It helps you understand the platform, classroom flow, and support available so you feel fully ready.
 
@@ -437,16 +437,16 @@ QA_FAQ_CERTIFICATE = """We provide a volunteer certificate after you complete th
 QA_FAQ_SUBJECTS_GRADES = """Most volunteers teach English, Math or Science for grades 5–8 (varies by school).
 We'll align your preferences during scheduling."""
 
-QA_FAQ_TECH = """A tablet or laptop with stable internet is enough. We'll share the Meet link for sessions."""
+QA_FAQ_TECH = """A tablet or laptop with stable internet is enough. We'll share the session link for classes."""
 
 # ---------- Section 6: Orientation Scheduling ----------
-ASK_AVAILABILITY = """One last step: a short orientation (about 30 minutes) is mandatory for all volunteers.
+ASK_AVAILABILITY = """One last step: a short WhatsApp check-in (about 10–15 minutes) is required for all volunteers.
 
 It helps you understand the platform, classroom flow, and support available so you feel fully ready.
 
 Please share 2–3 slots that work for you in the next few days (e.g., "Sat 4 PM" or "Sun 10 AM")."""
 
-ORIENT_INTRO = """One last step: a short 30-minute online orientation so you feel fully ready.
+ORIENT_INTRO = """One last step: a short WhatsApp check-in so you feel fully ready.
 It covers how classes work, tech setup, and support. 😊
 
 Please share 2–3 time slots in the next few days that work for you (e.g., "Sat 4–4:30 PM" or "Sun 10–10:30 AM")."""
@@ -514,21 +514,21 @@ ORIENT_BOOKING_CONFIRM = """Perfect — locking that in. One sec..."""
 ORIENT_BOOKING_FAILURE = """Sorry, there was an error booking your slot. Please try again or contact support."""
 
 ORIENT_CONFIRM = """Perfect ✅
-Orientation: {slot}
-Link: {meet_link}
+Session: {slot}
+Join link: {meet_link}
 You'll get a reminder before the session. Welcome to the SERVE Volunteer Community 💛"""
 
 ORIENT_INVALID_PICK = """I couldn't match that to the available slots 🙈 Could you please reply with one of the shown options (like 1 or 2), or type the exact day & time?"""
 
-ORIENT_LATER_NOTE = """No worries 😊 You can message me here anytime to fix your orientation. We'll keep your details ready."""
+ORIENT_LATER_NOTE = """No worries 😊 You can message me here anytime to set this up. We'll keep your details ready."""
 
 
 # ---------- Section 5: Final Confirmation ----------
-DONE = """Orientation: {slot_label}
-Meet link: {meet_link}
+DONE = """Session: {slot_label}
+Join link: {meet_link}
 
 Welcome to the SERVE Volunteer Community, {name}!
-Every hour you share helps a child learn better. See you at the orientation!"""
+Every hour you share helps a child learn better. See you soon!"""
 
 
 # ---------- General Messages ----------

@@ -99,10 +99,15 @@ def classify_eligibility_rule_based(text: str) -> Tuple[Optional[str], Optional[
     words = text_lower.split()
     
     # Check for QUERY first (questions)
-    if "?" in text or re.search(r"^(what|how|when|why|where|who|which|can|could|do|does|is|are)\b", text, re.I):
-        # Check if it's a question about eligibility requirements
-        if any(term in text_lower for term in ["18", "age", "laptop", "phone", "internet", "device", "paid", "payment", "unpaid", "volunteer", "compulsory", "required", "need", "hour", "time", "commitment"]):
-            return ("QUERY", None)
+    has_question = "?" in text or re.search(r"^(what|how|when|why|where|who|which|can|could|do|does|is|are)\b", text, re.I)
+    has_answer_indicators = any(term in text_lower for term in [
+        "yes", "no", "ok", "okay", "sure", "18", "age", "laptop", "tablet", "phone",
+        "internet", "device", "paid", "payment", "unpaid", "volunteer", "hour", "hours",
+        "time", "commitment"
+    ])
+    if has_question and not has_answer_indicators:
+        # Question without any clear answer signals
+        return ("QUERY", None)
     
     # Check for simple "no" response - generic decline (exit immediately)
     if is_no_response(text):
@@ -1068,10 +1073,16 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
             await _handle(phone, "__kick__")
             return
         elif final_intent == "QUERY":
-            # Query - send "Tell me more" explanation and re-show main prompt
+            # Query - answer briefly if we can, then re-show main prompt
             log.info(f"[ELIGIBILITY] User asked a question, sending explanation")
-            await mcp_wa_send(phone, ELIGIBILITY_TELL_ME_MORE_MSG)
-            _add_to_history(phone, bot_msg=ELIGIBILITY_TELL_ME_MORE_MSG)
+            faq_answer = get_faq_answer(text)
+            if faq_answer:
+                await mcp_wa_send(phone, faq_answer)
+                _add_to_history(phone, bot_msg=faq_answer)
+            else:
+                await mcp_wa_send(phone, ELIGIBILITY_TELL_ME_MORE_MSG)
+                _add_to_history(phone, bot_msg=ELIGIBILITY_TELL_ME_MORE_MSG)
+            sess["_state_handled_question"] = True
             await mcp_wa_send(phone, ELIGIBILITY_PROMPT, buttons=ELIGIBILITY_BUTTONS)
             _add_to_history(phone, bot_msg=ELIGIBILITY_PROMPT)
             sess["_eligibility_mode"] = "ALIGN"

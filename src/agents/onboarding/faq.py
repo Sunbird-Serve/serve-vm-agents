@@ -92,7 +92,10 @@ async def compose_answer(query: str, context_entries: List[Dict]) -> str:
     """Use MCP faq.answer to compose a concise answer + bridge; fall back to KB text."""
     # Build a simple policy context for safety and clarity
     policy_ctx = (
-        "weekday-only 8–15; 100% volunteer no pay; ~2 hrs/week split across days; smartphone or laptop acceptable"
+        "weekday-only 8–15; 100% volunteer (no pay); ~2 hrs/week; "
+        "tablet or laptop required (no smartphones); "
+        "video shown is a real volunteer-led class demo to show how SERVE sessions feel; "
+        "everything happens here on WhatsApp; do not mention orientation, scheduling, or internal stages"
     )
     try:
         resp = await _mcp_call(

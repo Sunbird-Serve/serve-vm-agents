@@ -17,6 +17,9 @@ from ..messages import (
 )
 
 log = logging.getLogger(__name__)
+VIDEO_ABOUT_MSG = (
+    "This is a real class demo led by a volunteer, shared to give you a feel for how a SERVE session looks."
+)
 
 
 def classify_video_intent(text: str) -> str:
@@ -38,6 +41,18 @@ def classify_video_intent(text: str) -> str:
     
     # Default: proceed anyway (don't block) - treat any text as valid response
     return "VIDEO_DONE"
+
+
+def is_video_about_question(text: str) -> bool:
+    """Detect questions about what the video/class is about."""
+    if not text:
+        return False
+    text_lower = text.lower()
+    if "video" not in text_lower and "class" not in text_lower:
+        return False
+    if "?" in text_lower:
+        return True
+    return bool(re.search(r"\b(what|how|is|this|about|shown|demo)\b", text_lower))
 
 
 async def handle_video(
@@ -273,6 +288,12 @@ async def handle_video(
         await mcp_wa_send(phone, stop_msg)
         _add_to_history(phone, bot_msg=stop_msg)
         return
+    
+    # If user asked about the video, answer briefly before proceeding
+    if is_video_about_question(text):
+        await mcp_wa_send(phone, VIDEO_ABOUT_MSG)
+        _add_to_history(phone, bot_msg=VIDEO_ABOUT_MSG)
+        sess["_state_handled_question"] = True
     
     # Send VIDEO_DONE_PROMPT before proceeding
     log.info(f"[VIDEO] Sending done prompt to {phone}")
