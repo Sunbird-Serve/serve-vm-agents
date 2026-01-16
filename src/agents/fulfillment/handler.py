@@ -296,8 +296,9 @@ async def nominate_selected_need(need_id: str, volunteer_id: str, wa_phone: str)
     try:
         # Prepare MCP tool arguments as per serve.fulfill.nominate contract
         arguments = {
-            "need_id": need_id,
-            "volunteer_id": volunteer_id,
+            "needId": need_id,
+            "nominatedUserId": volunteer_id,
+            "source": "whatsapp",
             "idempotency_key": idempotency_key,
         }
         
@@ -751,8 +752,11 @@ async def handle_fulfill_nominate(phone: str, text: str, session: dict):
         await handle_fulfill_list(phone, "__kick__", session)
         return
     
-    # Get volunteer_id (SERVE osid) from registration tool_state (DB)
+    # Get volunteer_id (SERVE osid) from session/profile first, then registration tool_state (DB)
     volunteer_id = None
+    profile = session.get("profile", {})
+    if isinstance(profile, dict):
+        volunteer_id = profile.get("volunteer_id") or profile.get("serve_volunteer_id")
     try:
         from storage.db import get_db_session
         from sqlalchemy import select
@@ -767,7 +771,7 @@ async def handle_fulfill_nominate(phone: str, text: str, session: dict):
                 tool_state = result[0]
                 reg = tool_state.get("registration", {})
                 serve_block = reg.get("serve", {}) if isinstance(reg, dict) else {}
-                volunteer_id = serve_block.get("volunteer_id")
+                volunteer_id = volunteer_id or serve_block.get("volunteer_id")
     except Exception as e:
         log.warning(f"[FULFILLMENT] Failed to load volunteer_id from tool_state for {phone}: {e}", exc_info=True)
     
@@ -792,8 +796,16 @@ async def handle_fulfill_nominate(phone: str, text: str, session: dict):
         # Success
         log.info(f"[FULFILLMENT] Nomination successful for {phone}, need_id: {need_id}")
         
-        # Send success message
-        success_msg_id = await mcp_wa_send(phone, FULFILL_CONFIRM_SUCCESS_MSG)
+        # Send success message with need title
+        need_title = None
+        if isinstance(fulfillment_data, dict):
+            selected_need = fulfillment_data.get("selected_need")
+            if isinstance(selected_need, dict):
+                need_title = selected_need.get("title")
+        if not need_title:
+            need_title = "the selected opportunity"
+        success_msg = FULFILL_CONFIRM_SUCCESS_MSG.format(need_title=need_title)
+        success_msg_id = await mcp_wa_send(phone, success_msg)
         
         # Persistence: store successful nomination
         try:
