@@ -273,8 +273,13 @@ async def handle_selection_wait_video_done(phone: str, text: str, session: dict)
     # Check for done/confirmation keywords
     done_keywords = ["done", "watched", "yes", "ok", "okay", "completed", "finished", "viewed"]
     skip_keywords = ["skip", "cannot", "can't", "cant", "not now", "later"]
+    appreciation_keywords = [
+        "nice", "good", "great", "awesome", "love", "loved", "thanks",
+        "thank you", "thanku", "cool", "amazing"
+    ]
     
-    if any(keyword in text_lower for keyword in done_keywords) or any(keyword in text_lower for keyword in skip_keywords):
+    is_appreciation = any(keyword in text_lower for keyword in appreciation_keywords)
+    if any(keyword in text_lower for keyword in done_keywords) or any(keyword in text_lower for keyword in skip_keywords) or is_appreciation:
         # Mark response as received to prevent timeout
         session["_selection_video_response_received"] = True
         session["ts"] = time.time()
@@ -283,6 +288,11 @@ async def handle_selection_wait_video_done(phone: str, text: str, session: dict)
         
         # Proceed to followup and about-you question
         log.info(f"[SELECTION] Video acknowledged by {phone}, proceeding")
+        
+        # If they expressed appreciation, acknowledge warmly before proceeding
+        if is_appreciation:
+            mcp_wa_send = _get_mcp_wa_send()
+            await mcp_wa_send(phone, "Glad you liked it!")
         
         now_iso = datetime.now(timezone.utc).isoformat()
         

@@ -26,7 +26,7 @@ from jsonschema import ValidationError
 from .config import settings
 from .messages import (
     WELCOME, WELCOME_MAYBE_LATER,
-    WELCOME_INTRO, WELCOME_INSTRUCTIONS, GENERIC_DEFERRED_MSG, WELCOME_SERVE_OVERVIEW, WELCOME_CONSENT_ACK,
+    WELCOME_INTRO, WELCOME_INSTRUCTIONS, GENERIC_DEFERRED_MSG, WELCOME_SERVE_OVERVIEW, WELCOME_CONSENT_ACK, WELCOME_CONSENT_REMINDER,
     INTENT_PROMPT, INTENT_EXIT,
     ELIGIBILITY_PROMPT, ELIGIBILITY_EXIT,
     ELIGIBILITY_INTRO, ELIGIBILITY_Q1, ELIGIBILITY_Q2, ELIGIBILITY_Q3,
@@ -2482,6 +2482,65 @@ async def _handle(phone: str, text: str):
         SESSIONS[phone] = sess
         await _reask_pending_question(phone, state, sess)
 
+    # Shared ambiguity resolver (split answer from mixed Q+A)
+    def _has_answer_indicators(text_value: str) -> bool:
+        if not text_value:
+            return False
+        text_lower = text_value.lower()
+        return bool(
+            re.search(r"\b(yes|yeah|yep|no|nah|ready|continue|ok|okay|sure|done)\b", text_lower)
+            or "@" in text_lower
+            or re.search(r"\b\d{10}\b", text_lower)
+            or re.search(r"\b(my name is|i am|i'm|im|name is)\b", text_lower)
+            or re.search(r"\b(mon(day)?|tue(sday)?|wed(nesday)?|thu(rsday)?|fri(day)?|sat(urday)?|sun(day)?|weekend|weekday|morning|afternoon|evening)\b", text_lower)
+        )
+    
+    def _split_question_and_answer(text_value: str) -> tuple[str | None, str, bool]:
+        if not text_value or not _is_question(text_value):
+            return (None, text_value, False)
+        if len(text_value.split()) < 6:
+            return (None, text_value, False)
+        if not _has_answer_indicators(text_value):
+            return (None, text_value, False)
+        last_q = text_value.rfind("?")
+        if last_q == -1:
+            return (None, text_value, False)
+        question_part = text_value[: last_q + 1].strip()
+        answer_part = text_value[last_q + 1 :].strip()
+        if answer_part and _has_answer_indicators(answer_part):
+            return (question_part, answer_part, True)
+        return (None, text_value, False)
+    
+    mixed_question, text_for_state, is_mixed_qna = (None, text, False)
+    if text != "__kick__":
+        mixed_question, text_for_state, is_mixed_qna = _split_question_and_answer(text)
+    
+    if is_mixed_qna and mixed_question:
+        answered = False
+        if state == "WELCOME":
+            welcome_faq = [
+                (r"\b(what is this|what is serve|what is this about|about serve)\b", "This is SERVE’s volunteer onboarding on WhatsApp — I’ll guide you step by step."),
+                (r"\b(how long|how much time|how long will this take)\b", "About 5–10 minutes if you’re ready now."),
+                (r"\b(what will you ask|what do i need to do|what is the process)\b", "Just a few basics — your interest, availability, and contact details."),
+                (r"\b(is this paid|paid role|payment|stipend)\b", "It’s a volunteer role with no payment."),
+                (r"\b(laptop|tablet|device|phone)\b", "You’ll need a tablet or laptop with stable internet for classes."),
+            ]
+            for pattern, answer in welcome_faq:
+                if re.search(pattern, text_lower_global):
+                    await mcp_wa_send(phone, answer)
+                    _add_to_history(phone, bot_msg=answer)
+                    answered = True
+                    break
+        if not answered:
+            answered = await _maybe_answer_global_faq(mixed_question)
+        if not answered:
+            fallback = "I can share more on that soon — for now, let’s continue."
+            await mcp_wa_send(phone, fallback)
+            _add_to_history(phone, bot_msg=fallback)
+        sess["_state_handled_question"] = True
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+    
     # Lightweight FAQ intercept (strict: only explicit questions)
     # Behavior: answer FAQ and then continue normal state flow (no pause),
     # except when _reask_pending_question explicitly handles the follow-up and returns True.
@@ -2495,6 +2554,7 @@ async def _handle(phone: str, text: str):
         and _is_question(text)
         and state not in {"WELCOME", "VIDEO", "ELIGIBILITY"}
         and not sess.get("_state_handled_question")
+        and not is_mixed_qna
     ):
         # If we're in commitment (ELIGIBILITY_PART2) and the question is about "same day 2 hours",
         # skip FAQ so the commitment handler can respond with the correct policy clarification.
@@ -2519,7 +2579,7 @@ async def _handle(phone: str, text: str):
             if is_yes_response(text) or is_no_response(text):
                 should_skip_parse = True
         if not should_skip_parse:
-            parsed = await mcp_onboarding_parse(text, state=state)
+            parsed = await mcp_onboarding_parse(text_for_state, state=state)
         # parsed example fields:
         # intents: [..], consent: {value, confidence}, constraints: {weekday_ok, weekend_only, confidence}
         # availability: [{day, start, end, confidence}]
@@ -2669,7 +2729,7 @@ async def _handle(phone: str, text: str):
             return
         else:
             # Welcome FAQ handling: answer common questions and keep in WELCOME
-            if _is_question(text):
+            if _is_question(text) and not sess.get("_state_handled_question"):
                 welcome_faq = [
                     (r"\b(what is this|what is serve|what is this about|about serve)\b", "This is SERVE’s volunteer onboarding on WhatsApp — I’ll guide you step by step."),
                     (r"\b(how long|how much time|how long will this take)\b", "About 5–10 minutes if you’re ready now."),
@@ -2710,12 +2770,12 @@ async def _handle(phone: str, text: str):
     
     # ========== INTENT STATE (State 2: Purpose Acknowledgement) ==========
     if state == "INTENT":
-        await handle_intent(phone, text, sess, profile)
+        await handle_intent(phone, text_for_state, sess, profile)
         return
     
     # ========== VIDEO STATE (State 2.5: Show class preview video) ==========
     if state == "VIDEO":
-        await handle_video(phone, text, sess, profile)
+        await handle_video(phone, text_for_state, sess, profile)
         updated_sess = SESSIONS.get(phone, sess)
         if _is_question(text) and not updated_sess.get("_state_handled_question"):
             answered = await _maybe_answer_global_faq(text)
@@ -2725,17 +2785,17 @@ async def _handle(phone: str, text: str):
     
     # ========== NEEDS_PREVIEW STATE (State 2.7: Show needs preview) ==========
     if state == "NEEDS_PREVIEW":
-        await handle_needs_preview(phone, text, sess, profile)
+        await handle_needs_preview(phone, text_for_state, sess, profile)
         return
     
     # ========== CONTINUE_CONFIRM STATE (State 2.8: Confirm continuation with time expectation) ==========
     if state == "CONTINUE_CONFIRM":
-        await handle_continue_confirm(phone, text, sess, profile)
+        await handle_continue_confirm(phone, text_for_state, sess, profile)
         return
     
     # ========== ELIGIBILITY STATE (State 3: Eligibility Check) ==========
     if state == "ELIGIBILITY":
-        await handle_eligibility(phone, text, sess, profile)
+        await handle_eligibility(phone, text_for_state, sess, profile)
         updated_sess = SESSIONS.get(phone, sess)
         if _is_question(text) and not updated_sess.get("_state_handled_question"):
             answered = await _maybe_answer_global_faq(text)
@@ -2747,7 +2807,7 @@ async def _handle(phone: str, text: str):
     if state == "IDENTITY":
         try:
             log.info(f"[HANDLE] Calling handle_identity for {phone}, text='{text[:50]}...'")
-            await handle_identity(phone, text, sess, profile)
+            await handle_identity(phone, text_for_state, sess, profile)
             log.info(f"[HANDLE] handle_identity completed for {phone}")
         except Exception as e:
             log.error(f"[HANDLE] Error in handle_identity for {phone}: {e}", exc_info=True)
@@ -2758,13 +2818,13 @@ async def _handle(phone: str, text: str):
     if state == "PREFERENCES":
         log.info(f"[HANDLE] Calling handle_preferences for {phone}, text='{text[:50]}...', "
                 f"state={sess.get('state')}, _prefs_confirmed={sess.get('_prefs_confirmed')}")
-        await handle_preferences(phone, text, sess, profile)
+        await handle_preferences(phone, text_for_state, sess, profile)
         log.info(f"[HANDLE] handle_preferences returned for {phone}, new_state={sess.get('state')}")
         return
     
     # ========== QA_WINDOW STATE (State 6: Questions & Answers) ==========
     if state == "QA_WINDOW":
-        await handle_qa_window(phone, text, sess, profile)
+        await handle_qa_window(phone, text_for_state, sess, profile)
         return
     
     # ========== REJECTED STATE (Eligibility Not Met) ==========

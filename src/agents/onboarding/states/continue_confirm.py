@@ -5,7 +5,7 @@ Confirm continuation with time expectation (10 minutes).
 import logging
 import time
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 
 from ..messages import (
@@ -182,12 +182,15 @@ async def handle_continue_confirm(
         _add_to_history(phone, bot_msg=CONTINUE_CONFIRM_DEFERRED_MSG)
         
         volunteer_id = profile.get("uuid") or phone
+        until_date = datetime.now(timezone.utc) + timedelta(days=5)
+        until_iso = until_date.isoformat()
+        idempotency_key = f"{volunteer_id}_CONTINUE_DEFER_{int(time.time())}"
         try:
             await mcp_deferral_create(
                 volunteer_id=volunteer_id,
                 reason="user_requested_later",
-                until_iso=None,
-                idempotency_key=None
+                until_iso=until_iso,
+                idempotency_key=idempotency_key
             )
         except Exception as e:
             log.warning(f"[CONTINUE_CONFIRM] Failed to create deferral: {e}")
@@ -235,6 +238,8 @@ async def handle_continue_confirm(
         except Exception as e:
             log.warning(f"[CONTINUE_CONFIRM] Failed to persist: {e}", exc_info=True)
         
+        sess["_deferred_prev_state"] = "CONTINUE_CONFIRM"
+        sess["_deferred_reason"] = "user_requested_later"
         sess["state"] = "DEFERRED"
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
@@ -326,12 +331,15 @@ async def handle_continue_confirm(
         _add_to_history(phone, bot_msg=CONTINUE_CONFIRM_DEFERRED_MSG)
         
         volunteer_id = profile.get("uuid") or phone
+        until_date = datetime.now(timezone.utc) + timedelta(days=5)
+        until_iso = until_date.isoformat()
+        idempotency_key = f"{volunteer_id}_CONTINUE_DEFER_{int(time.time())}"
         try:
             await mcp_deferral_create(
                 volunteer_id=volunteer_id,
                 reason="user_requested_later",
-                until_iso=None,
-                idempotency_key=None
+                until_iso=until_iso,
+                idempotency_key=idempotency_key
             )
         except Exception as e:
             log.warning(f"[CONTINUE_CONFIRM] Failed to create deferral: {e}")
@@ -379,6 +387,8 @@ async def handle_continue_confirm(
         except Exception as e:
             log.warning(f"[CONTINUE_CONFIRM] Failed to persist: {e}", exc_info=True)
         
+        sess["_deferred_prev_state"] = "CONTINUE_CONFIRM"
+        sess["_deferred_reason"] = "user_requested_later"
         sess["state"] = "DEFERRED"
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
