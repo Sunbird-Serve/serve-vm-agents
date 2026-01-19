@@ -13,6 +13,7 @@ from typing import Dict, Any, Optional
 
 from ..messages import (
     VIDEO_INTRO,
+    VIDEO_FOOTER,
     VIDEO_DONE_PROMPT,
 )
 
@@ -176,6 +177,10 @@ async def handle_video(
             except:
                 pass
         
+        # Footer: prompt to reply Done
+        await mcp_wa_send(phone, VIDEO_FOOTER)
+        _add_to_history(phone, bot_msg=VIDEO_FOOTER)
+        
         # Persistence: Update state and tool_state
         now_iso = datetime.now(timezone.utc).isoformat()
         try:
@@ -227,25 +232,6 @@ async def handle_video(
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         
-        # Schedule 40-second timeout to auto-proceed if no response
-        async def video_timeout_handler():
-            await asyncio.sleep(40.0)
-            
-            # Check if still in VIDEO state and no response received
-            current_sess = SESSIONS.get(phone)
-            if (current_sess and
-                current_sess.get("state") == "VIDEO" and
-                not current_sess.get("_video_response_received")):
-                log.info(f"[VIDEO] 40-second timeout reached, auto-proceeding to NEEDS_PREVIEW for {phone}")
-                current_sess["state"] = "NEEDS_PREVIEW"
-                current_sess["sub_state"] = "NEEDS_PREVIEW"
-                current_sess["ts"] = time.time()
-                SESSIONS[phone] = current_sess
-                # Trigger NEEDS_PREVIEW state handler
-                await _handle(phone, "__kick__")
-        
-        # Create background task for timeout (non-blocking)
-        asyncio.create_task(video_timeout_handler())
         return
     
     # Handle user response - send VIDEO_DONE_PROMPT, then proceed to NEEDS_PREVIEW
@@ -363,10 +349,11 @@ async def handle_video(
     except Exception as e:
         log.warning(f"[VIDEO] Failed to persist: {e}", exc_info=True)
     
-    # Any other response -> proceed to NEEDS_PREVIEW (don't block)
-    log.info(f"[VIDEO] Proceeding to NEEDS_PREVIEW after user response")
-    sess["state"] = "NEEDS_PREVIEW"
-    sess["sub_state"] = "NEEDS_PREVIEW"
+    # Route to next state (default NEEDS_PREVIEW)
+    next_state = sess.pop("_video_next_state", "NEEDS_PREVIEW")
+    log.info(f"[VIDEO] Proceeding to {next_state} after user response")
+    sess["state"] = next_state
+    sess["sub_state"] = next_state
     sess["ts"] = time.time()
     SESSIONS[phone] = sess
     await _handle(phone, "__kick__")

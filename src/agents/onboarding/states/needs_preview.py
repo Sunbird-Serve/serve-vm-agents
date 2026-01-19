@@ -325,7 +325,13 @@ async def handle_needs_preview(
             _add_to_history(phone, bot_msg=NEEDS_PREVIEW_ERROR_MSG)
             message_id = error_msg_id or header_msg_id
         
-        # Add 10-second delay before transitioning to CONTINUE_CONFIRM
+        # Optional note for requirements preview (only for peek flow)
+        if sess.get("_needs_preview_note"):
+            await mcp_wa_send(phone, sess["_needs_preview_note"])
+            _add_to_history(phone, bot_msg=sess["_needs_preview_note"])
+            sess.pop("_needs_preview_note", None)
+
+        # Add 10-second delay before transitioning
         log.info(f"[NEEDS_PREVIEW] Waiting 10 seconds before continuing to {phone}")
         await asyncio.sleep(10)
         
@@ -379,10 +385,11 @@ async def handle_needs_preview(
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         
-        # Immediately transition to CONTINUE_CONFIRM (don't wait for user response)
-        log.info(f"[NEEDS_PREVIEW] Transitioning to CONTINUE_CONFIRM")
-        sess["state"] = "CONTINUE_CONFIRM"
-        sess["sub_state"] = "CONTINUE_CONFIRM"
+        # Transition to next state (default CONTINUE_CONFIRM)
+        next_state = sess.pop("_needs_preview_next_state", "CONTINUE_CONFIRM")
+        log.info(f"[NEEDS_PREVIEW] Transitioning to {next_state}")
+        sess["state"] = next_state
+        sess["sub_state"] = next_state
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         await _handle(phone, "__kick__")
@@ -390,8 +397,9 @@ async def handle_needs_preview(
     
     # Should not reach here (auto-transitions on entry)
     # But handle gracefully if user sends a message
-    log.warning(f"[NEEDS_PREVIEW] Received message in NEEDS_PREVIEW after preview sent, transitioning to CONTINUE_CONFIRM")
-    sess["state"] = "CONTINUE_CONFIRM"
+    next_state = sess.pop("_needs_preview_next_state", "CONTINUE_CONFIRM")
+    log.warning(f"[NEEDS_PREVIEW] Received message in NEEDS_PREVIEW after preview sent, transitioning to {next_state}")
+    sess["state"] = next_state
     sess["ts"] = time.time()
     SESSIONS[phone] = sess
     await _handle(phone, "__kick__")

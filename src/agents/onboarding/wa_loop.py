@@ -26,7 +26,8 @@ from jsonschema import ValidationError
 from .config import settings
 from .messages import (
     WELCOME, WELCOME_MAYBE_LATER,
-    WELCOME_INTRO, WELCOME_INSTRUCTIONS, GENERIC_DEFERRED_MSG, WELCOME_SERVE_OVERVIEW, WELCOME_CONSENT_ACK, WELCOME_CONSENT_REMINDER,
+    WELCOME_INTRO, WELCOME_INSTRUCTIONS, WELCOME_START_BUTTONS, WELCOME_VIDEO_INTRO, WELCOME_VIDEO_FOOTER,
+    GENERIC_DEFERRED_MSG, WELCOME_SERVE_OVERVIEW, WELCOME_CONSENT_ACK, WELCOME_CONSENT_REMINDER,
     INTENT_PROMPT, INTENT_EXIT,
     ELIGIBILITY_PROMPT, ELIGIBILITY_EXIT,
     ELIGIBILITY_INTRO, ELIGIBILITY_Q1, ELIGIBILITY_Q2, ELIGIBILITY_Q3,
@@ -59,6 +60,9 @@ from .messages import (
     ORIENT_PROPOSAL_ERROR, ORIENT_SLOT_UNAVAILABLE,
     ORIENT_BOOKING_CONFIRM, ORIENT_BOOKING_FAILURE,
     YES_WORDS, NO_WORDS, MAYBE_LATER, CONFIRM_WORDS, EDIT_WORDS,
+    VIDEO_INTRO, VIDEO_FOOTER, VIDEO_DONE_PROMPT, VIDEO_ERROR_MSG,
+    PEEK_VIDEO_PROMPT,
+    PEEK_NEEDS_PROMPT, PEEK_REQUIREMENTS_NOTE, PEEK_SKIP_MESSAGE,
     format_message, format_subjects_list
 )
 from .validators import is_yes_response, is_no_response, is_defer_response, is_resume_response, normalize_phone
@@ -321,6 +325,20 @@ INTENT_RESPONSE_SCHEMA = {
     },
 }
 
+PEEK_PLANNER_SCHEMA = {
+    "type": "object",
+    "required": ["action", "tone_reply"],
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["SHOW_VIDEO", "SHOW_NEEDS", "SHOW_BOTH", "SKIP", "CLARIFY"],
+        },
+        "tone_reply": {"type": "string"},
+        "confidence": {"type": ["number", "string"]},
+    },
+    "additionalProperties": False,
+}
+
 PREFS_INTERPRET_RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -393,6 +411,36 @@ async def _llm_call_structured(
         else:
             raise ValueError(f"LLM response failed schema validation: {exc.message}") from exc
     return parsed
+
+
+async def _peek_planner_llm(user_text: str, stage: str) -> dict:
+    if stage == "VIDEO":
+        stage_prompt = "The user was asked if they'd like to watch a short class glimpse."
+        allowed = "- SHOW_VIDEO: user wants to watch the class video\n- SKIP: user wants to skip\n- CLARIFY: unclear response"
+    else:
+        stage_prompt = "The user was asked if they'd like to see a quick preview of current requirements."
+        allowed = "- SHOW_NEEDS: user wants to see requirements preview\n- SKIP: user wants to skip\n- CLARIFY: unclear response"
+    prompt = (
+        "You are helping decide the next step in a volunteer onboarding flow.\n"
+        f"{stage_prompt}\n"
+        "Allowed actions:\n"
+        f"{allowed}\n"
+        "Return ONLY valid JSON with keys: action, tone_reply.\n"
+        "tone_reply should be a short, friendly response (1-2 lines).\n"
+        "If user is unclear, tone_reply should ask a concise clarification."
+    )
+    messages = [
+        {"role": "system", "content": MASTER_SYSTEM_PROMPT},
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": user_text},
+    ]
+    return await _llm_call_structured(
+        messages,
+        schema=PEEK_PLANNER_SCHEMA,
+        temperature=0.2,
+        max_tokens=120,
+        timeout=12,
+    )
 
 
 def _extract_llm_text(result: dict) -> str:
@@ -766,6 +814,54 @@ async def mcp_wa_send_class_video(to_phone: str) -> Optional[str]:
         
     except Exception as e:
         log.error(f"[VIDEO] Failed to send class video: {e}")
+        return None
+
+
+async def mcp_wa_send_welcome_video(to_phone: str) -> Optional[str]:
+    """
+    Send welcome video to WhatsApp recipient.
+    The MCP server handles loading and sending the video file internally.
+    
+    Args:
+        to_phone: Recipient phone number (required)
+        
+    Returns:
+        message_id if successful, None otherwise
+    """
+    log.info(f"[VIDEO] Requesting welcome video send to {to_phone}")
+    
+    try:
+        result = await _mcp_call(
+            "serve.whatsapp.send_welcome_video",
+            {
+                "to_phone": to_phone
+            },
+            timeout=60  # Longer timeout for file upload and send
+        )
+        
+        if isinstance(result, dict):
+            if result.get("ok") is True:
+                message_id = result.get("wa_message_id") or result.get("message_id") or result.get("id") or result.get("wamid")
+                if message_id:
+                    log.info(f"[VIDEO] MCP tool sent welcome video successfully, message_id: {message_id}")
+                    return str(message_id)
+                log.info("[VIDEO] MCP tool sent welcome video successfully (ok: true), but no message_id in response")
+                return "success"
+            elif result.get("ok") is False:
+                error_msg = result.get("error") or "Unknown error"
+                log.error(f"[VIDEO] MCP tool failed: {error_msg}")
+                return None
+            else:
+                message_id = result.get("wa_message_id") or result.get("message_id") or result.get("id") or result.get("wamid")
+                if message_id:
+                    log.info(f"[VIDEO] MCP tool sent welcome video (legacy response), message_id: {message_id}")
+                    return str(message_id)
+        
+        log.warning(f"[VIDEO] MCP tool returned unexpected format: {result}")
+        return None
+        
+    except Exception as e:
+        log.error(f"[VIDEO] Failed to send welcome video: {e}")
         return None
 
 
@@ -2552,7 +2648,7 @@ async def _handle(phone: str, text: str):
         and state != "QA_WINDOW"
         and not deferral_like
         and _is_question(text)
-        and state not in {"WELCOME", "VIDEO", "ELIGIBILITY"}
+        and state not in {"WELCOME", "WELCOME_VIDEO", "PEEK_CHOICE", "PEEK_NEEDS_OFFER", "VIDEO", "ELIGIBILITY"}
         and not sess.get("_state_handled_question")
         and not is_mixed_qna
     ):
@@ -2665,7 +2761,7 @@ async def _handle(phone: str, text: str):
 
             # Step 3: Immediately send instructions message
             instructions_msg = WELCOME_INSTRUCTIONS
-            instructions_msg_id = await mcp_wa_send(phone, instructions_msg)
+            instructions_msg_id = await mcp_wa_send(phone, instructions_msg, buttons=WELCOME_START_BUTTONS)
             _add_to_history(phone, bot_msg=instructions_msg)
 
             # Persistence: record welcome text messages in sessions + events
@@ -2752,25 +2848,211 @@ async def _handle(phone: str, text: str):
                         await _handle_offtopic_redirect()
                 
                 # Re-ask how to continue and stay in WELCOME
-                await mcp_wa_send(phone, WELCOME_INSTRUCTIONS)
+                await mcp_wa_send(phone, WELCOME_INSTRUCTIONS, buttons=WELCOME_START_BUTTONS)
                 _add_to_history(phone, bot_msg=WELCOME_INSTRUCTIONS)
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
                 return
             
-            # User replied after welcome message – transition directly to INTENT
-            log.info(f"[GREET] User responded after welcome message, transitioning to INTENT")
-            sess["state"] = "INTENT"
-            sess["sub_state"] = "INTENT"
+            # Handle "I'll do this later" and start flow
+            text_lower = text.lower().strip()
+            if any(phrase in text_lower for phrase in ["i'll do this later", "ill do this later", "later", "not now"]):
+                await mcp_wa_send(phone, GENERIC_DEFERRED_MSG)
+                _add_to_history(phone, bot_msg=GENERIC_DEFERRED_MSG)
+                sess["_deferred_prev_state"] = "WELCOME_VIDEO"
+                sess["_deferred_reason"] = "WELCOME_LATER"
+                sess["state"] = "DEFERRED"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            
+            # Otherwise, start with welcome video
+            log.info(f"[GREET] User responded after welcome message, transitioning to WELCOME_VIDEO")
+            sess["state"] = "WELCOME_VIDEO"
+            sess["sub_state"] = "WELCOME_VIDEO"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
-            # Trigger INTENT state handler
             await _handle(phone, "__kick__")
             return
+    
+    # ========== PEEK_CHOICE STATE (Video/Requirements choice) ==========
+    if state == "PEEK_CHOICE":
+        if text == "__kick__" or not sess.get("_peek_video_prompted"):
+            await mcp_wa_send(phone, PEEK_VIDEO_PROMPT)
+            _add_to_history(phone, bot_msg=PEEK_VIDEO_PROMPT)
+            sess["_peek_video_prompted"] = True
+            sess["_peek_stage"] = "VIDEO"
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+        
+        stage = sess.get("_peek_stage") or "VIDEO"
+        try:
+            plan = await _peek_planner_llm(text, stage=stage)
+            action = (plan.get("action") or "").upper()
+            tone_reply = (plan.get("tone_reply") or "").strip()
+        except Exception as e:
+            log.warning(f"[PEEK_CHOICE] Planner failed: {e}")
+            action = ""
+            tone_reply = ""
+        
+        if tone_reply:
+            await mcp_wa_send(phone, tone_reply)
+            _add_to_history(phone, bot_msg=tone_reply)
+        
+        if stage == "VIDEO":
+            if action == "SHOW_VIDEO":
+                sess["_video_next_state"] = "PEEK_NEEDS_OFFER"
+                sess["state"] = "VIDEO"
+                sess["sub_state"] = "VIDEO"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                await _handle(phone, "__kick__")
+                return
+            if action == "SKIP":
+                sess["state"] = "PEEK_NEEDS_OFFER"
+                sess["sub_state"] = "PEEK_NEEDS_OFFER"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                await _handle(phone, "__kick__")
+                return
+            # CLARIFY or unknown
+            await mcp_wa_send(phone, PEEK_VIDEO_PROMPT)
+            _add_to_history(phone, bot_msg=PEEK_VIDEO_PROMPT)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+
+        # Fallback: if stage not recognized, re-ask
+        await mcp_wa_send(phone, PEEK_VIDEO_PROMPT)
+        _add_to_history(phone, bot_msg=PEEK_VIDEO_PROMPT)
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+        return
+
+    # ========== PEEK_NEEDS_OFFER STATE (Optional requirements preview) ==========
+    if state == "PEEK_NEEDS_OFFER":
+        if text == "__kick__" or not sess.get("_peek_needs_prompted"):
+            await mcp_wa_send(phone, PEEK_NEEDS_PROMPT)
+            _add_to_history(phone, bot_msg=PEEK_NEEDS_PROMPT)
+            sess["_peek_needs_prompted"] = True
+            sess["_peek_stage"] = "NEEDS"
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+        
+        try:
+            plan = await _peek_planner_llm(text, stage="NEEDS")
+            action = (plan.get("action") or "").upper()
+            tone_reply = (plan.get("tone_reply") or "").strip()
+        except Exception as e:
+            log.warning(f"[PEEK_NEEDS_OFFER] Planner failed: {e}")
+            action = ""
+            tone_reply = ""
+        
+        if tone_reply:
+            await mcp_wa_send(phone, tone_reply)
+            _add_to_history(phone, bot_msg=tone_reply)
+        
+        if action == "SHOW_NEEDS":
+            sess["_needs_preview_next_state"] = "ELIGIBILITY"
+            sess["_needs_preview_note"] = PEEK_REQUIREMENTS_NOTE
+            sess["state"] = "NEEDS_PREVIEW"
+            sess["sub_state"] = "NEEDS_PREVIEW"
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            await _handle(phone, "__kick__")
+            return
+        
+        if action == "SKIP":
+            if not tone_reply:
+                await mcp_wa_send(phone, PEEK_SKIP_MESSAGE)
+                _add_to_history(phone, bot_msg=PEEK_SKIP_MESSAGE)
+            sess["state"] = "ELIGIBILITY"
+            sess["sub_state"] = "ELIGIBILITY"
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            await _handle(phone, "__kick__")
+            return
+        
+        # CLARIFY or unknown
+        await mcp_wa_send(phone, PEEK_NEEDS_PROMPT)
+        _add_to_history(phone, bot_msg=PEEK_NEEDS_PROMPT)
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+        return
+    
+    # (PEEK_VIDEO_OFFER state removed; handled by micro-planner in PEEK_CHOICE)
     
     # ========== INTENT STATE (State 2: Purpose Acknowledgement) ==========
     if state == "INTENT":
         await handle_intent(phone, text_for_state, sess, profile)
+        return
+
+    # ========== WELCOME_VIDEO STATE (Quick hello video) ==========
+    if state == "WELCOME_VIDEO":
+        from .messages import QA_STOP_ACK
+        text_lower = text.lower().strip()
+        
+        if text == "__kick__" or not sess.get("_welcome_video_sent"):
+            await mcp_wa_send(phone, WELCOME_VIDEO_INTRO)
+            _add_to_history(phone, bot_msg=WELCOME_VIDEO_INTRO)
+            # Send mp4 using existing class video tool
+            await mcp_wa_send_welcome_video(phone)
+            _add_to_history(phone, bot_msg="[VIDEO]")
+            await mcp_wa_send(phone, WELCOME_VIDEO_FOOTER)
+            _add_to_history(phone, bot_msg=WELCOME_VIDEO_FOOTER)
+            sess["_welcome_video_sent"] = True
+            sess["_welcome_video_response_received"] = False
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+        
+        if re.search(r"\b(stop|unsubscribe|leave|quit|exit|end)\b", text_lower):
+            await mcp_wa_send(phone, QA_STOP_ACK)
+            _add_to_history(phone, bot_msg=QA_STOP_ACK)
+            sess["state"] = "OPTOUT"
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+        
+        # If user asks what the video is about, answer and re-ask footer
+        if "video" in text_lower and _is_question(text):
+            about_msg = "It’s a quick hello from our team and a peek into real classrooms."
+            await mcp_wa_send(phone, about_msg)
+            _add_to_history(phone, bot_msg=about_msg)
+            sess["_state_handled_question"] = True
+            await mcp_wa_send(phone, WELCOME_VIDEO_FOOTER)
+            _add_to_history(phone, bot_msg=WELCOME_VIDEO_FOOTER)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+        
+        done_keywords = ["done", "watched", "viewed", "finished", "completed", "ok", "okay", "yes", "sure", "y", "ready"]
+        appreciation_keywords = ["wow", "nice", "great", "awesome", "love", "loved", "thanks", "thank you", "cool", "amazing"]
+        if any(k in text_lower for k in done_keywords + appreciation_keywords):
+            if any(k in text_lower for k in appreciation_keywords):
+                await mcp_wa_send(phone, "Glad you liked it!")
+                _add_to_history(phone, bot_msg="Glad you liked it!")
+            sess["_welcome_video_response_received"] = True
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            # Send thank-you + intent question, then move to INTENT (prompt already sent)
+            thanks_intent_msg = f"Thank you for watching! {INTENT_PROMPT}"
+            await mcp_wa_send(phone, thanks_intent_msg)
+            _add_to_history(phone, bot_msg=thanks_intent_msg)
+            sess["_intent_prompted"] = True
+            sess["state"] = "INTENT"
+            sess["sub_state"] = "INTENT"
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+        
+        # Ambiguous response: re-ask footer
+        await mcp_wa_send(phone, WELCOME_VIDEO_FOOTER)
+        _add_to_history(phone, bot_msg=WELCOME_VIDEO_FOOTER)
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
         return
     
     # ========== VIDEO STATE (State 2.5: Show class preview video) ==========

@@ -39,16 +39,25 @@ WELCOME_MAYBE_LATER = """No worries! You can come back anytime using this same l
 
 Just send 'start' whenever you're ready."""
 
-WELCOME_INTRO = """Hi! I'm SIA from Project SERVE - an initiative where volunteers connect with children in government schools through live online learning.
+WELCOME_INTRO = """Hi! I'm SIA - I represent eVidyaloka’s Volunteering Team.
 
-Whenever you're ready, just reply and we'll begin."""
+Thank you for being here for the cause of children’s education in government schools, supported through live online teaching.
+It’s my pleasure to welcome you on this journey 🌱"""
 
-WELCOME_INSTRUCTIONS = """You can simply reply with:
-• Hi
-• Yes
-• Ready
+WELCOME_INSTRUCTIONS = """I’m here to guide you through getting started as a volunteer —
+just three simple parts 🙂
 
-and I'll take it from there 🙂"""
+🌼 Say Hello - a warm welcome and a quick peek into real classrooms
+🌱 Find Your Rhythm - figuring out what works for your time and comfort
+🌿 Know You Better - a short, friendly chat about you
+
+About 10 minutes, at your pace.
+You can pause anytime."""
+
+WELCOME_START_BUTTONS = ["Let's start", "I'll do this later"]
+
+WELCOME_VIDEO_INTRO = "Here’s a quick hello from our team 🙂"
+WELCOME_VIDEO_FOOTER = "When you’re done watching, just reply Done."
 
 GENERIC_DEFERRED_MSG = """No worries — take your time.
 Whenever you're ready, just reply here and we'll continue from where you left off."""
@@ -67,7 +76,7 @@ WELCOME_CONSENT_REMINDER = """Quick reminder — shall we continue with the onbo
 
 
 # ---------- Section 2: Intent (Purpose Acknowledgement) ----------
-INTENT_PROMPT = """Amazing! Before we dive in, just curious! What made you check this out today?"""
+INTENT_PROMPT = """Before we continue, I'm just curious - What made you explore this today? 🙂"""
 
 INTENT_FOLLOWUP = """If you'd like, I can quickly walk you through what volunteering with SERVE looks like."""
 
@@ -104,13 +113,19 @@ CLASS_PREVIEW_ASK_BUTTONS = ["Yes, show me", "Skip for now"]
 
 
 # ---------- Section 2.4: Video ----------
-VIDEO_INTRO = """Here's a short glimpse of how a SERVE class usually looks 💛
-Take a look when you're ready — just reply *Done* after watching."""
+VIDEO_INTRO = "Here's a short glimpse of how a class usually looks"
 
-VIDEO_DONE_PROMPT = """Thanks for watching!
-What you just saw is a real SERVE classroom - children learning live with a volunteer like you."""
+VIDEO_FOOTER = "Reply Done when ready"
+
+VIDEO_DONE_PROMPT = "Thanks for watching 🙂"
 
 VIDEO_ERROR_MSG = """I'm having trouble playing the video right now, but we can still continue."""
+
+PEEK_VIDEO_PROMPT = "By the way, would you like to watch a short live class glimpse? You can say yes, skip, or maybe."
+
+PEEK_NEEDS_PROMPT = "Would you like to see a quick preview of current requirements? You can say yes, skip, or maybe."
+PEEK_REQUIREMENTS_NOTE = "This is just a preview — we’ll later look at what works for you."
+PEEK_SKIP_MESSAGE = "From here, we’ll move into a few basics — about 10 minutes, at your pace 🙂"
 
 
 # ---------- Section 2.5: Needs Preview ----------

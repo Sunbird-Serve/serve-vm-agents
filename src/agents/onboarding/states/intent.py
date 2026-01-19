@@ -8,7 +8,7 @@ import re
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
-from ..messages import INTENT_PROMPT, INTENT_FOLLOWUP, INTENT_EXIT, VIDEO_INTRO
+from ..messages import INTENT_PROMPT, INTENT_FOLLOWUP, INTENT_EXIT
 from ..validators import is_no_response
 
 log = logging.getLogger(__name__)
@@ -119,9 +119,9 @@ async def handle_intent(phone: str, text: str, sess: Dict[str, Any], profile: Di
             SESSIONS[phone] = sess
             return
         else:
-            # User wants to continue - transition directly to VIDEO
-            log.info(f"[INTENT] User wants to continue, proceeding to VIDEO for {phone}")
-            sess["state"] = "VIDEO"
+            # User wants to continue - transition to PEEK_CHOICE
+            log.info(f"[INTENT] User wants to continue, proceeding to PEEK_CHOICE for {phone}")
+            sess["state"] = "PEEK_CHOICE"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             await _handle(phone, "__kick__")
@@ -199,23 +199,19 @@ Keep it brief, warm, and genuine. Do not make promises or commitments."""
         
         log.info(f"[INTENT] Generated reflective response: {reflective_response}")
         
-        # Combine reflective response with VIDEO_INTRO into one message
-        combined_message = f"{reflective_response}\n\n{VIDEO_INTRO}"
-        
-        # Send combined message
-        await mcp_wa_send(phone, combined_message)
-        _add_to_history(phone, bot_msg=combined_message)
+        # Send reflective response, then prompt for next step
+        await mcp_wa_send(phone, reflective_response)
+        _add_to_history(phone, bot_msg=reflective_response)
         
         # Mark that VIDEO_INTRO was already sent (so VIDEO state won't send it again)
         sess["_video_intro_sent"] = True
         
     except Exception as e:
         log.warning(f"[INTENT] Failed to generate reflective response: {e}, using fallback")
-        # Fallback: combine fallback response with VIDEO_INTRO
+        # Fallback: send reflection separately
         fallback_response = "That's wonderful to hear."
-        combined_message = f"{fallback_response}\n\n{VIDEO_INTRO}"
-        await mcp_wa_send(phone, combined_message)
-        _add_to_history(phone, bot_msg=combined_message)
+        await mcp_wa_send(phone, fallback_response)
+        _add_to_history(phone, bot_msg=fallback_response)
         
         # Mark that VIDEO_INTRO was already sent
         sess["_video_intro_sent"] = True
@@ -261,10 +257,10 @@ Keep it brief, warm, and genuine. Do not make promises or commitments."""
     except Exception as e:
         log.warning(f"[INTENT] Failed to persist: {e}", exc_info=True)
     
-    # Transition directly to VIDEO (no CLASS_PREVIEW_ASK step)
-    log.info(f"[INTENT] Transitioning directly to VIDEO for {phone}")
-    sess["state"] = "VIDEO"
-    sess["sub_state"] = "VIDEO"
+    # Transition to PEEK_CHOICE
+    log.info(f"[INTENT] Transitioning to PEEK_CHOICE for {phone}")
+    sess["state"] = "PEEK_CHOICE"
+    sess["sub_state"] = "PEEK_CHOICE"
     sess["ts"] = time.time()
     SESSIONS[phone] = sess
     await _handle(phone, "__kick__")
