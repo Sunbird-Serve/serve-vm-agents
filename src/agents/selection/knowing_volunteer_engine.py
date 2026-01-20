@@ -114,7 +114,8 @@ You are guiding a human, not completing a form."""
 def get_knowing_volunteer_prompt(
     next_target: Optional[str] = None,
     collected_fields: Optional[Dict] = None,
-    discussed_fields: Optional[set] = None
+    discussed_fields: Optional[set] = None,
+    preferred_language: Optional[str] = None
 ) -> str:
     """
     Get the KNOWING_VOLUNTEER prompt with optional NEXT_TARGET instruction and profile state.
@@ -147,25 +148,38 @@ def get_knowing_volunteer_prompt(
                 profile_state_section += "Already collected:\n" + "\n".join(collected_list) + "\n"
             if discussed_list:
                 profile_state_section += "Already discussed:\n" + "\n".join(discussed_list) + "\n"
+            if preferred_language:
+                profile_state_section += f"Preferred language from preferences: {preferred_language}\n"
             profile_state_section += "\nIMPORTANT: Do NOT ask about fields that are already collected or discussed.\n"
+    elif preferred_language:
+        profile_state_section = f"\n\nPreferred language from preferences: {preferred_language}\n"
     
     # Build NEXT_TARGET instruction (prominent, at the top)
     next_target_section = ""
     if next_target:
-        target_questions = {
-            "motivation": "Ask: 'What inspired you to consider volunteering?' or similar. Focus on why they want to volunteer, what drew them to SERVE.",
-            "has_teaching_experience": "Ask: 'Do you have any experience teaching or mentoring?' or similar. Focus on prior teaching/mentoring experience (formal or informal).",
-            "teaching_interest": "Ask: 'How do you feel about teaching?' or similar. Focus on their interest in teaching.",
-            "commitment_horizon": "Ask: 'Do you feel you can continue volunteering for about 3 months?' or similar. Ask naturally, do NOT ask for dates or guarantees.",
-            "language": (
-                "Use this exact wording for your question (you may adapt only minor politeness details):\n"
-                "\"Which language are you most comfortable teaching in? If you like, you can even reply in that language — totally optional!\"\n"
-                "\n"
-                "After they answer, you may ask a brief follow-up about how comfortable they feel teaching in that language "
-                "(comfortable / somewhat / unsure), but do NOT change the first question copy.\n"
-                "Do NOT evaluate grammar, fluency, or correctness. Only capture self-reported preference and comfort level "
-                "(language + language_comfort)."
+        if preferred_language:
+            language_instruction = (
+                "Ask about comfort only in the already-chosen language. "
+                f"Use {preferred_language} in your question and offer these options: Read, Write, Speak, All. "
+                "Do NOT ask which language they prefer (it is already known). "
+                "Capture language_comfort as one of: Read, Write, Speak, All (case-insensitive)."
             )
+        else:
+            language_instruction = (
+                "Ask which language they are most comfortable teaching in, in a natural way. "
+                "If they reply, capture language and language_comfort if mentioned. "
+                "Do NOT evaluate grammar, fluency, or correctness."
+            )
+
+        target_questions = {
+            "motivation": "Ask a warm question about why they want to volunteer and what drew them to SERVE.",
+            "teaching_experience": "Ask about any prior teaching or mentoring experience (formal or informal).",
+            "teaching_readiness": (
+                "Ask how they feel about teaching children in a live class. "
+                "You can include cues like: Excited to try / Comfortable with guidance / A bit unsure but open."
+            ),
+            "commitment_horizon": "Ask if they feel they can continue volunteering for about 3 months (no dates or guarantees).",
+            "language": language_instruction
         }
         instruction = target_questions.get(next_target, "")
         if instruction:
@@ -207,10 +221,10 @@ Context:
 - You are NOT evaluating or filtering the volunteer at this stage.
 - You are only understanding these signals:
   1) motivation - why they want to volunteer, what drew them to SERVE
-  2) has_teaching_experience - any prior teaching / mentoring experience (formal or informal)
-  3) teaching_interest - their interest in teaching
-  4) commitment_horizon - willingness to continue for ~3 months (ask naturally, no dates or guarantees)
-  5) language - which language they are comfortable teaching in (they may reply in that language, do NOT evaluate grammar/fluency, only capture preference + comfort level)
+  2) language - comfort in the preferred language (Read/Write/Speak/All)
+  3) commitment_horizon - willingness to continue for ~3 months (ask naturally, no dates or guarantees)
+  4) teaching_readiness - how they feel about teaching children live
+  5) teaching_experience - any prior teaching / mentoring experience (formal or informal)
   
 - The orchestrator controls which question was last asked in this state via `last_agent_prompt`.
 
@@ -221,16 +235,16 @@ Classify the user's latest message and produce:
 - a short, warm WhatsApp-style acknowledgement ("tone_reply").
 
 Allowed intents:
-- MOTIVATION_SHARED   -> explains why they want to volunteer / help / give back
-- EXPERIENCE_SHARED   -> mentions teaching, tutoring, mentoring, training, or helping others learn
-- NO_EXPERIENCE       -> explicitly states no teaching or mentoring experience
-- COMMITMENT_SHARED   -> mentions willingness or inability to continue for ~3 months
-- LANGUAGE_SHARED     -> mentions language preference or comfort level
-- INTEREST_SHARED     -> expresses interest or hesitation about teaching
-- QUERY               -> asks a question instead of answering
-- AMBIGUOUS           -> vague, off-topic, or unclear response
-- DEFERRAL            -> "not now", "later", "idk", "unsure", etc.
-- STOP                -> stop / unsubscribe / leave
+- MOTIVATION_SHARED         -> explains why they want to volunteer / help / give back
+- EXPERIENCE_SHARED         -> mentions teaching, tutoring, mentoring, training, or helping others learn
+- NO_EXPERIENCE             -> explicitly states no teaching or mentoring experience
+- COMMITMENT_SHARED         -> mentions willingness or inability to continue for ~3 months
+- LANGUAGE_SHARED           -> mentions language preference or comfort level
+- TEACHING_READINESS_SHARED -> expresses excitement, comfort, or hesitation about teaching children live
+- QUERY                     -> asks a question instead of answering
+- AMBIGUOUS                 -> vague, off-topic, or unclear response
+- DEFERRAL                  -> "not now", "later", "idk", "unsure", etc.
+- STOP                      -> stop / unsubscribe / leave
 
 Classification rules:
 - Do NOT judge or filter based on experience; beginners are welcome.
@@ -261,11 +275,12 @@ Signal extraction rules:
 - IMPORTANT: If the user's message clearly relates to a signal, extract it. Don't be overly strict.
 
 Allowed values with examples:
-  - has_teaching_experience: true / false / null
+  - teaching_experience: true / false / null
     Examples: "I taught math" -> true, "No experience" -> false, "I'm a teacher" -> true
   
-  - teaching_interest: yes / no / maybe / null
-    Examples: "I love teaching" -> "yes", "Not sure" -> "maybe", "I don't like it" -> "no"
+  - teaching_readiness: "excited" / "comfortable_with_guidance" / "unsure_but_open" / "no" / null
+    Examples: "Excited to try" -> "excited", "Comfortable with guidance" -> "comfortable_with_guidance",
+              "A bit unsure but open" -> "unsure_but_open", "Not interested" -> "no"
   
   - commitment_horizon:
       "yes"    -> confident willingness to continue for ~3 months
@@ -278,11 +293,12 @@ Allowed values with examples:
     Examples: User says "English" -> "English", "I speak Kannada" -> "Kannada", "Telugu is my mother tongue" -> "Telugu"
   
   - language_comfort:
-      "comfortable" -> feels comfortable teaching in the language
-      "somewhat"     -> somewhat comfortable
-      "unsure"       -> uncertain about comfort level
+      "Read"  -> prefers reading
+      "Write" -> prefers writing
+      "Speak" -> prefers speaking
+      "All"   -> comfortable with all
       null
-    Examples: "I'm comfortable" -> "comfortable", "A bit" -> "somewhat", "Not sure" -> "unsure"
+    Examples: "Read" -> "Read", "write" -> "Write", "speak" -> "Speak", "all of them" -> "All"
   
   - motivation: null / help / serve others / empower / uplift / bring joy / happiness / give
     Examples: "I want to help" -> "help", "To serve others" -> "serve others", "To empower students" -> "empower"
@@ -294,12 +310,12 @@ Output ONLY valid JSON (all string values must be in double quotes):
   "tone_reply": "Great to hear about your background! What inspired you to consider teaching?",
 
   "signals": {{
-    "has_teaching_experience": true,
-    "teaching_interest": "maybe",
+    "teaching_experience": true,
+    "teaching_readiness": "unsure_but_open",
     "motivation": "help",
     "commitment_horizon": "yes",
     "language": "English",
-    "language_comfort": "comfortable"
+    "language_comfort": "All"
   }}
 }}
 
@@ -313,7 +329,7 @@ IMPORTANT JSON rules:
 
 
 # Ordered list of rubrics to fill (deterministic questioning)
-RUBRIC_ORDER = ["motivation", "has_teaching_experience", "teaching_interest", "commitment_horizon", "language"]
+RUBRIC_ORDER = ["motivation", "language", "commitment_horizon", "teaching_readiness", "teaching_experience"]
 
 # Confidence threshold for trusting new extractions
 LOW_CONF_THRESHOLD = 0.55
@@ -347,7 +363,7 @@ def _get_next_missing_rubric(profile: Dict, discussed_fields: Optional[set] = No
             if profile.get("language") or profile.get("language_comfort"):
                 continue
         else:
-            if profile.get(rubric):
+            if profile.get(rubric) is not None:
                 continue
         
         # This rubric is missing and not discussed - return it
@@ -359,9 +375,10 @@ def _get_next_missing_rubric(profile: Dict, discussed_fields: Optional[set] = No
 # Intent to field mapping (for marking fields as discussed)
 INTENT_TO_FIELD_MAP = {
     "MOTIVATION_SHARED": "motivation",
-    "EXPERIENCE_SHARED": "has_teaching_experience",
-    "NO_EXPERIENCE": "has_teaching_experience",
-    "INTEREST_SHARED": "teaching_interest",
+    "EXPERIENCE_SHARED": "teaching_experience",
+    "NO_EXPERIENCE": "teaching_experience",
+    "TEACHING_READINESS_SHARED": "teaching_readiness",
+    "INTEREST_SHARED": "teaching_readiness",
     "COMMITMENT_SHARED": "commitment_horizon",
     "LANGUAGE_SHARED": "language"
 }
@@ -371,9 +388,9 @@ def init_volunteer_profile() -> Dict:
     """Initialize empty volunteer profile structure"""
     return {
         "motivation": None,
-        "has_teaching_experience": None,
+        "teaching_experience": None,
         "commitment_horizon": None,
-        "teaching_interest": None,
+        "teaching_readiness": None,
         "language": None,
         "language_comfort": None
     }
@@ -409,10 +426,10 @@ def _count_signals_present(profile: Dict) -> int:
     """
     signals = [
         profile.get("motivation"),
-        profile.get("has_teaching_experience"),
+        profile.get("teaching_experience"),
         profile.get("commitment_horizon"),
         profile.get("language") or profile.get("language_comfort"),  # Language signal counts if either field is present
-        profile.get("teaching_interest")
+        profile.get("teaching_readiness")
     ]
     
     count = 0
@@ -548,13 +565,16 @@ async def run_knowing_volunteer_step(
     
     log.info(f"[KNOWING_VOLUNTEER] Before LLM call: next_target={next_target}, collected={list(collected_fields.keys())}, discussed={list(discussed_fields)}, missing={missing_fields}")
     
+    preferred_language = session.get("profile", {}).get("preferences", {}).get("language")
+
     # Build messages with dynamic prompt (include profile state)
     messages = [
         {"role": "system", "content": MASTER_SYSTEM_PROMPT},
         {"role": "system", "content": get_knowing_volunteer_prompt(
             next_target=next_target,
             collected_fields=collected_fields,
-            discussed_fields=discussed_fields
+            discussed_fields=discussed_fields,
+            preferred_language=preferred_language
         )}
     ]
     
@@ -590,8 +610,8 @@ async def run_knowing_volunteer_step(
             "signals": {
                 "type": "object",
                 "properties": {
-                    "has_teaching_experience": {"type": ["boolean", "null"]},
-                    "teaching_interest": {"type": ["string", "null"]},
+                    "teaching_experience": {"type": ["boolean", "null"]},
+                    "teaching_readiness": {"type": ["string", "null"]},
                     "motivation": {"type": ["string", "null"]},
                     "commitment_horizon": {"type": ["string", "null"]},
                     "language": {"type": ["string", "null"]},
@@ -653,10 +673,10 @@ async def run_knowing_volunteer_step(
         # Repair common JSON issues before parsing
         # Fix unquoted string values (e.g., maybe -> "maybe", yes -> "yes", no -> "no")
         repaired_text = raw_text
-        # Replace unquoted maybe/yes/no in teaching_interest field
+        # Replace unquoted string values in teaching_readiness field
         repaired_text = re.sub(
-            r'"teaching_interest"\s*:\s*(maybe|yes|no)(?=\s*[,}])',
-            r'"teaching_interest": "\1"',
+            r'"teaching_readiness"\s*:\s*(excited|comfortable_with_guidance|unsure_but_open|no)(?=\s*[,}])',
+            r'"teaching_readiness": "\1"',
             repaired_text,
             flags=re.IGNORECASE
         )
@@ -676,7 +696,7 @@ async def run_knowing_volunteer_step(
         )
         # Replace unquoted string values in language_comfort field
         repaired_text = re.sub(
-            r'"language_comfort"\s*:\s*(comfortable|somewhat|unsure)(?=\s*[,}])',
+            r'"language_comfort"\s*:\s*(read|write|speak|all)(?=\s*[,}])',
             r'"language_comfort": "\1"',
             repaired_text,
             flags=re.IGNORECASE
@@ -735,6 +755,34 @@ async def run_knowing_volunteer_step(
         tone_reply = _strip_emojis(tone_reply)
     
     signals = result.get("signals", {})
+    if isinstance(signals, dict):
+        comfort = signals.get("language_comfort")
+        if isinstance(comfort, str):
+            comfort_norm = comfort.strip().lower()
+            comfort_map = {
+                "read": "Read",
+                "write": "Write",
+                "speak": "Speak",
+                "all": "All",
+            }
+            if comfort_norm in comfort_map:
+                signals["language_comfort"] = comfort_map[comfort_norm]
+        # Backward-compat: map old keys to new ones if present
+        if "teaching_experience" not in signals and "has_teaching_experience" in signals:
+            signals["teaching_experience"] = signals.get("has_teaching_experience")
+        if "teaching_readiness" not in signals and "teaching_interest" in signals:
+            interest = signals.get("teaching_interest")
+            if isinstance(interest, str):
+                interest_norm = interest.strip().lower()
+                readiness_map = {
+                    "yes": "excited",
+                    "maybe": "unsure_but_open",
+                    "no": "no",
+                }
+                if interest_norm in readiness_map:
+                    signals["teaching_readiness"] = readiness_map[interest_norm]
+            elif interest is None:
+                signals["teaching_readiness"] = None
     
     # Get expected target (rubric we were aiming for this turn)
     expected_target = session["tool_state"]["selection"].get("expected_target")
@@ -775,15 +823,9 @@ async def run_knowing_volunteer_step(
             else:
                 signals[expected_target] = None
             
-            # Set a simple clarification question for this target
-            if expected_target == "commitment_horizon":
-                tone_reply = "Just to confirm — do you feel you could continue volunteering for about 3 months?"
-            elif expected_target == "language":
-                tone_reply = "Just to confirm — which language would you feel most comfortable teaching in?"
-            else:
-                # Fallback clarification for any other rubric
-                if not tone_reply or "?" not in tone_reply:
-                    tone_reply = "Could you clarify that a bit more?"
+            # Keep the LLM's tone_reply (no hardcoded follow-up)
+            if not tone_reply:
+                tone_reply = "I see. Could you tell me a bit more?"
             
             # Increment low confidence streak
             low_conf_streak += 1
@@ -800,15 +842,15 @@ async def run_knowing_volunteer_step(
         signals_extracted["motivation"] = profile["motivation"]
         log.info(f"[KNOWING_VOLUNTEER] Extracted motivation: {profile['motivation']}")
     
-    if signals.get("has_teaching_experience") is not None and profile.get("has_teaching_experience") is None:
-        profile["has_teaching_experience"] = signals.get("has_teaching_experience")
-        signals_extracted["has_teaching_experience"] = profile["has_teaching_experience"]
-        log.info(f"[KNOWING_VOLUNTEER] Extracted has_teaching_experience: {profile['has_teaching_experience']}")
+    if signals.get("teaching_experience") is not None and profile.get("teaching_experience") is None:
+        profile["teaching_experience"] = signals.get("teaching_experience")
+        signals_extracted["teaching_experience"] = profile["teaching_experience"]
+        log.info(f"[KNOWING_VOLUNTEER] Extracted teaching_experience: {profile['teaching_experience']}")
     
-    if signals.get("teaching_interest") is not None and profile.get("teaching_interest") is None:
-        profile["teaching_interest"] = signals.get("teaching_interest")
-        signals_extracted["teaching_interest"] = profile["teaching_interest"]
-        log.info(f"[KNOWING_VOLUNTEER] Extracted teaching_interest: {profile['teaching_interest']}")
+    if signals.get("teaching_readiness") is not None and profile.get("teaching_readiness") is None:
+        profile["teaching_readiness"] = signals.get("teaching_readiness")
+        signals_extracted["teaching_readiness"] = profile["teaching_readiness"]
+        log.info(f"[KNOWING_VOLUNTEER] Extracted teaching_readiness: {profile['teaching_readiness']}")
     
     if signals.get("commitment_horizon") is not None and profile.get("commitment_horizon") is None:
         profile["commitment_horizon"] = signals.get("commitment_horizon")
@@ -824,6 +866,12 @@ async def run_knowing_volunteer_step(
         profile["language_comfort"] = signals.get("language_comfort")
         signals_extracted["language_comfort"] = profile["language_comfort"]
         log.info(f"[KNOWING_VOLUNTEER] Extracted language_comfort: {profile['language_comfort']}")
+
+        # If language is already known from preferences, persist it when comfort is captured
+        if preferred_language and profile.get("language") is None:
+            profile["language"] = preferred_language
+            signals_extracted["language"] = profile["language"]
+            log.info(f"[KNOWING_VOLUNTEER] Set language from preferences: {profile['language']}")
     
     # If we successfully extracted the expected_target with high confidence, reset low_conf_streak
     high_conf_success = False

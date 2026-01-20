@@ -347,6 +347,7 @@ PREFS_INTERPRET_RESPONSE_SCHEMA = {
             "items": {"type": "string"},
         },
         "preferred_time_band": {"type": ["string", "null"]},
+        "preferred_language": {"type": ["string", "null"]},
         "followup": {"type": ["string", "null"]},
         "followup_tag": {"type": ["string", "null"]},
         "deferral": {
@@ -865,6 +866,54 @@ async def mcp_wa_send_welcome_video(to_phone: str) -> Optional[str]:
         return None
 
 
+async def mcp_wa_send_thankyou_video(to_phone: str) -> Optional[str]:
+    """
+    Send thank-you video to WhatsApp recipient.
+    The MCP server handles loading and sending the video file internally.
+    
+    Args:
+        to_phone: Recipient phone number (required)
+        
+    Returns:
+        message_id if successful, None otherwise
+    """
+    log.info(f"[VIDEO] Requesting thank-you video send to {to_phone}")
+    
+    try:
+        result = await _mcp_call(
+            "serve.whatsapp.send_thankyou_video",
+            {
+                "to_phone": to_phone
+            },
+            timeout=60  # Longer timeout for file upload and send
+        )
+        
+        if isinstance(result, dict):
+            if result.get("ok") is True:
+                message_id = result.get("wa_message_id") or result.get("message_id") or result.get("id") or result.get("wamid")
+                if message_id:
+                    log.info(f"[VIDEO] MCP tool sent thank-you video successfully, message_id: {message_id}")
+                    return str(message_id)
+                log.info("[VIDEO] MCP tool sent thank-you video successfully (ok: true), but no message_id in response")
+                return "success"
+            elif result.get("ok") is False:
+                error_msg = result.get("error") or "Unknown error"
+                log.error(f"[VIDEO] MCP tool failed: {error_msg}")
+                return None
+            else:
+                message_id = result.get("wa_message_id") or result.get("message_id") or result.get("id") or result.get("wamid")
+                if message_id:
+                    log.info(f"[VIDEO] MCP tool sent thank-you video (legacy response), message_id: {message_id}")
+                    return str(message_id)
+        
+        log.warning(f"[VIDEO] MCP tool returned unexpected format: {result}")
+        return None
+        
+    except Exception as e:
+        log.error(f"[VIDEO] Failed to send thank-you video: {e}")
+        return None
+
+
 async def mcp_wa_send_video(to: str, media_id: str, caption: Optional[str] = None) -> Optional[str]:
     """
     Send a WhatsApp video message using media_id.
@@ -1157,6 +1206,7 @@ async def _generate_prefs_interpretation(
     fallback = {
         "days": [],
         "time_band": None,
+        "language": None,
         "followup": None,
         "followup_tag": None,
         "deferral": None,
@@ -1170,7 +1220,8 @@ async def _generate_prefs_interpretation(
                 "role": "system",
                 "content": (
                     "You interpret availability replies. Return strict JSON with keys: preferred_days (array of ISO weekday strings), "
-                    "preferred_time_band (MORNING/AFTERNOON/EVENING or null), followup (string or null), followup_tag (string or null), "
+                    "preferred_time_band (MORNING/AFTERNOON/EVENING or null), preferred_language (string or null), "
+                    "followup (string or null), followup_tag (string or null), "
                     "deferral (object with keys message and until_iso or null), topics (array)."
                 ),
             },
@@ -1195,6 +1246,7 @@ async def _generate_prefs_interpretation(
         interpretation = {
             "days": payload.get("preferred_days") or [],
             "time_band": payload.get("preferred_time_band"),
+            "language": payload.get("preferred_language"),
             "deferral": payload.get("deferral"),
             "topics": payload.get("topics") or [],
             "followup": payload.get("followup"),
@@ -2340,6 +2392,8 @@ async def _handle(phone: str, text: str):
                         profile["preferences"]["days"] = preferences.get("days")
                     if "time_band" in preferences:
                         profile["preferences"]["time_band"] = preferences.get("time_band")
+                    if "language" in preferences:
+                        profile["preferences"]["language"] = preferences.get("language")
                     sess["profile"] = profile
                     if preferences.get("confirmed_at"):
                         sess["_prefs_confirmed"] = True
@@ -2896,7 +2950,7 @@ async def _handle(phone: str, text: str):
             action = ""
             tone_reply = ""
         
-        if tone_reply:
+        if tone_reply and action != "SKIP":
             await mcp_wa_send(phone, tone_reply)
             _add_to_history(phone, bot_msg=tone_reply)
         
@@ -2910,6 +2964,10 @@ async def _handle(phone: str, text: str):
                 await _handle(phone, "__kick__")
                 return
             if action == "SKIP":
+                if not sess.get("_peek_skip_message_sent"):
+                    await mcp_wa_send(phone, PEEK_SKIP_MESSAGE)
+                    _add_to_history(phone, bot_msg=PEEK_SKIP_MESSAGE)
+                    sess["_peek_skip_message_sent"] = True
                 sess["state"] = "PEEK_NEEDS_OFFER"
                 sess["sub_state"] = "PEEK_NEEDS_OFFER"
                 sess["ts"] = time.time()
@@ -2950,7 +3008,7 @@ async def _handle(phone: str, text: str):
             action = ""
             tone_reply = ""
         
-        if tone_reply:
+        if tone_reply and action != "SKIP":
             await mcp_wa_send(phone, tone_reply)
             _add_to_history(phone, bot_msg=tone_reply)
         
@@ -2965,9 +3023,10 @@ async def _handle(phone: str, text: str):
             return
         
         if action == "SKIP":
-            if not tone_reply:
+            if not sess.get("_peek_skip_message_sent"):
                 await mcp_wa_send(phone, PEEK_SKIP_MESSAGE)
                 _add_to_history(phone, bot_msg=PEEK_SKIP_MESSAGE)
+                sess["_peek_skip_message_sent"] = True
             sess["state"] = "ELIGIBILITY"
             sess["sub_state"] = "ELIGIBILITY"
             sess["ts"] = time.time()
@@ -3185,8 +3244,7 @@ async def _handle(phone: str, text: str):
                 name = profile.get("name") or "there"
                 # Combine "Let's continue" message with Selection intro
                 combined_msg = (
-                    f"Thanks {name}, for walking through this with me 🌼 "
-                    "Before we go ahead, here's a short welcome video"
+                    f"Here's a quick note from our team, {name} - we're in the last stretch now 🙂"
                 )
                 await mcp_wa_send(phone, combined_msg)
                 _add_to_history(phone, bot_msg=combined_msg)
@@ -4189,12 +4247,22 @@ async def _handle(phone: str, text: str):
             sess["ts"] = time.time(); SESSIONS[phone] = sess
             return
         elif interpretation.get("followup"):
-            await mcp_wa_send(phone, interpretation["followup"])
-            _add_to_history(phone, bot_msg=interpretation["followup"])
-            sess["_prefs_last_prompt"] = interpretation.get("followup_tag")
-            sess["_prefs_last_prompt_text"] = interpretation["followup"]
-            sess["ts"] = time.time(); SESSIONS[phone] = sess
-            return
+            followup = interpretation["followup"]
+            followup_tag = (interpretation.get("followup_tag") or "").lower()
+            followup_lower = followup.lower()
+            # If time is already captured, ignore time followups
+            if time_band and ("time" in followup_tag or "time" in followup_lower):
+                log.info("[PREFS] Ignoring time followup since time_band already set")
+            # If days already captured, ignore day followups
+            elif days and ("day" in followup_tag or "day" in followup_lower):
+                log.info("[PREFS] Ignoring day followup since days already set")
+            else:
+                await mcp_wa_send(phone, followup)
+                _add_to_history(phone, bot_msg=followup)
+                sess["_prefs_last_prompt"] = interpretation.get("followup_tag")
+                sess["_prefs_last_prompt_text"] = followup
+                sess["ts"] = time.time(); SESSIONS[phone] = sess
+                return
 
         if not days:
             followup = PREFS_FOLLOWUP_DAYS

@@ -15,7 +15,6 @@ from .prompts import (
     get_sel_video_followup,
     get_sel_about_you,
     get_sel_recommended_msg,
-    WELCOME_VIDEO_URL,
     SEL_NOT_RECOMMENDED_MSG,
     SEL_DEFERRED_MSG,
 )
@@ -32,6 +31,8 @@ log = logging.getLogger(__name__)
 # These will be imported from the main routing/dispatcher
 # For now, we'll use late imports to avoid circular dependencies
 _mcp_wa_send = None
+_mcp_wa_send_thankyou_video = None
+_mcp_call = None
 _log_event = None
 _handle_fulfillment = None
 
@@ -43,6 +44,24 @@ def _get_mcp_wa_send():
         from agents.onboarding.wa_loop import mcp_wa_send
         _mcp_wa_send = mcp_wa_send
     return _mcp_wa_send
+
+
+def _get_mcp_wa_send_thankyou_video():
+    """Lazy import of mcp_wa_send_thankyou_video to avoid circular dependencies"""
+    global _mcp_wa_send_thankyou_video
+    if _mcp_wa_send_thankyou_video is None:
+        from agents.onboarding.wa_loop import mcp_wa_send_thankyou_video
+        _mcp_wa_send_thankyou_video = mcp_wa_send_thankyou_video
+    return _mcp_wa_send_thankyou_video
+
+
+def _get_mcp_call():
+    """Lazy import of _mcp_call to avoid circular dependencies"""
+    global _mcp_call
+    if _mcp_call is None:
+        from agents.onboarding.wa_loop import _mcp_call as mcp_call_func
+        _mcp_call = mcp_call_func
+    return _mcp_call
 
 
 def _get_log_event():
@@ -145,16 +164,14 @@ async def handle_selection_start(phone: str, text: str, session: dict):
             log.info(f"[SELECTION] Intro already sent in COMPLETE state, skipping")
             mcp_wa_send = _get_mcp_wa_send()
         
-        # Wait 10 seconds before sending video
-        log.info(f"[SELECTION] Waiting 10 seconds before sending video to {phone}")
-        import asyncio
-        await asyncio.sleep(10)
-        
-        # Send video URL and done prompt together
+        # Send thank-you video via MCP tool
+        mcp_wa_send_thankyou_video = _get_mcp_wa_send_thankyou_video()
+        video_msg_id = await mcp_wa_send_thankyou_video(phone)
+
+        # Send done prompt
         done_prompt = get_sel_video_done_prompt()
-        combined_video_msg = f"{WELCOME_VIDEO_URL}\n\n{done_prompt}"
-        video_msg_id = await mcp_wa_send(phone, combined_video_msg)
-        session["_last_agent_prompt"] = combined_video_msg
+        done_prompt_msg_id = await mcp_wa_send(phone, done_prompt)
+        session["_last_agent_prompt"] = done_prompt
         
         # Persistence: Store selection start and video sent
         try:
@@ -180,7 +197,7 @@ async def handle_selection_start(phone: str, text: str, session: dict):
                     wa_phone=phone,
                     state="SELECTION",
                     sub_state=SelectionState.WAIT_VIDEO_DONE,
-                    last_outbound_msg_id=video_msg_id,
+                    last_outbound_msg_id=done_prompt_msg_id or video_msg_id,
                     tool_state_updates=tool_state_updates
                 )
                 
@@ -221,42 +238,7 @@ async def handle_selection_start(phone: str, text: str, session: dict):
         from agents.onboarding.wa_loop import SESSIONS
         SESSIONS[phone] = session
         
-        # Schedule 30-second timeout to auto-proceed if no response
-        async def selection_video_timeout_handler():
-            await asyncio.sleep(30.0)
-            
-            # Check if still in WAIT_VIDEO_DONE state and no response received
-            current_session = SESSIONS.get(phone)
-            if (current_session and
-                current_session.get("state") == SelectionState.WAIT_VIDEO_DONE and
-                not current_session.get("_selection_video_response_received")):
-                log.info(f"[SELECTION] 30-second timeout reached, auto-proceeding for {phone}")
-                
-                # Get volunteer name
-                profile = current_session.get("profile", {})
-                name = profile.get("name") or "there"
-                
-                mcp_wa_send = _get_mcp_wa_send()
-                
-                # Send followup
-                followup = get_sel_video_followup()
-                await mcp_wa_send(phone, followup)
-                
-                # Send about-you question
-                about_you = get_sel_about_you(name)
-                await mcp_wa_send(phone, about_you)
-                
-                # Store the about-you question as last agent prompt
-                current_session["_last_agent_prompt"] = about_you
-                
-                # Transition to knowing volunteer loop (do NOT send kickoff question)
-                current_session["state"] = SelectionState.KNOWING_VOLUNTEER_LOOP
-                current_session["_knowing_volunteer_started"] = True
-                current_session["ts"] = time.time()
-                SESSIONS[phone] = current_session
-        
-        # Create background task for timeout (non-blocking)
-        asyncio.create_task(selection_video_timeout_handler())
+        # No timeout auto-proceed; wait for the user's reply.
 
 
 async def handle_selection_wait_video_done(phone: str, text: str, session: dict):
@@ -289,11 +271,6 @@ async def handle_selection_wait_video_done(phone: str, text: str, session: dict)
         # Proceed to followup and about-you question
         log.info(f"[SELECTION] Video acknowledged by {phone}, proceeding")
         
-        # If they expressed appreciation, acknowledge warmly before proceeding
-        if is_appreciation:
-            mcp_wa_send = _get_mcp_wa_send()
-            await mcp_wa_send(phone, "Glad you liked it!")
-        
         now_iso = datetime.now(timezone.utc).isoformat()
         
         # Get volunteer name
@@ -303,7 +280,7 @@ async def handle_selection_wait_video_done(phone: str, text: str, session: dict)
         mcp_wa_send = _get_mcp_wa_send()
         
         # Send followup
-        followup = get_sel_video_followup()
+        followup = get_sel_video_followup(name)
         followup_msg_id = await mcp_wa_send(phone, followup)
         
         # Send about-you question
@@ -396,7 +373,7 @@ async def handle_selection_wait_video_done(phone: str, text: str, session: dict)
         # Question asked - answer briefly and re-ask
         log.info(f"[SELECTION] Question asked by {phone} while waiting for video")
         mcp_wa_send = _get_mcp_wa_send()
-        await mcp_wa_send(phone, "It's a short welcome video from the SERVE team. When you're done watching, just reply *Done*")
+        await mcp_wa_send(phone, "It's a quick note from our team. Reply Done when you're ready..")
         
         session["ts"] = time.time()
         from agents.onboarding.wa_loop import SESSIONS
@@ -540,13 +517,24 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
         question_msg_id = None
         if assistant_text:
             mcp_wa_send = _get_mcp_wa_send()
-            question_msg_id = await mcp_wa_send(phone, assistant_text)
-            session["_last_agent_prompt"] = assistant_text
+            profile = session.get("profile", {})
+            preferred_language = session.get("profile", {}).get("preferences", {}).get("language")
+            expected_target = session.get("tool_state", {}).get("selection", {}).get("expected_target")
+            if expected_target == "language" and preferred_language:
+                question_msg_id = await mcp_wa_send(
+                    phone,
+                    assistant_text,
+                    buttons=["Read", "Write", "Speak", "All"]
+                )
+                session["_last_agent_prompt"] = assistant_text
+            else:
+                question_msg_id = await mcp_wa_send(phone, assistant_text)
+                session["_last_agent_prompt"] = assistant_text
             
             # Add to history
             try:
                 from agents.onboarding.wa_loop import _add_to_history
-                _add_to_history(phone, bot_msg=assistant_text)
+                _add_to_history(phone, bot_msg=session["_last_agent_prompt"])
             except:
                 pass
         
@@ -719,7 +707,7 @@ async def handle_selection_evaluate(phone: str, session: dict):
     - Default is recommended=true
     - Hold for human follow-up if ANY of these are true:
       - user_stop_requested == True (STOP state)
-      - profile.teaching_interest == "no"
+      - profile.teaching_readiness == "no"
       - profile.commitment_horizon == "no"
     
     Routing:
@@ -732,7 +720,7 @@ async def handle_selection_evaluate(phone: str, session: dict):
     profile = session.get("tool_state", {}).get("selection", {}).get("profile", {})
     
     # Derive basic signals
-    teaching_interest = profile.get("teaching_interest")
+    teaching_readiness = profile.get("teaching_readiness")
     commitment_horizon = profile.get("commitment_horizon")
     
     # User stop requested (via STOP state)
@@ -742,8 +730,8 @@ async def handle_selection_evaluate(phone: str, session: dict):
     reason_codes = []
     if user_stop_requested:
         reason_codes.append("USER_STOP_REQUESTED")
-    if teaching_interest == "no":
-        reason_codes.append("TEACHING_INTEREST_NO")
+    if teaching_readiness == "no":
+        reason_codes.append("TEACHING_READINESS_NO")
     if commitment_horizon == "no":
         reason_codes.append("COMMITMENT_HORIZON_NO")
     
@@ -757,10 +745,10 @@ async def handle_selection_evaluate(phone: str, session: dict):
     # Count signals present
     signals_present_count = sum([
         1 if profile.get("motivation") else 0,
-        1 if profile.get("has_teaching_experience") is not None else 0,
+        1 if profile.get("teaching_experience") is not None else 0,
         1 if profile.get("commitment_horizon") else 0,
         1 if profile.get("language") or profile.get("language_comfort") else 0,  # Language signal counts if either field is present
-        1 if profile.get("teaching_interest") else 0,
+        1 if profile.get("teaching_readiness") else 0,
     ])
     
     # Store decision in session
@@ -783,6 +771,27 @@ async def handle_selection_evaluate(phone: str, session: dict):
         "signals": profile.copy(),
         "evaluated_at": now_iso
     }
+
+    # Update volunteer status via MCP tool (if volunteer_id is available)
+    volunteer_id = profile.get("volunteer_id") or session.get("profile", {}).get("volunteer_id")
+    if volunteer_id:
+        try:
+            mcp_call = _get_mcp_call()
+            status_value = "RECOMMENDED" if recommended else "ONHOLD"
+            tool_result = await mcp_call(
+                "serve.volunteer.update_status",
+                {
+                    "volunteer_id": volunteer_id,
+                    "status": status_value,
+                    "send": True
+                },
+                timeout=15
+            )
+            log.info(f"[SELECTION] volunteer.update_status result for {volunteer_id}: {tool_result}")
+        except Exception as e:
+            log.warning(f"[SELECTION] volunteer.update_status failed for {volunteer_id}: {e}", exc_info=True)
+    else:
+        log.warning(f"[SELECTION] volunteer_id missing; skipping volunteer.update_status for {phone}")
     
     # Persistence: Store evaluation outcome
     try:

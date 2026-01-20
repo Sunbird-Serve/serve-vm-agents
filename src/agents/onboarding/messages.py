@@ -39,7 +39,7 @@ WELCOME_MAYBE_LATER = """No worries! You can come back anytime using this same l
 
 Just send 'start' whenever you're ready."""
 
-WELCOME_INTRO = """Hi! I'm SIA - I represent eVidyaloka’s Volunteering Team.
+WELCOME_INTRO = """Hi! I'm Siya - I represent eVidyaloka’s Volunteering Team.
 
 Thank you for being here for the cause of children’s education in government schools, supported through live online teaching.
 It’s my pleasure to welcome you on this journey 🌱"""
@@ -389,11 +389,18 @@ Example: "Math for Grade 8 in Tamil" """
 # ---------- Section 4: Teaching Preferences (continued) ----------
 PREFS_INTRO_COLLAB = """Let's find a rhythm that works for you and the students 🌱
 
-Which 2–3 weekdays usually suit you? And do mornings, lunch hours, or early afternoons feel better?"""
+Which 2–3 weekdays usually suit you? Do mornings, lunch hours, or early afternoons feel better? And which language would you prefer teaching in?"""
 
 PREFS_FOLLOWUP_DAYS = """Beautiful. Which weekdays would you lean on? You can name 2–3 that feel realistic."""
 
 PREFS_FOLLOWUP_TIME = """Lovely! Do mornings, lunchtime, or early afternoon fit you best on those days?"""
+
+PREFS_FOLLOWUP_LANGUAGE = """Got it — which language would you prefer teaching in? (e.g., English, Hindi, Tamil, Kannada)"""
+
+PREFS_LANGUAGE_REGIONAL_NUDGE = (
+    "Thanks! For these classes, a regional language works best so children can follow easily. "
+    "Which regional language would you prefer? (Hindi, Tamil, Kannada, Telugu, etc.)"
+)
 
 PREFS_WEEKEND_NOTE = """Got it! Weekends are mostly shut in schools. Could we try picking any weekday slots that might work?"""
 

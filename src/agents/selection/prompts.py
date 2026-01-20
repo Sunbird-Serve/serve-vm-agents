@@ -10,22 +10,30 @@ WELCOME_VIDEO_URL = os.getenv("WELCOME_VIDEO_URL", settings.WELCOME_VIDEO_URL)
 
 def get_sel_video_intro(name: str = "there") -> str:
     """Get video intro message with name"""
-    return f"Before we continue, I have something special for you, {name} — a short welcome video"
+    return f"Here's a quick note from our team, {name} - we're in the last stretch now 🙂"
 
 
 def get_sel_video_done_prompt() -> str:
     """Get video done prompt"""
-    return "When you're done watching, just reply *Done*"
+    return "Reply Done when you're ready.."
 
 
-def get_sel_video_followup() -> str:
+def get_sel_video_followup(name: str = "there") -> str:
     """Get video followup message"""
-    return "Hope you liked it! We wanted you to feel the warmth and appreciation that every SERVE volunteer deserves"
+    return f"Thanks for staying with me, {name} 🙂 This is the last part — just a few things to get to know you better."
 
 
 def get_sel_about_you(name: str = "there") -> str:
     """Get about you question with name"""
     return f"Let's start with something simple, {name}. Tell me a little about yourself — anything you'd like to share"
+
+
+def get_sel_language_comfort_prompt(language: str, name: str = "there") -> str:
+    """Get language comfort prompt with buttons"""
+    return (
+        f"Quick one, {name} — for {language}, which option fits you best?\n"
+        "Read, Write, Speak, or All"
+    )
 
 
 SEL_DEFERRED_MSG = """No worries — take your time.

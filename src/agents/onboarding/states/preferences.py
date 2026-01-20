@@ -8,7 +8,8 @@ import re
 import asyncio
 from typing import Dict, Any
 from ..messages import (
-    PREFS_INTRO_COLLAB, PREFS_FOLLOWUP_DAYS, PREFS_FOLLOWUP_TIME,
+    PREFS_INTRO_COLLAB, PREFS_FOLLOWUP_DAYS, PREFS_FOLLOWUP_TIME, PREFS_FOLLOWUP_LANGUAGE,
+    PREFS_LANGUAGE_REGIONAL_NUDGE,
     PREFS_WEEKEND_NOTE, PREFS_EVENING_NUDGE, PREFS_CONFIRM_DEFAULT,
     PREFS_SUMMARY_FALLBACK, format_message
 )
@@ -108,6 +109,7 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
         sess["_prefs_prompted"] = True
         sess.setdefault("_prefs_days", [])
         sess.setdefault("_prefs_time_band", None)
+        sess.setdefault("_prefs_language", None)
         sess["_prefs_evening_attempts"] = 0
         sess["_prefs_last_prompt"] = "intro"
         sess["_prefs_last_prompt_text"] = PREFS_INTRO_COLLAB
@@ -125,6 +127,7 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
 
     days = sess.setdefault("_prefs_days", [])
     time_band = sess.get("_prefs_time_band")
+    language = sess.get("_prefs_language")
     had_evening = time_band == "EVENING"
 
     if interpretation.get("days"):
@@ -135,6 +138,10 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
     if interpretation.get("time_band"):
         time_band = interpretation["time_band"]
         sess["_prefs_time_band"] = time_band
+
+    if interpretation.get("language"):
+        language = interpretation["language"]
+        sess["_prefs_language"] = language
 
     if interpretation.get("topics"):
         topics = sess.setdefault("_qa_topics", [])
@@ -171,6 +178,41 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
                 if iso not in days:
                     days.append(iso)
 
+    # Time-band fallback if LLM didn't populate it
+    if not sess.get("_prefs_time_band"):
+        text_lower_local = text.lower()
+        if re.search(r"\bmorning(s)?\b|\bam\b", text_lower_local):
+            sess["_prefs_time_band"] = "MORNING"
+        elif re.search(r"\b(lunch|noon|midday|afternoon(s)?)\b", text_lower_local):
+            sess["_prefs_time_band"] = "AFTERNOON"
+        elif re.search(r"\b(evening(s)?|night)\b|\bpm\b", text_lower_local):
+            sess["_prefs_time_band"] = "EVENING"
+        time_band = sess.get("_prefs_time_band")
+
+    # Language fallback if LLM didn't populate it
+    if not sess.get("_prefs_language"):
+        text_lower_local = text.lower()
+        language_patterns = {
+            "english": "English",
+            "hindi": "Hindi",
+            "tamil": "Tamil",
+            "telugu": "Telugu",
+            "kannada": "Kannada",
+            "malayalam": "Malayalam",
+            "marathi": "Marathi",
+            "bengali": "Bengali",
+            "gujarati": "Gujarati",
+            "punjabi": "Punjabi",
+            "urdu": "Urdu",
+            "odia": "Odia",
+            "assamese": "Assamese",
+        }
+        for token, label in language_patterns.items():
+            if re.search(rf"\b{re.escape(token)}\b", text_lower_local):
+                sess["_prefs_language"] = label
+                break
+        language = sess.get("_prefs_language")
+
     if interpretation.get("deferral"):
         await mcp_deferral_create(
             profile.get("uuid") or phone,
@@ -186,14 +228,42 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         return
-    elif interpretation.get("followup"):
-        await mcp_wa_send(phone, interpretation["followup"])
-        _add_to_history(phone, bot_msg=interpretation["followup"])
-        sess["_prefs_last_prompt"] = interpretation.get("followup_tag")
-        sess["_prefs_last_prompt_text"] = interpretation["followup"]
+
+    # Soft policy: nudge for regional language if English-only was provided
+    if language and language.strip().lower() == "english" and not sess.get("_prefs_language_nudge_sent"):
+        await mcp_wa_send(phone, PREFS_LANGUAGE_REGIONAL_NUDGE)
+        _add_to_history(phone, bot_msg=PREFS_LANGUAGE_REGIONAL_NUDGE)
+        sess["_prefs_language_nudge_sent"] = True
+        sess["_prefs_last_prompt"] = "language_regional_nudge"
+        sess["_prefs_last_prompt_text"] = PREFS_LANGUAGE_REGIONAL_NUDGE
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         return
+
+    if language and language.strip().lower() != "english":
+        sess.pop("_prefs_language_nudge_sent", None)
+
+    if interpretation.get("followup"):
+        followup = interpretation["followup"]
+        followup_tag = (interpretation.get("followup_tag") or "").lower()
+        followup_lower = followup.lower()
+        # If time is already captured, ignore time followups
+        if time_band and ("time" in followup_tag or "time" in followup_lower):
+            log.info("[PREFS] Ignoring time followup since time_band already set")
+        # If language is already captured, ignore language followups
+        elif language and ("language" in followup_tag or "language" in followup_lower):
+            log.info("[PREFS] Ignoring language followup since language already set")
+        # If days already captured, ignore day followups
+        elif days and ("day" in followup_tag or "day" in followup_lower):
+            log.info("[PREFS] Ignoring day followup since days already set")
+        else:
+            await mcp_wa_send(phone, followup)
+            _add_to_history(phone, bot_msg=followup)
+            sess["_prefs_last_prompt"] = interpretation.get("followup_tag")
+            sess["_prefs_last_prompt_text"] = followup
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
 
     # Check for weekend-only input BEFORE checking if days is empty
     text_lower = text.lower().strip()
@@ -271,6 +341,16 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
         SESSIONS[phone] = sess
         return
 
+    if not language:
+        followup = PREFS_FOLLOWUP_LANGUAGE
+        await mcp_wa_send(phone, followup)
+        _add_to_history(phone, bot_msg=followup)
+        sess["_prefs_last_prompt"] = "language_followup"
+        sess["_prefs_last_prompt_text"] = followup
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+        return
+
     day_label_map = {
         "MON": "Monday", "TUE": "Tuesday", "WED": "Wednesday",
         "THU": "Thursday", "FRI": "Friday", "SAT": "Saturday", "SUN": "Sunday"
@@ -293,6 +373,7 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
     profile.setdefault("preferences", {})
     profile["preferences"]["days"] = days
     profile["preferences"]["time_band"] = time_band
+    profile["preferences"]["language"] = language
 
     # Double-check idempotency right before sending messages (defense in depth)
     if sess.get("_prefs_confirmed"):
@@ -377,6 +458,7 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
             preferences_update.update({
                 "days": days,
                 "time_band": time_band,
+                "language": language,
                 "confirmed_at": now_iso
             })
             
@@ -397,7 +479,7 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
                 state="ONBOARDING",
                 sub_state="PREFERENCES",
                 status="SUCCESS",
-                details={"days": days, "time_band": time_band},
+                details={"days": days, "time_band": time_band, "language": language},
                 session_id=session_id
             )
     except Exception as e:
