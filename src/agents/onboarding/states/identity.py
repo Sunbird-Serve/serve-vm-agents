@@ -31,6 +31,7 @@ IDENTITY_SAVE_RETRY = """Hmm, I couldn't save that just now — could you share 
 IDENTITY_NAME_RETRY = """Could you share your name? 🙂"""
 IDENTITY_NAME_INVALID = """No worries, What name should I call you?"""
 IDENTITY_INVALID_EMAIL = """Please provide a valid email address (e.g., name@example.com) 🙂"""
+IDENTITY_WHICH_EDIT = """Thanks for letting me know! Which should I change — *name* or *email*?"""
 IDENTITY_INVALID_PHONE = """Please provide a valid 10-digit phone number 🙂"""
 
 
@@ -1281,15 +1282,47 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
                     await _handle(phone, "__kick__")
                     return
             elif is_no_response(text):
-                # Not confirmed - ask for email again
-                log.info(f"[IDENTITY] User said no to confirmation, asking for email again")
+                # Not confirmed - ask which field to correct
+                log.info(f"[IDENTITY] User said no to confirmation, asking which field to edit")
                 sess.pop("_identity_waiting_confirmation", None)
                 sess.pop("_identity_pending_email", None)
-                await mcp_wa_send(phone, IDENTITY_EMAIL_CORRECTION)
-                _add_to_history(phone, bot_msg=IDENTITY_EMAIL_CORRECTION)
+                sess["_identity_edit_mode"] = True
+                await mcp_wa_send(phone, IDENTITY_WHICH_EDIT)
+                _add_to_history(phone, bot_msg=IDENTITY_WHICH_EDIT)
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
                 return
+            elif sess.get("_identity_edit_mode") or re.search(r"\b(name|email)\b", text.lower()):
+                # Handle explicit edit intent after confirmation
+                text_lower = text.lower()
+                if "name" in text_lower:
+                    log.info(f"[IDENTITY] User wants to edit name")
+                    sess.pop("_identity_waiting_confirmation", None)
+                    sess.pop("_identity_pending_email", None)
+                    sess["_identity_name_collected"] = False
+                    sess["_identity_name_asked"] = False
+                    sess["_identity_edit_mode"] = False
+                    await mcp_wa_send(phone, IDENTITY_NAME_PROMPT)
+                    _add_to_history(phone, bot_msg=IDENTITY_NAME_PROMPT)
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+                    return
+                if "email" in text_lower or "mail" in text_lower or "@" in text_lower:
+                    log.info(f"[IDENTITY] User wants to edit email")
+                    sess.pop("_identity_waiting_confirmation", None)
+                    sess.pop("_identity_pending_email", None)
+                    sess["_identity_edit_mode"] = False
+                    await mcp_wa_send(phone, IDENTITY_EMAIL_CORRECTION)
+                    _add_to_history(phone, bot_msg=IDENTITY_EMAIL_CORRECTION)
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+                    return
+                if sess.get("_identity_edit_mode"):
+                    await mcp_wa_send(phone, IDENTITY_WHICH_EDIT)
+                    _add_to_history(phone, bot_msg=IDENTITY_WHICH_EDIT)
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+                    return
             else:
                 # Ambiguous response - re-ask confirmation
                 log.info(f"[IDENTITY] Ambiguous confirmation response, re-asking")

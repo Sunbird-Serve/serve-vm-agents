@@ -521,11 +521,7 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
             preferred_language = session.get("profile", {}).get("preferences", {}).get("language")
             expected_target = session.get("tool_state", {}).get("selection", {}).get("expected_target")
             if expected_target == "language" and preferred_language:
-                question_msg_id = await mcp_wa_send(
-                    phone,
-                    assistant_text,
-                    buttons=["Read", "Write", "Speak", "All"]
-                )
+                question_msg_id = await mcp_wa_send(phone, assistant_text)
                 session["_last_agent_prompt"] = assistant_text
             else:
                 question_msg_id = await mcp_wa_send(phone, assistant_text)

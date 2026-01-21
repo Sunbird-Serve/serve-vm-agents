@@ -368,6 +368,19 @@ async def handle_fulfillment(phone: str, text: str, session: dict):
                 SESSIONS[phone] = session
                 return
 
+            # If user asks a question while paused, move to QA_WINDOW to answer
+            if "?" in (text or ""):
+                from agents.onboarding.wa_loop import SESSIONS, _handle as onboarding_handle
+                session["agent"] = "onboarding"
+                session["state"] = "QA_WINDOW"
+                session.setdefault("_qa_count", 0)
+                session.setdefault("_qa_topics", [])
+                session.setdefault("_qa_summary_sent", False)
+                session["ts"] = time.time()
+                SESSIONS[phone] = session
+                await onboarding_handle(phone, text)
+                return
+
             # Stay paused on any other input
             await mcp_wa_send(phone, FULFILL_DEFERRED_MSG)
             session["ts"] = time.time()
@@ -377,12 +390,15 @@ async def handle_fulfillment(phone: str, text: str, session: dict):
 
         if is_defer_response(text):
             await mcp_wa_send(phone, FULFILL_DEFERRED_MSG)
-            session["_paused"] = True
-            session["_pause_reason"] = "user_deferred"
-            session["_paused_state"] = state
+            from agents.onboarding.wa_loop import SESSIONS, _handle as onboarding_handle
+            session["agent"] = "onboarding"
+            session["state"] = "QA_WINDOW"
+            session.setdefault("_qa_count", 0)
+            session.setdefault("_qa_topics", [])
+            session.setdefault("_qa_summary_sent", False)
             session["ts"] = time.time()
-            from agents.onboarding.wa_loop import SESSIONS
             SESSIONS[phone] = session
+            await onboarding_handle(phone, "__kick__")
             return
     
     # Route to appropriate state handler
