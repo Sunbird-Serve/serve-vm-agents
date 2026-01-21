@@ -356,16 +356,24 @@ async def handle_fulfillment(phone: str, text: str, session: dict):
     mcp_wa_send = _get_mcp_wa_send()
     if text != "__kick__":
         if session.get("_paused"):
-            session["_paused"] = False
-            session.pop("_pause_reason", None)
             if is_resume_response(text):
+                session["_paused"] = False
+                session.pop("_pause_reason", None)
+                session.pop("_paused_state", None)
                 last_prompt = session.get("_last_agent_prompt")
                 if last_prompt:
                     await mcp_wa_send(phone, last_prompt)
-                    session["ts"] = time.time()
-                    from agents.onboarding.wa_loop import SESSIONS
-                    SESSIONS[phone] = session
-                    return
+                session["ts"] = time.time()
+                from agents.onboarding.wa_loop import SESSIONS
+                SESSIONS[phone] = session
+                return
+
+            # Stay paused on any other input
+            await mcp_wa_send(phone, FULFILL_DEFERRED_MSG)
+            session["ts"] = time.time()
+            from agents.onboarding.wa_loop import SESSIONS
+            SESSIONS[phone] = session
+            return
 
         if is_defer_response(text):
             await mcp_wa_send(phone, FULFILL_DEFERRED_MSG)

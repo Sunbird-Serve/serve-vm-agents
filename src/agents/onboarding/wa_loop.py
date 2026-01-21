@@ -2878,6 +2878,17 @@ async def _handle(phone: str, text: str):
             SESSIONS[phone] = sess
             return
         else:
+            # Handle deferral early to avoid FAQ + reminder loops
+            if is_defer_response(text) or _detect_deferral(text):
+                await mcp_wa_send(phone, GENERIC_DEFERRED_MSG)
+                _add_to_history(phone, bot_msg=GENERIC_DEFERRED_MSG)
+                sess["_deferred_prev_state"] = "WELCOME"
+                sess["_deferred_reason"] = "WELCOME_LATER"
+                sess["state"] = "DEFERRED"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+
             # Welcome FAQ handling: answer common questions and keep in WELCOME
             if _is_question(text) and not sess.get("_state_handled_question"):
                 welcome_faq = [
@@ -2904,18 +2915,6 @@ async def _handle(phone: str, text: str):
                 # Re-ask how to continue and stay in WELCOME
                 await mcp_wa_send(phone, WELCOME_INSTRUCTIONS, buttons=WELCOME_START_BUTTONS)
                 _add_to_history(phone, bot_msg=WELCOME_INSTRUCTIONS)
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
-                return
-            
-            # Handle "I'll do this later" and start flow
-            text_lower = text.lower().strip()
-            if any(phrase in text_lower for phrase in ["i'll do this later", "ill do this later", "later", "not now"]):
-                await mcp_wa_send(phone, GENERIC_DEFERRED_MSG)
-                _add_to_history(phone, bot_msg=GENERIC_DEFERRED_MSG)
-                sess["_deferred_prev_state"] = "WELCOME_VIDEO"
-                sess["_deferred_reason"] = "WELCOME_LATER"
-                sess["state"] = "DEFERRED"
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
                 return
@@ -3077,10 +3076,13 @@ async def _handle(phone: str, text: str):
         
         # If user asks what the video is about, answer and re-ask footer
         if "video" in text_lower and _is_question(text):
-            about_msg = "It’s a quick hello from our team and a peek into real classrooms."
-            await mcp_wa_send(phone, about_msg)
-            _add_to_history(phone, bot_msg=about_msg)
-            sess["_state_handled_question"] = True
+            # Try to answer any FAQ content in the same message first
+            answered = await _maybe_answer_global_faq(text)
+            if not answered:
+                about_msg = "It’s a quick hello from our team and a peek into real classrooms."
+                await mcp_wa_send(phone, about_msg)
+                _add_to_history(phone, bot_msg=about_msg)
+                sess["_state_handled_question"] = True
             await mcp_wa_send(phone, WELCOME_VIDEO_FOOTER)
             _add_to_history(phone, bot_msg=WELCOME_VIDEO_FOOTER)
             sess["ts"] = time.time()

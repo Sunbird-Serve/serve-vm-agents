@@ -91,12 +91,25 @@ def retrieve(query: str, k: int = 3) -> List[Dict]:
 async def compose_answer(query: str, context_entries: List[Dict]) -> str:
     """Use MCP faq.answer to compose a concise answer + bridge; fall back to KB text."""
     # Build a simple policy context for safety and clarity
+    kb_context = ""
+    if context_entries:
+        lines = []
+        for entry in context_entries:
+            q = (entry.get("q") or "").strip()
+            a = (entry.get("a") or "").strip()
+            if q or a:
+                lines.append(f"Q: {q}\nA: {a}".strip())
+        if lines:
+            kb_context = "FAQ context (use only this):\n" + "\n\n".join(lines)
     policy_ctx = (
         "weekday-only 8–15; 100% volunteer (no pay); ~2 hrs/week; "
         "tablet or laptop required (no smartphones); "
         "video shown is a real volunteer-led class demo to show how SERVE sessions feel; "
-        "everything happens here on WhatsApp; do not mention orientation, scheduling, or internal stages"
+        "everything happens here on WhatsApp; do not mention orientation, scheduling, or internal stages. "
+        "Answer strictly using the FAQ context provided. If the answer is not in the FAQ context, say you don't know."
     )
+    if kb_context:
+        policy_ctx = f"{policy_ctx}\n\n{kb_context}"
     try:
         resp = await _mcp_call(
             "faq.answer",
@@ -120,6 +133,6 @@ async def compose_answer(query: str, context_entries: List[Dict]) -> str:
     if context_entries:
         best = context_entries[0]
         return (best.get("a") or "").strip()
-    return ""
+    return "Your question is noted. Our coordinator will get in touch with you."
 
 

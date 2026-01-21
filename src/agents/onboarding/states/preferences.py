@@ -213,6 +213,25 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
                 break
         language = sess.get("_prefs_language")
 
+    # Check for weekend-only input BEFORE LLM followups
+    text_lower = text.lower().strip()
+    weekend_only_patterns = [
+        r"\bweekend\s+only\b",
+        r"\bonly\s+weekend\b",
+        r"\bweekends?\s+only\b",
+        r"\bonly\s+weekends?\b",
+        r"\b(sat|saturday|sun|sunday)\s+only\b",
+        r"\bonly\s+(sat|saturday|sun|sunday)\b"
+    ]
+
+    if any(re.search(pattern, text_lower) for pattern in weekend_only_patterns):
+        log.info(f"[PREFS] Explicit weekend-only input detected for {phone}")
+        sess["weekend_only"] = True
+        sess["available_days"] = ["Sat", "Sun"]
+        days = ["SAT", "SUN"]
+        sess["_prefs_days"] = days
+        sess.pop("_prefs_weekend_nudge_sent", None)
+
     if interpretation.get("deferral"):
         await mcp_deferral_create(
             profile.get("uuid") or phone,
@@ -276,60 +295,62 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
         r"\bonly\s+(sat|saturday|sun|sunday)\b"
     ]
     
-    # Check if user explicitly confirms "Weekend only" after nudge
-    if sess.get("_prefs_weekend_nudge_sent"):
-        if "weekend only" in text_lower or any(re.search(pattern, text_lower) for pattern in weekend_only_patterns):
-            # User confirmed weekend-only - accept and proceed
-            log.info(f"[PREFS] User confirmed weekend-only availability for {phone}")
-            sess["weekend_only"] = True
-            sess["available_days"] = ["Sat", "Sun"]
-            # Set days to weekend days for processing
-            days = ["SAT", "SUN"]
-            sess["_prefs_days"] = days
-            sess.pop("_prefs_weekend_nudge_sent", None)
-            # Continue with normal flow
-        else:
-            # User provided weekday(s) after nudge - clear nudge flag and continue
-            sess.pop("_prefs_weekend_nudge_sent", None)
-    
-    # Detect weekend-only input (if nudge not already sent)
-    if not sess.get("_prefs_weekend_nudge_sent"):
-        # Check if only weekend days are mentioned
-        weekend_days_in_text = []
-        weekday_days_in_text = []
+    # If already marked weekend-only above, skip further nudge logic
+    if not (sess.get("weekend_only") and days == ["SAT", "SUN"]):
+        # Check if user explicitly confirms "Weekend only" after nudge
+        if sess.get("_prefs_weekend_nudge_sent"):
+            if "weekend only" in text_lower or any(re.search(pattern, text_lower) for pattern in weekend_only_patterns):
+                # User confirmed weekend-only - accept and proceed
+                log.info(f"[PREFS] User confirmed weekend-only availability for {phone}")
+                sess["weekend_only"] = True
+                sess["available_days"] = ["Sat", "Sun"]
+                # Set days to weekend days for processing
+                days = ["SAT", "SUN"]
+                sess["_prefs_days"] = days
+                sess.pop("_prefs_weekend_nudge_sent", None)
+                # Continue with normal flow
+            else:
+                # User provided weekday(s) after nudge - clear nudge flag and continue
+                sess.pop("_prefs_weekend_nudge_sent", None)
         
-        day_patterns = {
-            "monday": "MON", "mon": "MON",
-            "tuesday": "TUE", "tue": "TUE",
-            "wednesday": "WED", "wed": "WED",
-            "thursday": "THU", "thu": "THU", "thur": "THU",
-            "friday": "FRI", "fri": "FRI",
-            "saturday": "SAT", "sat": "SAT",
-            "sunday": "SUN", "sun": "SUN",
-        }
-        
-        for token, iso in day_patterns.items():
-            if re.search(rf"\b{re.escape(token)}\b", text_lower):
-                if iso in ["SAT", "SUN"]:
-                    weekend_days_in_text.append(iso)
-                else:
-                    weekday_days_in_text.append(iso)
-        
-        # Check for explicit weekend-only phrases
-        has_weekend_only_phrase = any(re.search(pattern, text_lower) for pattern in weekend_only_patterns)
-        
-        # If only weekend days mentioned AND no weekdays, send nudge
-        if (weekend_days_in_text and not weekday_days_in_text) or has_weekend_only_phrase:
-            if not sess.get("_prefs_weekend_nudge_sent"):
-                log.info(f"[PREFS] Weekend-only input detected for {phone}, sending nudge")
-                await mcp_wa_send(phone, PREFS_WEEKEND_ONLY_NUDGE)
-                _add_to_history(phone, bot_msg=PREFS_WEEKEND_ONLY_NUDGE)
-                sess["_prefs_weekend_nudge_sent"] = True
-                sess["_prefs_last_prompt"] = "weekend_nudge"
-                sess["_prefs_last_prompt_text"] = PREFS_WEEKEND_ONLY_NUDGE
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
-                return
+        # Detect weekend-only input (if nudge not already sent)
+        if not sess.get("_prefs_weekend_nudge_sent"):
+            # Check if only weekend days are mentioned
+            weekend_days_in_text = []
+            weekday_days_in_text = []
+            
+            day_patterns = {
+                "monday": "MON", "mon": "MON",
+                "tuesday": "TUE", "tue": "TUE",
+                "wednesday": "WED", "wed": "WED",
+                "thursday": "THU", "thu": "THU", "thur": "THU",
+                "friday": "FRI", "fri": "FRI",
+                "saturday": "SAT", "sat": "SAT",
+                "sunday": "SUN", "sun": "SUN",
+            }
+            
+            for token, iso in day_patterns.items():
+                if re.search(rf"\b{re.escape(token)}\b", text_lower):
+                    if iso in ["SAT", "SUN"]:
+                        weekend_days_in_text.append(iso)
+                    else:
+                        weekday_days_in_text.append(iso)
+            
+            # Check for explicit weekend-only phrases
+            has_weekend_only_phrase = any(re.search(pattern, text_lower) for pattern in weekend_only_patterns)
+            
+            # If only weekend days mentioned AND no weekdays, send nudge
+            if (weekend_days_in_text and not weekday_days_in_text) or has_weekend_only_phrase:
+                if not sess.get("_prefs_weekend_nudge_sent"):
+                    log.info(f"[PREFS] Weekend-only input detected for {phone}, sending nudge")
+                    await mcp_wa_send(phone, PREFS_WEEKEND_ONLY_NUDGE)
+                    _add_to_history(phone, bot_msg=PREFS_WEEKEND_ONLY_NUDGE)
+                    sess["_prefs_weekend_nudge_sent"] = True
+                    sess["_prefs_last_prompt"] = "weekend_nudge"
+                    sess["_prefs_last_prompt_text"] = PREFS_WEEKEND_ONLY_NUDGE
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+                    return
     
     if not days:
         followup = PREFS_FOLLOWUP_DAYS
