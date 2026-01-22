@@ -75,6 +75,7 @@ WELCOME_CONSENT_ACK = """Great, I'll keep it simple and quick."""
 WELCOME_CONSENT_REMINDER = """Quick reminder — shall we continue with the onboarding?"""
 
 WELCOME_FAQ_FOLLOWUP = """Shall we begin now? You’ll get to know more as we go, and you can ask questions anytime — I’m here to help."""
+WELCOME_STATEMENT_ACK = "Thanks for sharing. Happy to help."
 
 
 # ---------- Section 2: Intent (Purpose Acknowledgement) ----------
@@ -175,6 +176,10 @@ Volunteering with SERVE usually means:
 * are 18 years or above
 
 If this sounds like something you'd enjoy, we can continue"""
+
+# Under-18 specific exit (gentler than generic exit)
+ELIGIBILITY_UNDERAGE_EXIT = """Thanks for sharing. Volunteering with SERVE is open only to 18+ right now due to policy. 
+When you turn 18, message us here — we’d love to have you. 🌼"""
 
 # Button labels for ELIGIBILITY main prompt
 ELIGIBILITY_BUTTONS = ["Yes, this works", "Tell me more", "Something won't work"]

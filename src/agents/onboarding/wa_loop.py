@@ -29,6 +29,7 @@ from .messages import (
     WELCOME_INTRO, WELCOME_INSTRUCTIONS, WELCOME_START_BUTTONS, WELCOME_VIDEO_INTRO, WELCOME_VIDEO_FOOTER,
     GENERIC_DEFERRED_MSG, WELCOME_SERVE_OVERVIEW, WELCOME_CONSENT_ACK, WELCOME_CONSENT_REMINDER,
     WELCOME_FAQ_FOLLOWUP,
+    WELCOME_STATEMENT_ACK,
     INTENT_PROMPT, INTENT_EXIT,
     ELIGIBILITY_PROMPT, ELIGIBILITY_EXIT,
     ELIGIBILITY_INTRO, ELIGIBILITY_Q1, ELIGIBILITY_Q2, ELIGIBILITY_Q3,
@@ -2704,7 +2705,7 @@ async def _handle(phone: str, text: str):
         and state != "QA_WINDOW"
         and not deferral_like
         and _is_question(text)
-        and state not in {"WELCOME", "WELCOME_VIDEO", "PEEK_CHOICE", "PEEK_NEEDS_OFFER", "VIDEO", "ELIGIBILITY"}
+        and state not in {"WELCOME", "PEEK_CHOICE", "PEEK_NEEDS_OFFER", "ELIGIBILITY"}
         and not sess.get("_state_handled_question")
         and not is_mixed_qna
     ):
@@ -2921,6 +2922,23 @@ async def _handle(phone: str, text: str):
                 SESSIONS[phone] = sess
                 return
             
+            # Acknowledge non-question statements and re-ask to begin
+            if (
+                text
+                and not _is_question(text)
+                and not is_yes_response(text)
+                and not is_no_response(text)
+                and not is_defer_response(text)
+                and not _detect_deferral(text)
+            ):
+                await mcp_wa_send(phone, WELCOME_STATEMENT_ACK)
+                _add_to_history(phone, bot_msg=WELCOME_STATEMENT_ACK)
+                await mcp_wa_send(phone, WELCOME_FAQ_FOLLOWUP, buttons=WELCOME_START_BUTTONS)
+                _add_to_history(phone, bot_msg=WELCOME_FAQ_FOLLOWUP)
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            
             # Otherwise, start with welcome video
             log.info(f"[GREET] User responded after welcome message, transitioning to WELCOME_VIDEO")
             sess["state"] = "WELCOME_VIDEO"
@@ -3107,8 +3125,9 @@ async def _handle(phone: str, text: str):
                 await mcp_wa_send(phone, about_msg)
                 _add_to_history(phone, bot_msg=about_msg)
                 sess["_state_handled_question"] = True
-            await mcp_wa_send(phone, WELCOME_VIDEO_FOOTER)
-            _add_to_history(phone, bot_msg=WELCOME_VIDEO_FOOTER)
+            if not sess.get("_state_handled_question"):
+                await mcp_wa_send(phone, WELCOME_VIDEO_FOOTER)
+                _add_to_history(phone, bot_msg=WELCOME_VIDEO_FOOTER)
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             return
@@ -3133,7 +3152,11 @@ async def _handle(phone: str, text: str):
             SESSIONS[phone] = sess
             return
         
-        # Ambiguous response: re-ask footer
+        # Ambiguous response: re-ask footer unless we already answered a question
+        if _is_question(text) and sess.get("_state_handled_question"):
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
         await mcp_wa_send(phone, WELCOME_VIDEO_FOOTER)
         _add_to_history(phone, bot_msg=WELCOME_VIDEO_FOOTER)
         sess["ts"] = time.time()

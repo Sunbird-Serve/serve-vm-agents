@@ -19,6 +19,8 @@ from ..messages import (
     ELIGIBILITY_ISSUE_OTHER_PROMPT,
     ELIGIBILITY_FAQ_MORE_PROMPT, ELIGIBILITY_FAQ_MORE_BUTTONS, ELIGIBILITY_FAQ_MORE_ACK,
     ELIGIBILITY_CONFIRM_SHORT,
+    ELIGIBILITY_UNDERAGE_EXIT,
+    PERSUADE_WEEKEND_ONLY,
     # Legacy (kept for backward compatibility)
     ELIGIBILITY_CLARIFY_AGE_PROMPT, ELIGIBILITY_CLARIFY_AGE_BUTTONS,
     ELIGIBILITY_CLARIFY_DEVICE_PROMPT, ELIGIBILITY_CLARIFY_DEVICE_BUTTONS,
@@ -111,7 +113,9 @@ def classify_eligibility_rule_based(text: str) -> Tuple[Optional[str], Optional[
         r"\b(i'?m|i am|im)\s*(17|sixteen|15|fifteen|14|fourteen|13|thirteen|12|twelve)\b",
         r"\b(17|sixteen|15|fifteen|14|fourteen|13|thirteen|12|twelve)\s*(years? old|yr|yrs)\b",
         r"\b(under|below|less than)\s*(18|eighteen)\b",
-        r"\b(not 18|not eighteen|not yet 18)\b",
+        r"\bnot\s*(18|eighteen)\s*(yet|currently)?\b",
+        r"\b(not yet|not quite|almost|turning|will be)\s*(18|eighteen)\b",
+        r"\b(18|eighteen)\s*(soon|in a few months|in few months|in a couple of months)\b",
         r"\b(17|sixteen|15|fifteen|14|fourteen|13|thirteen|12|twelve)\b",  # Just a number < 18
     ]
     for pattern in age_violations:
@@ -381,7 +385,20 @@ def get_faq_answer(text: str) -> Optional[str]:
     if any(term in text_lower for term in ["paid", "payment", "unpaid", "volunteer", "voluntary", "stipend", "money", "compensation"]):
         return ELIGIBILITY_FAQ_UNPAID
     
+    # Weekend/weekday timing questions
+    if any(term in text_lower for term in ["weekend", "weekends", "saturday", "sunday", "weekday", "weekdays"]):
+        return PERSUADE_WEEKEND_ONLY
+    
     return None
+
+
+def _get_exit_message(
+    missing_requirement: Optional[str],
+    eligibility_mode: Optional[str],
+) -> str:
+    if missing_requirement == "age" or eligibility_mode == "ISSUE_AGE":
+        return ELIGIBILITY_UNDERAGE_EXIT
+    return ELIGIBILITY_EXIT
 
 
 async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profile: Dict[str, Any]) -> None:
@@ -468,6 +485,8 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         return
+    
+    text_lower = (text or "").lower().strip()
     
     # Step 1: Check for button click
     button_click = detect_button_click(text)
@@ -670,8 +689,9 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
             elif button_click == "NO":
                 # Requirement not met - exit immediately
                 log.info(f"[ELIGIBILITY] Requirement {eligibility_mode} not met, exiting")
-                await mcp_wa_send(phone, ELIGIBILITY_EXIT)
-                _add_to_history(phone, bot_msg=ELIGIBILITY_EXIT)
+                exit_msg = _get_exit_message(None, eligibility_mode)
+                await mcp_wa_send(phone, exit_msg)
+                _add_to_history(phone, bot_msg=exit_msg)
                 
                 # Persistence: Store rejection response
                 try:
@@ -929,8 +949,9 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
         elif final_intent == "ELIGIBLE_NO":
             # Requirement not met - exit immediately
             log.info(f"[ELIGIBILITY] Requirement {eligibility_mode} not met via typed response, exiting")
-            await mcp_wa_send(phone, ELIGIBILITY_EXIT)
-            _add_to_history(phone, bot_msg=ELIGIBILITY_EXIT)
+            exit_msg = _get_exit_message(final_missing_req, eligibility_mode)
+            await mcp_wa_send(phone, exit_msg)
+            _add_to_history(phone, bot_msg=exit_msg)
             
             # Persistence: Store rejection response
             try:
