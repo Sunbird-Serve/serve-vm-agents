@@ -495,6 +495,23 @@ async def handle_fulfill_list(phone: str, text: str, session: dict):
         
         # Fetch needs via MCP tool (volunteer_id not supported by API)
         needs = await fetch_open_needs(limit=5)
+
+        if not needs:
+            # No needs available - notify and move to QA window
+            no_needs_msg = format_need_list([], max_items=0)
+            mcp_wa_send = _get_mcp_wa_send()
+            await mcp_wa_send(phone, no_needs_msg)
+            session["_fulfill_list_sent"] = True
+            session["ts"] = time.time()
+            from agents.onboarding.wa_loop import SESSIONS, _handle as onboarding_handle
+            session["agent"] = "onboarding"
+            session["state"] = "QA_WINDOW"
+            session.setdefault("_qa_count", 0)
+            session.setdefault("_qa_topics", [])
+            session.setdefault("_qa_summary_sent", False)
+            SESSIONS[phone] = session
+            await onboarding_handle(phone, "__kick__")
+            return
         
         # Format list
         list_message = format_need_list(needs, max_items=5)

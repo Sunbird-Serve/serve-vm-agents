@@ -37,6 +37,13 @@ _log_event = None
 _handle_fulfillment = None
 
 
+def _sanitize_ascii(text: str) -> str:
+    """Strip non-ASCII characters to avoid encoding issues in outbound messages."""
+    if not text:
+        return text
+    return text.encode("ascii", errors="ignore").decode("ascii").strip()
+
+
 def _get_mcp_wa_send():
     """Lazy import of mcp_wa_send to avoid circular dependencies"""
     global _mcp_wa_send
@@ -521,11 +528,13 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
             preferred_language = session.get("profile", {}).get("preferences", {}).get("language")
             expected_target = session.get("tool_state", {}).get("selection", {}).get("expected_target")
             if expected_target == "language" and preferred_language:
-                question_msg_id = await mcp_wa_send(phone, assistant_text)
-                session["_last_agent_prompt"] = assistant_text
+                safe_text = _sanitize_ascii(assistant_text)
+                question_msg_id = await mcp_wa_send(phone, safe_text)
+                session["_last_agent_prompt"] = safe_text
             else:
-                question_msg_id = await mcp_wa_send(phone, assistant_text)
-                session["_last_agent_prompt"] = assistant_text
+                safe_text = _sanitize_ascii(assistant_text)
+                question_msg_id = await mcp_wa_send(phone, safe_text)
+                session["_last_agent_prompt"] = safe_text
             
             # Add to history
             try:

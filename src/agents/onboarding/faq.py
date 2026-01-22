@@ -106,7 +106,8 @@ async def compose_answer(query: str, context_entries: List[Dict]) -> str:
         "tablet or laptop required (no smartphones); "
         "video shown is a real volunteer-led class demo to show how SERVE sessions feel; "
         "everything happens here on WhatsApp; do not mention orientation, scheduling, or internal stages. "
-        "Answer strictly using the FAQ context provided. If the answer is not in the FAQ context, say you don't know."
+        "Answer strictly using the FAQ context provided. If the answer is not in the FAQ context, say: "
+        "\"Your question is noted — our coordinator will answer it soon.\""
     )
     if kb_context:
         policy_ctx = f"{policy_ctx}\n\n{kb_context}"
@@ -133,6 +134,6 @@ async def compose_answer(query: str, context_entries: List[Dict]) -> str:
     if context_entries:
         best = context_entries[0]
         return (best.get("a") or "").strip()
-    return "Your question is noted. Our coordinator will get in touch with you."
+    return "Your question is noted — our coordinator will answer it soon."
 
 

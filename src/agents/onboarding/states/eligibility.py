@@ -17,6 +17,8 @@ from ..messages import (
     ELIGIBILITY_ISSUE_TIME_PROMPT, ELIGIBILITY_ISSUE_TIME_BUTTONS,
     ELIGIBILITY_ISSUE_UNPAID_PROMPT, ELIGIBILITY_ISSUE_UNPAID_BUTTONS,
     ELIGIBILITY_ISSUE_OTHER_PROMPT,
+    ELIGIBILITY_FAQ_MORE_PROMPT, ELIGIBILITY_FAQ_MORE_BUTTONS, ELIGIBILITY_FAQ_MORE_ACK,
+    ELIGIBILITY_CONFIRM_SHORT,
     # Legacy (kept for backward compatibility)
     ELIGIBILITY_CLARIFY_AGE_PROMPT, ELIGIBILITY_CLARIFY_AGE_BUTTONS,
     ELIGIBILITY_CLARIFY_DEVICE_PROMPT, ELIGIBILITY_CLARIFY_DEVICE_BUTTONS,
@@ -32,18 +34,9 @@ ELIGIBILITY_CLARIFY_DEVICE = """Do you have a tablet or laptop with a reasonably
 ELIGIBILITY_CLARIFY_UNPAID = """And are you okay with this being a voluntary (unpaid) role? 🙂"""
 
 # FAQ answers for common questions
-ELIGIBILITY_FAQ_AGE = """Yes, 18+ is required for classroom volunteering. This is a policy requirement.
-
-So just to confirm — are all three okay for you? (18+, tablet/laptop+internet, unpaid role)
-You can simply reply with Yes or No 🙂"""
-ELIGIBILITY_FAQ_DEVICE = """A tablet or laptop with stable internet is needed for live online classes. (Smartphones/phones are not suitable for this program.)
-
-So just to confirm — are all three okay for you? (18+, tablet/laptop+internet, unpaid role)
-You can simply reply with Yes or No 🙂"""
-ELIGIBILITY_FAQ_UNPAID = """Yes, this is a volunteer role with no payment.
-
-So just to confirm — are all three okay for you? (18+, tablet/laptop+internet, unpaid role)
-You can simply reply with Yes or No 🙂"""
+ELIGIBILITY_FAQ_AGE = "Yes, 18+ is required for classroom volunteering. This is a policy requirement."
+ELIGIBILITY_FAQ_DEVICE = "A tablet or laptop with stable internet is needed for live online classes. (Smartphones/phones are not suitable for this program.)"
+ELIGIBILITY_FAQ_UNPAID = "Yes, this is a volunteer role with no payment."
 
 
 def detect_button_click(text: str) -> Optional[str]:
@@ -479,6 +472,48 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
     # Step 1: Check for button click
     button_click = detect_button_click(text)
     eligibility_mode = sess.get("_eligibility_mode", "ALIGN")
+    forced_button_click = None
+
+    # If we asked whether they have more questions, handle that first
+    if sess.get("_eligibility_faq_more_prompted"):
+        if is_no_response(text) or re.search(r"\b(no|that's all|thats all|nope|done|continue)\b", text_lower):
+            sess["_eligibility_faq_more_prompted"] = False
+            sess["_eligibility_faq_confirm_pending"] = True
+            await mcp_wa_send(phone, ELIGIBILITY_CONFIRM_SHORT, buttons=["Yes", "No"])
+            _add_to_history(phone, bot_msg=ELIGIBILITY_CONFIRM_SHORT)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+        if is_yes_response(text) or re.search(r"\b(yes|yeah|yep|sure|ok|okay|more|one more)\b", text_lower):
+            sess["_eligibility_faq_more_prompted"] = False
+            await mcp_wa_send(phone, ELIGIBILITY_FAQ_MORE_ACK)
+            _add_to_history(phone, bot_msg=ELIGIBILITY_FAQ_MORE_ACK)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+        await mcp_wa_send(phone, ELIGIBILITY_FAQ_MORE_PROMPT, buttons=ELIGIBILITY_FAQ_MORE_BUTTONS)
+        _add_to_history(phone, bot_msg=ELIGIBILITY_FAQ_MORE_PROMPT)
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+        return
+
+    # Handle confirmation after FAQ follow-up
+    if sess.get("_eligibility_faq_confirm_pending"):
+        if is_yes_response(text):
+            forced_button_click = "YES_WORKS"
+            sess["_eligibility_faq_confirm_pending"] = False
+        elif is_no_response(text):
+            forced_button_click = "SOMETHING_WONT_WORK"
+            sess["_eligibility_faq_confirm_pending"] = False
+        else:
+            await mcp_wa_send(phone, ELIGIBILITY_CONFIRM_SHORT, buttons=["Yes", "No"])
+            _add_to_history(phone, bot_msg=ELIGIBILITY_CONFIRM_SHORT)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+
+    if forced_button_click:
+        button_click = forced_button_click
     
     if button_click:
         log.info(f"[ELIGIBILITY] Button clicked: {button_click}, mode: {eligibility_mode}")
@@ -1083,9 +1118,9 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
                 await mcp_wa_send(phone, ELIGIBILITY_TELL_ME_MORE_MSG)
                 _add_to_history(phone, bot_msg=ELIGIBILITY_TELL_ME_MORE_MSG)
             sess["_state_handled_question"] = True
-            await mcp_wa_send(phone, ELIGIBILITY_PROMPT, buttons=ELIGIBILITY_BUTTONS)
-            _add_to_history(phone, bot_msg=ELIGIBILITY_PROMPT)
-            sess["_eligibility_mode"] = "ALIGN"
+            await mcp_wa_send(phone, ELIGIBILITY_FAQ_MORE_PROMPT, buttons=ELIGIBILITY_FAQ_MORE_BUTTONS)
+            _add_to_history(phone, bot_msg=ELIGIBILITY_FAQ_MORE_PROMPT)
+            sess["_eligibility_faq_more_prompted"] = True
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             return

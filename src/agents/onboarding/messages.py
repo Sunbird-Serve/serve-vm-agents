@@ -41,7 +41,7 @@ Just send 'start' whenever you're ready."""
 
 WELCOME_INTRO = """Hi! I'm Siya - I represent eVidyaloka’s Volunteering Team.
 
-Thank you for being here for the cause of children’s education in government schools, supported through live online teaching.
+You’re joining SERVE, our volunteer initiative for teaching students online and supporting children’s education in government schools.
 It’s my pleasure to welcome you on this journey 🌱"""
 
 WELCOME_INSTRUCTIONS = """I’m here to guide you through getting started as a volunteer —
@@ -73,6 +73,8 @@ Shall I take you through a few quick questions to get you ready?"""
 WELCOME_CONSENT_ACK = """Great, I'll keep it simple and quick."""
 
 WELCOME_CONSENT_REMINDER = """Quick reminder — shall we continue with the onboarding?"""
+
+WELCOME_FAQ_FOLLOWUP = """Shall we begin now? You’ll get to know more as we go, and you can ask questions anytime — I’m here to help."""
 
 
 # ---------- Section 2: Intent (Purpose Acknowledgement) ----------
@@ -126,10 +128,11 @@ PEEK_VIDEO_PROMPT = "By the way, would you like to watch a short live class glim
 PEEK_NEEDS_PROMPT = "Would you like to see a quick preview of current requirements? You can say yes, skip, or maybe."
 PEEK_REQUIREMENTS_NOTE = "This is just a preview — we’ll later look at what works for you."
 PEEK_SKIP_MESSAGE = "From here, we’ll move into a few basics — about 10 minutes, at your pace 🙂"
+PEEK_MAYBE_MESSAGE = "Totally okay — we can skip it for now and continue. You can always come back to it later."
 
 
 # ---------- Section 2.5: Needs Preview ----------
-NEEDS_PREVIEW_HEADER = """To give you a sense of how volunteering usually looks, here are a couple of current examples 👇"""
+NEEDS_PREVIEW_HEADER = """To give you a sense of how volunteering usually looks, here are a couple of current open requirements 👇"""
 
 NEEDS_PREVIEW_DISCLAIMER = """This is just a preview — Later, we'll understand your comfort and availability and match you thoughtfully. """
 
@@ -175,6 +178,15 @@ If this sounds like something you'd enjoy, we can continue"""
 
 # Button labels for ELIGIBILITY main prompt
 ELIGIBILITY_BUTTONS = ["Yes, this works", "Tell me more", "Something won't work"]
+
+# Follow-up after answering eligibility FAQ
+ELIGIBILITY_FAQ_MORE_PROMPT = "Do you have more questions, or can we continue?"
+ELIGIBILITY_FAQ_MORE_BUTTONS = ["Yes, more questions", "No, continue"]
+ELIGIBILITY_FAQ_MORE_ACK = "Sure — ask me any question."
+ELIGIBILITY_CONFIRM_SHORT = (
+    "So just to confirm — are all three okay for you? "
+    "(18+, tablet/laptop+internet, unpaid role) You can simply reply with Yes or No 🙂"
+)
 
 # Button labels for issue selection
 ELIGIBILITY_ISSUE_SELECTION_BUTTONS = ["Age", "Device", "Time", "Unpaid", "Other"]
@@ -251,6 +263,10 @@ Email: **{email}**
 Is this correct? Reply Yes or No"""
 
 IDENTITY_EMAIL_CORRECTION = """No worries! Could you share your email again? 🙂"""
+IDENTITY_FAQ_EMAIL_STORAGE = "We use your email only to create your volunteer profile and share session updates."
+IDENTITY_FAQ_EMAIL_REQUIRED = "Yes, we need your email to create your volunteer profile and stay in touch."
+IDENTITY_FAQ_PHONE_REQUIRED = "Your phone number helps us reach you for session updates. We only use it for the program."
+IDENTITY_FAQ_PROMO_EMAIL = "We won’t send promotional emails. We use your email only for volunteering updates."
 
 IDENTITY_NAME_RECHECK = """Just checking — what name should I use to address you?"""
 
@@ -428,6 +444,18 @@ PREFS_EVENING_DEFERRAL = (
 QA_ENTRY_PROMPT = """Do you have any quick questions for me? (training, certificate, subjects, tech setup…)
 
 I'll keep it short and clear. 🙂"""
+
+QA_MORE_PROMPT = """Do you have any more questions?"""
+QA_MORE_BUTTONS = ["Yes, one more", "No, that's all"]
+
+QA_CLOSING_MSG = """Thanks, {name}! Our coordinator will soon get in touch with you."""
+
+QA_FALLBACK_SOFT = """Thanks for your question. Our coordinator will get in touch with you soon."""
+
+# ---------- Section 5.5: Feedback ----------
+QA_FEEDBACK_PROMPT = "Before we wrap up, how was this onboarding experience for you?"
+QA_FEEDBACK_BUTTONS = ["Great 👍", "Okay 🙂", "Needs improvement"]
+QA_FEEDBACK_CLOSING = "Thank you, {name}! Your feedback helps us improve. A coordinator will be in touch if needed."
 
 QA_MANDATORY_ORIENT = """One last step: a short WhatsApp check-in (about 10–15 minutes) is required for all volunteers.
 

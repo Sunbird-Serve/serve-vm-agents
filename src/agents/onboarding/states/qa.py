@@ -10,7 +10,8 @@ from typing import Dict, Any
 from ..messages import (
     QA_ENTRY_PROMPT, QA_STOP_ACK, QA_DEFERRAL_PROMPT,
     QA_FAQ_ABOUT_SERVE, QA_FAQ_TIME_PROCESS, QA_FAQ_SUPPORT,
-    QA_FAQ_CERTIFICATE, QA_FAQ_SUBJECTS_GRADES, QA_FAQ_TECH
+    QA_FAQ_CERTIFICATE, QA_FAQ_SUBJECTS_GRADES, QA_FAQ_TECH,
+    QA_MORE_PROMPT, QA_MORE_BUTTONS, QA_FALLBACK_SOFT
 )
 from ..validators import is_no_response
 
@@ -57,9 +58,30 @@ async def handle_qa_window(phone: str, text: str, sess: Dict[str, Any], profile:
     faq_bucket = None
     classifier_conf = None
     
-    # If user indicates they're done with questions, transition to COMPLETE
+    # If we recently asked whether they have more questions, handle that first
+    if sess.get("_qa_more_prompted"):
+        if is_no_response(text) or re.search(r"\b(no|that's all|thats all|nope|done)\b", text_lower):
+            sess["_qa_more_prompted"] = False
+            sess["state"] = "FEEDBACK"
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            await _handle(phone, "__kick__")
+            return
+        if re.search(r"\b(yes|yeah|yep|sure|ok|okay|more|one more)\b", text_lower):
+            sess["_qa_more_prompted"] = False
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            # Continue to answer their next question
+        else:
+            await mcp_wa_send(phone, QA_MORE_PROMPT, buttons=QA_MORE_BUTTONS)
+            _add_to_history(phone, bot_msg=QA_MORE_PROMPT)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+
+    # If user indicates they're done with questions, transition to COMPLETE with closing
     if is_no_response(text) or re.search(r"\b(not now|no questions|no questions?|nothing|no)\b", text_lower):
-        sess["state"] = "COMPLETE"
+        sess["state"] = "FEEDBACK"
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         await _handle(phone, "__kick__")
@@ -183,14 +205,13 @@ async def handle_qa_window(phone: str, text: str, sess: Dict[str, Any], profile:
             except Exception:
                 pass
             
-            # After answering, check if max turns reached, otherwise stay in QA_WINDOW
-            if qa_count >= 2:
-                # Max turns reached, transition to COMPLETE
-                await asyncio.sleep(0.5)
-                sess["state"] = "COMPLETE"
+            # After answering, check if max turns reached
+            if qa_count >= 2 and not sess.get("_qa_more_prompted"):
+                await mcp_wa_send(phone, QA_MORE_PROMPT, buttons=QA_MORE_BUTTONS)
+                _add_to_history(phone, bot_msg=QA_MORE_PROMPT)
+                sess["_qa_more_prompted"] = True
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
-                await _handle(phone, "__kick__")
             return
     
     # E) LLM + KB (single pipeline: retrieve from faqs.jsonl + compose_answer via faq.answer)
@@ -208,9 +229,7 @@ async def handle_qa_window(phone: str, text: str, sess: Dict[str, Any], profile:
         
         # Fallback if LLM+KB failed or no context
         if not answer:
-            answer = (
-                "I might not have the perfect answer right now. Our coordinator will cover this in orientation."
-            )
+            answer = QA_FALLBACK_SOFT
         
         if "custom" not in qa_topics:
             qa_topics.append("custom")
@@ -236,14 +255,13 @@ async def handle_qa_window(phone: str, text: str, sess: Dict[str, Any], profile:
         except Exception:
             pass
         
-        # After answering, check if max turns reached, otherwise stay in QA_WINDOW
-        if qa_count >= 2:
-            # Max turns reached, transition to COMPLETE
-            await asyncio.sleep(0.5)
-            sess["state"] = "COMPLETE"
+        # After answering, check if max turns reached
+        if qa_count >= 2 and not sess.get("_qa_more_prompted"):
+            await mcp_wa_send(phone, QA_MORE_PROMPT, buttons=QA_MORE_BUTTONS)
+            _add_to_history(phone, bot_msg=QA_MORE_PROMPT)
+            sess["_qa_more_prompted"] = True
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
-            await _handle(phone, "__kick__")
         return
     
     # Should not reach here, but handle gracefully

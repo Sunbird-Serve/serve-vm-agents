@@ -28,6 +28,7 @@ from .messages import (
     WELCOME, WELCOME_MAYBE_LATER,
     WELCOME_INTRO, WELCOME_INSTRUCTIONS, WELCOME_START_BUTTONS, WELCOME_VIDEO_INTRO, WELCOME_VIDEO_FOOTER,
     GENERIC_DEFERRED_MSG, WELCOME_SERVE_OVERVIEW, WELCOME_CONSENT_ACK, WELCOME_CONSENT_REMINDER,
+    WELCOME_FAQ_FOLLOWUP,
     INTENT_PROMPT, INTENT_EXIT,
     ELIGIBILITY_PROMPT, ELIGIBILITY_EXIT,
     ELIGIBILITY_INTRO, ELIGIBILITY_Q1, ELIGIBILITY_Q2, ELIGIBILITY_Q3,
@@ -62,7 +63,7 @@ from .messages import (
     YES_WORDS, NO_WORDS, MAYBE_LATER, CONFIRM_WORDS, EDIT_WORDS,
     VIDEO_INTRO, VIDEO_FOOTER, VIDEO_DONE_PROMPT, VIDEO_ERROR_MSG,
     PEEK_VIDEO_PROMPT,
-    PEEK_NEEDS_PROMPT, PEEK_REQUIREMENTS_NOTE, PEEK_SKIP_MESSAGE,
+    PEEK_NEEDS_PROMPT, PEEK_REQUIREMENTS_NOTE, PEEK_SKIP_MESSAGE, PEEK_MAYBE_MESSAGE,
     format_message, format_subjects_list
 )
 from .validators import is_yes_response, is_no_response, is_defer_response, is_resume_response, normalize_phone
@@ -75,6 +76,7 @@ from .states.intent import handle_intent
 from .states.readiness_check import handle_readiness_check
 from .states.video import handle_video
 from .states.needs_preview import handle_needs_preview
+from .states.feedback import handle_feedback
 from .states.continue_confirm import handle_continue_confirm
 from .states.eligibility import handle_eligibility
 from .states.identity import handle_identity
@@ -2912,9 +2914,9 @@ async def _handle(phone: str, text: str):
                     if not answered:
                         await _handle_offtopic_redirect()
                 
-                # Re-ask how to continue and stay in WELCOME
-                await mcp_wa_send(phone, WELCOME_INSTRUCTIONS, buttons=WELCOME_START_BUTTONS)
-                _add_to_history(phone, bot_msg=WELCOME_INSTRUCTIONS)
+                # Follow up in the same reply instead of re-sending welcome instructions
+                await mcp_wa_send(phone, WELCOME_FAQ_FOLLOWUP, buttons=WELCOME_START_BUTTONS)
+                _add_to_history(phone, bot_msg=WELCOME_FAQ_FOLLOWUP)
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
                 return
@@ -2940,14 +2942,23 @@ async def _handle(phone: str, text: str):
             return
         
         stage = sess.get("_peek_stage") or "VIDEO"
-        try:
-            plan = await _peek_planner_llm(text, stage=stage)
-            action = (plan.get("action") or "").upper()
-            tone_reply = (plan.get("tone_reply") or "").strip()
-        except Exception as e:
-            log.warning(f"[PEEK_CHOICE] Planner failed: {e}")
-            action = ""
+        text_lower = text.lower().strip()
+        if text_lower in {"maybe", "maybe later"}:
+            action = "SKIP"
             tone_reply = ""
+            sess["_peek_soft_deferral"] = True
+        elif text_lower in {"no", "nope", "nah", "no thanks", "not now", "skip"}:
+            action = "SKIP"
+            tone_reply = ""
+        else:
+            try:
+                plan = await _peek_planner_llm(text, stage=stage)
+                action = (plan.get("action") or "").upper()
+                tone_reply = (plan.get("tone_reply") or "").strip()
+            except Exception as e:
+                log.warning(f"[PEEK_CHOICE] Planner failed: {e}")
+                action = ""
+                tone_reply = ""
         
         if tone_reply and action != "SKIP":
             await mcp_wa_send(phone, tone_reply)
@@ -2964,9 +2975,11 @@ async def _handle(phone: str, text: str):
                 return
             if action == "SKIP":
                 if not sess.get("_peek_skip_message_sent"):
-                    await mcp_wa_send(phone, PEEK_SKIP_MESSAGE)
-                    _add_to_history(phone, bot_msg=PEEK_SKIP_MESSAGE)
+                    skip_msg = PEEK_MAYBE_MESSAGE if sess.get("_peek_soft_deferral") else PEEK_SKIP_MESSAGE
+                    await mcp_wa_send(phone, skip_msg)
+                    _add_to_history(phone, bot_msg=skip_msg)
                     sess["_peek_skip_message_sent"] = True
+                sess.pop("_peek_soft_deferral", None)
                 sess["state"] = "PEEK_NEEDS_OFFER"
                 sess["sub_state"] = "PEEK_NEEDS_OFFER"
                 sess["ts"] = time.time()
@@ -2998,14 +3011,23 @@ async def _handle(phone: str, text: str):
             SESSIONS[phone] = sess
             return
         
-        try:
-            plan = await _peek_planner_llm(text, stage="NEEDS")
-            action = (plan.get("action") or "").upper()
-            tone_reply = (plan.get("tone_reply") or "").strip()
-        except Exception as e:
-            log.warning(f"[PEEK_NEEDS_OFFER] Planner failed: {e}")
-            action = ""
+        text_lower = text.lower().strip()
+        if text_lower in {"maybe", "maybe later"}:
+            action = "SKIP"
             tone_reply = ""
+            sess["_peek_soft_deferral"] = True
+        elif text_lower in {"no", "nope", "nah", "no thanks", "not now", "skip"}:
+            action = "SKIP"
+            tone_reply = ""
+        else:
+            try:
+                plan = await _peek_planner_llm(text, stage="NEEDS")
+                action = (plan.get("action") or "").upper()
+                tone_reply = (plan.get("tone_reply") or "").strip()
+            except Exception as e:
+                log.warning(f"[PEEK_NEEDS_OFFER] Planner failed: {e}")
+                action = ""
+                tone_reply = ""
         
         if tone_reply and action != "SKIP":
             await mcp_wa_send(phone, tone_reply)
@@ -3023,9 +3045,11 @@ async def _handle(phone: str, text: str):
         
         if action == "SKIP":
             if not sess.get("_peek_skip_message_sent"):
-                await mcp_wa_send(phone, PEEK_SKIP_MESSAGE)
-                _add_to_history(phone, bot_msg=PEEK_SKIP_MESSAGE)
+                skip_msg = PEEK_MAYBE_MESSAGE if sess.get("_peek_soft_deferral") else PEEK_SKIP_MESSAGE
+                await mcp_wa_send(phone, skip_msg)
+                _add_to_history(phone, bot_msg=skip_msg)
                 sess["_peek_skip_message_sent"] = True
+            sess.pop("_peek_soft_deferral", None)
             sess["state"] = "ELIGIBILITY"
             sess["sub_state"] = "ELIGIBILITY"
             sess["ts"] = time.time()
@@ -3168,6 +3192,11 @@ async def _handle(phone: str, text: str):
     # ========== QA_WINDOW STATE (State 6: Questions & Answers) ==========
     if state == "QA_WINDOW":
         await handle_qa_window(phone, text_for_state, sess, profile)
+        return
+
+    # ========== FEEDBACK STATE ==========
+    if state == "FEEDBACK":
+        await handle_feedback(phone, text_for_state, sess, profile)
         return
     
     # ========== REJECTED STATE (Eligibility Not Met) ==========

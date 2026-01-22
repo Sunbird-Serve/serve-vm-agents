@@ -15,7 +15,9 @@ from ..messages import (
     IDENTITY_CONFIRM_CONTACT, IDENTITY_EMAIL_CORRECTION, IDENTITY_CONTACT_RETRY,
     IDENTITY_NAME_RECHECK, IDENTITY_REGISTRATION_START, IDENTITY_REGISTRATION_EXISTING,
     IDENTITY_REGISTRATION_CREATED, IDENTITY_REGISTRATION_FAILED,
-    IDENTITY_REGISTRATION_WAIT_REASSURANCE
+    IDENTITY_REGISTRATION_WAIT_REASSURANCE,
+    IDENTITY_FAQ_EMAIL_STORAGE, IDENTITY_FAQ_EMAIL_REQUIRED, IDENTITY_FAQ_PHONE_REQUIRED,
+    IDENTITY_FAQ_PROMO_EMAIL
 )
 from ..validators import is_yes_response, is_no_response
 from ..config import settings
@@ -217,7 +219,11 @@ def validate_name(text: str) -> bool:
     non_name_phrases = [
         "i don't know", "i dont know", "idk", "don't know", "dont know",
         "not sure", "unsure", "skip", "later", "no", "none", "nothing",
-        "n/a", "na", "not applicable", "prefer not", "rather not"
+        "n/a", "na", "not applicable", "prefer not", "rather not",
+        # Common button labels / control phrases
+        "yes, this works", "yes this works", "tell me more", "something won't work",
+        "something wont work", "skip for now", "yes, continue", "yes continue",
+        "i'll do this later", "ill do this later", "continue now", "later works better"
     ]
     
     for phrase in non_name_phrases:
@@ -993,6 +999,18 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
             return
         else:
             # User responded to name question
+            text_lower = text.lower().strip()
+            if "?" in text_lower or re.search(r"\b(what|why|how|can|do|does|is|are)\b", text_lower):
+                if "name" in text_lower and ("required" in text_lower or "need" in text_lower):
+                    reply = "Yes, we need your name to create your volunteer profile. What name should I use?"
+                else:
+                    reply = "Happy to help with questions once I have your name. What name should I use?"
+                await mcp_wa_send(phone, reply)
+                _add_to_history(phone, bot_msg=reply)
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+
             # Step 1: Rule-based classification
             intent, extracted_name = classify_name_response(text)
             log.info(f"[IDENTITY] Name classification: intent={intent}, name={extracted_name}")
@@ -1340,6 +1358,25 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
                 SESSIONS[phone] = sess
                 return
         
+        # Step 0: Handle common identity FAQs, then re-ask
+        text_lower = text.lower().strip()
+        if "?" in text_lower:
+            if "email" in text_lower and ("promo" in text_lower or "promotion" in text_lower or "marketing" in text_lower or "ads" in text_lower):
+                reply = IDENTITY_FAQ_PROMO_EMAIL
+            elif "email" in text_lower and ("store" in text_lower or "stored" in text_lower or "save" in text_lower or "use" in text_lower):
+                reply = IDENTITY_FAQ_EMAIL_STORAGE
+            elif "email" in text_lower and ("need" in text_lower or "required" in text_lower or "why" in text_lower):
+                reply = IDENTITY_FAQ_EMAIL_REQUIRED
+            elif "phone" in text_lower and ("need" in text_lower or "required" in text_lower or "why" in text_lower or "use" in text_lower):
+                reply = IDENTITY_FAQ_PHONE_REQUIRED
+            else:
+                reply = "Happy to help with questions once we finish your details. Could you share your email?"
+            await mcp_wa_send(phone, reply)
+            _add_to_history(phone, bot_msg=reply)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+
         # Step 1: Extract email only (ignore phone in user response)
         extracted_email = extract_email(text)
         log.info(f"[IDENTITY] Email extraction: {extracted_email}")
