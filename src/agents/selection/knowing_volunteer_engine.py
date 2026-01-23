@@ -798,10 +798,44 @@ async def run_knowing_volunteer_step(
     
     clarification_for_target = False
     
+    # Rule-based fallback for common replies (helps avoid loops on simple responses)
+    force_commit_target = False
+    if expected_target:
+        text_lower = (user_text or "").lower().strip()
+        rule_signals = {}
+        if expected_target == "teaching_readiness":
+            if re.search(r"\b(very\s+)?comfortable|confident|ready|okay|ok|sure\b", text_lower):
+                rule_signals["teaching_readiness"] = "comfortable_with_guidance"
+            elif re.search(r"\b(not comfortable|uncomfortable|not confident)\b", text_lower):
+                rule_signals["teaching_readiness"] = "no"
+            elif re.search(r"\b(unsure|not sure|maybe|nervous)\b", text_lower):
+                rule_signals["teaching_readiness"] = "unsure_but_open"
+        elif expected_target == "motivation":
+            if re.search(r"\b(help|teach|support|give back|contribute|volunteer|kids|children|students|education)\b", text_lower):
+                rule_signals["motivation"] = "help"
+        elif expected_target == "teaching_experience":
+            if re.search(r"\b(yes|have|taught|teaching|mentor|mentored|trained|experience)\b", text_lower):
+                rule_signals["teaching_experience"] = True
+            elif re.search(r"\b(no|not really|never|haven't|have not|didn't|did not)\b", text_lower):
+                rule_signals["teaching_experience"] = False
+        elif expected_target == "commitment_horizon":
+            if re.search(r"\b(yes|ok|okay|sure|can|will|possible|fine)\b", text_lower):
+                rule_signals["commitment_horizon"] = "yes"
+            elif re.search(r"\b(not sure|maybe|unsure)\b", text_lower):
+                rule_signals["commitment_horizon"] = "unsure"
+            elif re.search(r"\b(no|cannot|can't|cant)\b", text_lower):
+                rule_signals["commitment_horizon"] = "no"
+        elif expected_target == "language" and preferred_language:
+            if re.search(r"\b(very\s+)?comfortable|confident|good|ok|okay|fine\b", text_lower):
+                rule_signals["language_comfort"] = "All"
+        if rule_signals:
+            signals.update(rule_signals)
+            force_commit_target = True
+    
     # Guard: if confidence is low and LLM claims to extract a new signal for expected_target,
     # do NOT commit that field yet. Instead, ask a simple clarification question and
     # increment low_conf_streak.
-    if expected_target and confidence < LOW_CONF_THRESHOLD:
+    if expected_target and confidence < LOW_CONF_THRESHOLD and not force_commit_target:
         new_signal_for_target = False
         
         if expected_target == "language":
@@ -886,6 +920,9 @@ async def run_knowing_volunteer_step(
             high_conf_success = True
         elif expected_target == "language" and "language_comfort" in signals_extracted:
             high_conf_success = True
+    if force_commit_target and expected_target:
+        if expected_target in signals_extracted or (expected_target == "language" and "language_comfort" in signals_extracted):
+            high_conf_success = True
     
     if high_conf_success:
         if low_conf_streak != 0:
@@ -942,8 +979,14 @@ async def run_knowing_volunteer_step(
     session["tool_state"]["selection"]["question_index"] += 1
     question_index = session["tool_state"]["selection"]["question_index"]
     
+    # Hard cap on number of questions to prevent long loops
+    MAX_KNOWING_VOLUNTEER_QUESTIONS = 6
+    if question_index >= MAX_KNOWING_VOLUNTEER_QUESTIONS:
+        log.info(f"[KNOWING_VOLUNTEER] Max questions reached ({question_index}), stopping")
+        decision = KnowingVolunteerResult.COMPLETE_INSUFFICIENT_INFO
+        tone_reply = "Thanks for sharing — I have enough to suggest a next step."
     # Low-confidence escape hatch: if we have repeatedly low confidence, stop probing
-    if low_conf_streak >= 2:
+    elif low_conf_streak >= 2:
         log.info("[KNOWING_VOLUNTEER] Low confidence streak >= 2, stopping with COMPLETE_INSUFFICIENT_INFO")
         decision = KnowingVolunteerResult.COMPLETE_INSUFFICIENT_INFO
         # Graceful closing (this will be sent instead of another probing question)
