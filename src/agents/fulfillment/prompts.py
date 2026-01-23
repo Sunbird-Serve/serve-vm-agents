@@ -12,7 +12,7 @@ Reply with the number to nominate yourself."""
 FULFILL_LIST_HEADER = "Open opportunities you can consider:"
 
 FULFILL_LIST_FOOTER = """This is just to understand your preference — we can always adjust or discuss later.
-Reply 1/2/3... or type 'Not now' to decide later."""
+Reply 1/2/3... or if it is not matching your preferences type 'Not now' to decide later."""
 
 # FULFILL_INVALID_PICK message
 FULFILL_INVALID_PICK_MSG = "Please reply with a number like 1 or 2 😊 (or type 'Not now' to decide later)"

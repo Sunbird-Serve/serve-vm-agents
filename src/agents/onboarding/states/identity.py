@@ -1024,7 +1024,7 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
             # If still not a valid name, handle questions about the name request
             if intent != "NAME_OK":
                 text_lower = text.lower().strip()
-                if "?" in text_lower or re.search(r"\b(what|why|how|can|do|does|is|are)\b", text_lower):
+                if "?" in text_lower or re.search(r"\b(what|why|how|can|do|does)\b", text_lower):
                     if "name" in text_lower and ("required" in text_lower or "need" in text_lower):
                         reply = "Yes, we need your name to create your volunteer profile. What name should I use?"
                     else:

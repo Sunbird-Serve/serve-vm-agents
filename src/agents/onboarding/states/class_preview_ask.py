@@ -78,7 +78,7 @@ async def handle_class_preview_ask(
     from ..wa_loop import (
         mcp_wa_send, _add_to_history, _handle, SESSIONS,
         mcp_llm_classify_intent, build_llm_context,
-        mcp_deferral_create
+        mcp_deferral_create, _peek_planner_llm
     )
     
     # Entry: Send button message
@@ -230,10 +230,8 @@ async def handle_class_preview_ask(
         return
     
     # Free text fallback
-    intent = classify_class_preview_intent(text)
-    log.info(f"[CLASS_PREVIEW_ASK] Free text classified as: {intent}")
-    
-    if intent == "STOP":
+    text_lower = text.lower().strip()
+    if re.search(r"\b(stop|unsubscribe|leave|quit|exit|end)\b", text_lower):
         sess["state"] = "OPTOUT"
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
@@ -242,8 +240,7 @@ async def handle_class_preview_ask(
         _add_to_history(phone, bot_msg=stop_msg)
         return
     
-    elif intent == "DEFERRAL":
-        # DEFERRAL -> DEFERRED
+    if re.search(r"\b(later|not now|not right now|another time|some other time|maybe later|after|busy)\b", text_lower):
         volunteer_id = profile.get("uuid") or phone
         try:
             await mcp_deferral_create(
@@ -259,8 +256,7 @@ async def handle_class_preview_ask(
         SESSIONS[phone] = sess
         return
     
-    elif intent == "QUERY":
-        # Answer briefly, re-send buttons
+    if "?" in text or re.search(r"^(what|how|when|why|where|who|which|can|could|do|does|is|are)\b", text, re.I):
         try:
             llm_context = build_llm_context("CLASS_PREVIEW_ASK", sess)
             llm_result = await mcp_llm_classify_intent(text, "CLASS_PREVIEW_ASK", llm_context)
@@ -282,11 +278,29 @@ async def handle_class_preview_ask(
         SESSIONS[phone] = sess
         return
     
-    elif intent == "CLASS_YES":
-        # Yes -> VIDEO
-        log.info(f"[CLASS_PREVIEW_ASK] User wants to see video, proceeding to VIDEO")
+    # Use LLM planner for SHOW_VIDEO / SKIP / CLARIFY
+    try:
+        plan = await _peek_planner_llm(text, stage="VIDEO")
+        action = (plan.get("action") or "").upper()
+        tone_reply = (plan.get("tone_reply") or "").strip()
+    except Exception as e:
+        log.warning(f"[CLASS_PREVIEW_ASK] Planner failed: {e}")
+        action = ""
+        tone_reply = ""
+    
+    if action == "CLARIFY":
+        if tone_reply:
+            await mcp_wa_send(phone, tone_reply)
+            _add_to_history(phone, bot_msg=tone_reply)
+        await mcp_wa_send(phone, CLASS_PREVIEW_ASK_PROMPT, buttons=CLASS_PREVIEW_ASK_BUTTONS)
+        _add_to_history(phone, bot_msg=CLASS_PREVIEW_ASK_PROMPT)
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+        return
+    
+    if action == "SHOW_VIDEO":
+        log.info(f"[CLASS_PREVIEW_ASK] Planner chose SHOW_VIDEO, proceeding to VIDEO")
         
-        # Persistence: Store choice and log event
         now_iso = datetime.now(timezone.utc).isoformat()
         try:
             from storage.db import get_db_session
@@ -332,11 +346,9 @@ async def handle_class_preview_ask(
         await _handle(phone, "__kick__")
         return
     
-    elif intent == "CLASS_SKIP":
-        # Skip -> NEEDS_PREVIEW
-        log.info(f"[CLASS_PREVIEW_ASK] User wants to skip, proceeding to NEEDS_PREVIEW")
+    if action == "SKIP":
+        log.info(f"[CLASS_PREVIEW_ASK] Planner chose SKIP, proceeding to NEEDS_PREVIEW")
         
-        # Persistence: Store choice and log event
         now_iso = datetime.now(timezone.utc).isoformat()
         try:
             from storage.db import get_db_session
@@ -381,4 +393,3 @@ async def handle_class_preview_ask(
         SESSIONS[phone] = sess
         await _handle(phone, "__kick__")
         return
-

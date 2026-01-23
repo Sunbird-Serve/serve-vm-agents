@@ -332,7 +332,7 @@ IMPORTANT JSON rules:
 
 
 # Ordered list of rubrics to fill (deterministic questioning)
-RUBRIC_ORDER = ["motivation", "language", "commitment_horizon", "teaching_readiness", "teaching_experience"]
+RUBRIC_ORDER = ["motivation", "commitment_horizon", "teaching_readiness", "teaching_experience", "language"]
 
 # Confidence threshold for trusting new extractions
 LOW_CONF_THRESHOLD = 0.55
@@ -555,6 +555,9 @@ async def run_knowing_volunteer_step(
     discussed_fields = session["tool_state"]["selection"].get("discussed_fields", set())
     if not isinstance(discussed_fields, set):
         discussed_fields = set(discussed_fields) if discussed_fields else set()
+    # Pre-mark language as discussed to skip asking it for now
+    discussed_fields.add("language")
+    session["tool_state"]["selection"]["discussed_fields"] = discussed_fields
     
     # Calculate next target (skip discussed fields)
     next_target = _get_next_missing_rubric(current_profile, discussed_fields)
