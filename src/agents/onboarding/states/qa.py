@@ -11,7 +11,8 @@ from ..messages import (
     QA_ENTRY_PROMPT, QA_STOP_ACK, QA_DEFERRAL_PROMPT,
     QA_FAQ_ABOUT_SERVE, QA_FAQ_TIME_PROCESS, QA_FAQ_SUPPORT,
     QA_FAQ_CERTIFICATE, QA_FAQ_SUBJECTS_GRADES, QA_FAQ_TECH,
-    QA_MORE_PROMPT, QA_MORE_BUTTONS, QA_FALLBACK_SOFT
+    QA_MORE_PROMPT, QA_MORE_BUTTONS, QA_FALLBACK_SOFT,
+    QA_MORE_ACK
 )
 from ..validators import is_no_response
 
@@ -71,7 +72,10 @@ async def handle_qa_window(phone: str, text: str, sess: Dict[str, Any], profile:
             sess["_qa_more_prompted"] = False
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
-            # Continue to answer their next question
+            # Prompt them to ask the next question (avoid LLM on this text)
+            await mcp_wa_send(phone, QA_MORE_ACK)
+            _add_to_history(phone, bot_msg=QA_MORE_ACK)
+            return
         else:
             await mcp_wa_send(phone, QA_MORE_PROMPT, buttons=QA_MORE_BUTTONS)
             _add_to_history(phone, bot_msg=QA_MORE_PROMPT)

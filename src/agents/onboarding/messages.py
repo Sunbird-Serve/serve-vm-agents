@@ -455,6 +455,7 @@ I'll keep it short and clear. 🙂"""
 
 QA_MORE_PROMPT = """Do you have any more questions?"""
 QA_MORE_BUTTONS = ["Yes, one more", "No, that's all"]
+QA_MORE_ACK = "Sure — what's your question?"
 
 QA_CLOSING_MSG = """Thanks, {name}! Our coordinator will soon get in touch with you."""
 
