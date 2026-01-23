@@ -14,6 +14,7 @@ from .prompts import (
     get_sel_video_intro,
     get_sel_video_followup,
     get_sel_about_you,
+    get_sel_language_comfort_prompt,
     get_sel_recommended_msg,
     SEL_NOT_RECOMMENDED_MSG,
     SEL_DEFERRED_MSG,
@@ -43,6 +44,10 @@ def _sanitize_ascii(text: str) -> str:
     if not text:
         return text
     return text.encode("ascii", errors="ignore").decode("ascii").strip()
+
+
+def _has_non_ascii(text: str) -> bool:
+    return any(ord(ch) > 127 for ch in (text or ""))
 
 
 def _get_mcp_wa_send():
@@ -521,14 +526,17 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
             profile = session.get("profile", {})
             preferred_language = session.get("profile", {}).get("preferences", {}).get("language")
             expected_target = session.get("tool_state", {}).get("selection", {}).get("expected_target")
-            if expected_target == "language" and preferred_language:
-                safe_text = _sanitize_ascii(assistant_text)
-                question_msg_id = await mcp_wa_send(phone, safe_text)
-                session["_last_agent_prompt"] = safe_text
-            else:
-                safe_text = _sanitize_ascii(assistant_text)
-                question_msg_id = await mcp_wa_send(phone, safe_text)
-                session["_last_agent_prompt"] = safe_text
+            safe_text = assistant_text.strip()
+            if _has_non_ascii(safe_text):
+                profile = session.get("profile", {})
+                name = profile.get("name") or "there"
+                preferred_language = profile.get("preferences", {}).get("language")
+                if expected_target == "language":
+                    safe_text = get_sel_language_comfort_prompt(preferred_language or "that language", name)
+                else:
+                    safe_text = "Could you share that in English? I can only reply in English here."
+            question_msg_id = await mcp_wa_send(phone, safe_text)
+            session["_last_agent_prompt"] = safe_text
             
             # Add to history
             try:
