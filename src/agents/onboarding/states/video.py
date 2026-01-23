@@ -181,9 +181,11 @@ async def handle_video(
                 pass
         
         # Footer + needs preview question in the same message
+        await asyncio.sleep(2.0)
         combined_footer = f"{VIDEO_FOOTER}\n\n{PEEK_NEEDS_PROMPT}"
         await mcp_wa_send(phone, combined_footer)
         _add_to_history(phone, bot_msg=combined_footer)
+        sess["_video_needs_prompted"] = True
         
         # Persistence: Update state and tool_state
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -393,8 +395,9 @@ async def handle_video(
     else:
         next_state = "NEEDS_PREVIEW"
 
-    # Route to next state
-    next_state = sess.pop("_video_next_state", next_state)
+    # Route to next state (ignore _video_next_state if we already prompted for needs)
+    if not sess.get("_video_needs_prompted"):
+        next_state = sess.pop("_video_next_state", next_state)
     log.info(f"[VIDEO] Proceeding to {next_state} after user response")
     sess["state"] = next_state
     sess["sub_state"] = next_state

@@ -17,7 +17,7 @@ from ..messages import (
 log = logging.getLogger(__name__)
 
 
-def format_needs_list(needs_data: List[Dict]) -> str:
+def format_needs_list(needs_data: List[Dict], include_disclaimer: bool = True) -> str:
     """
     Format needs list for WhatsApp display with book emoji and disclaimer appended.
     
@@ -105,8 +105,9 @@ def format_needs_list(needs_data: List[Dict]) -> str:
         lines.append("")  # Empty line between items
     
     # Append disclaimer at the end
-    lines.append("")
-    lines.append(NEEDS_PREVIEW_DISCLAIMER)
+    if include_disclaimer:
+        lines.append("")
+        lines.append(NEEDS_PREVIEW_DISCLAIMER)
     
     return "\n".join(lines)
 
@@ -311,7 +312,9 @@ async def handle_needs_preview(
         
         if needs_data and needs_success:
             # Format and send needs list (includes disclaimer at the end)
-            needs_list = format_needs_list(needs_data)
+            needs_list = format_needs_list(
+                needs_data, include_disclaimer=not sess.get("_needs_preview_note")
+            )
             if needs_list:
                 list_msg_id = await mcp_wa_send(phone, needs_list)
                 _add_to_history(phone, bot_msg=needs_list)

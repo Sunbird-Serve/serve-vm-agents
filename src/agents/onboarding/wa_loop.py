@@ -3111,6 +3111,8 @@ async def _handle(phone: str, text: str):
             # Send mp4 using existing class video tool
             await mcp_wa_send_welcome_video(phone)
             _add_to_history(phone, bot_msg="[VIDEO]")
+            # Short delay to reduce footer arriving before media
+            await asyncio.sleep(2.0)
             await mcp_wa_send(phone, WELCOME_VIDEO_FOOTER)
             _add_to_history(phone, bot_msg=WELCOME_VIDEO_FOOTER)
             sess["_welcome_video_sent"] = True

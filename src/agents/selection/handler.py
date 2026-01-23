@@ -5,6 +5,7 @@ Handles the Selection Agent state machine for volunteer screening and recommenda
 """
 import logging
 import time
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -174,6 +175,7 @@ async def handle_selection_start(phone: str, text: str, session: dict):
         # Send thank-you video via MCP tool
         mcp_wa_send_thankyou_video = _get_mcp_wa_send_thankyou_video()
         video_msg_id = await mcp_wa_send_thankyou_video(phone)
+        await asyncio.sleep(2.0)
 
         # Send followup with continue/later buttons
         profile = session.get("profile", {})
