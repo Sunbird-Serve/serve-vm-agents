@@ -388,8 +388,8 @@ async def handle_needs_preview(
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         
-        # Transition to next state (default CONTINUE_CONFIRM)
-        next_state = sess.pop("_needs_preview_next_state", "CONTINUE_CONFIRM")
+        # Transition to next state (default ELIGIBILITY)
+        next_state = sess.pop("_needs_preview_next_state", "ELIGIBILITY")
         log.info(f"[NEEDS_PREVIEW] Transitioning to {next_state}")
         sess["state"] = next_state
         sess["sub_state"] = next_state

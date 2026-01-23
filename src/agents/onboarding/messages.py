@@ -76,8 +76,8 @@ WELCOME_CONSENT_ACK = """Great, I'll keep it simple and quick."""
 
 WELCOME_CONSENT_REMINDER = """Quick reminder — shall we continue with the onboarding?"""
 
-WELCOME_FAQ_FOLLOWUP = """Shall we begin now? You’ll get to know more as we go, and you can ask questions anytime — I’m here to help."""
-WELCOME_STATEMENT_ACK = "Thanks for sharing. Happy to help."
+WELCOME_FAQ_FOLLOWUP = """Let's get started — I'll explain things along the way."""
+WELCOME_STATEMENT_ACK = "Got it 🙂 I'm here to help."
 
 
 # ---------- Section 2: Intent (Purpose Acknowledgement) ----------
