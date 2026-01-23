@@ -991,10 +991,10 @@ async def run_knowing_volunteer_step(
         pattern = patterns.get(target)
         return bool(pattern and re.search(pattern, reply, re.I))
     
-    # Increment question_index only when we asked the expected rubric
+    # Increment question_index on every assistant question to enforce a hard cap
     if "question_index" not in session["tool_state"]["selection"]:
         session["tool_state"]["selection"]["question_index"] = 0
-    if _asked_expected_target(tone_reply, expected_target):
+    if tone_reply:
         session["tool_state"]["selection"]["question_index"] += 1
     question_index = session["tool_state"]["selection"]["question_index"]
     
