@@ -287,15 +287,16 @@ async def handle_video(
         _add_to_history(phone, bot_msg=VIDEO_ABOUT_MSG)
         sess["_state_handled_question"] = True
     
-    # Send VIDEO_DONE_PROMPT before proceeding
-    log.info(f"[VIDEO] Sending done prompt to {phone}")
+    # Send VIDEO_DONE_PROMPT before proceeding (skip if we already asked needs preview)
     done_msg_id = None
-    try:
-        done_msg_id = await mcp_wa_send(phone, VIDEO_DONE_PROMPT)
-        _add_to_history(phone, bot_msg=VIDEO_DONE_PROMPT)
-        log.info(f"[VIDEO] Done prompt sent successfully")
-    except Exception as e:
-        log.error(f"[VIDEO] Failed to send done prompt: {e}", exc_info=True)
+    if not sess.get("_video_needs_prompted"):
+        log.info(f"[VIDEO] Sending done prompt to {phone}")
+        try:
+            done_msg_id = await mcp_wa_send(phone, VIDEO_DONE_PROMPT)
+            _add_to_history(phone, bot_msg=VIDEO_DONE_PROMPT)
+            log.info(f"[VIDEO] Done prompt sent successfully")
+        except Exception as e:
+            log.error(f"[VIDEO] Failed to send done prompt: {e}", exc_info=True)
     
     # Persistence: Store video ack and log event
     now_iso = datetime.now(timezone.utc).isoformat()
