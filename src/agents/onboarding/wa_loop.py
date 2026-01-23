@@ -2891,6 +2891,17 @@ async def _handle(phone: str, text: str):
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
                 return
+            
+            # Handle welcome start button text robustly (strip punctuation/emojis)
+            normalized_text = re.sub(r"[^a-z0-9]+", " ", text_lower_global).strip()
+            if normalized_text in {"lets start", "let s start", "start"}:
+                log.info(f"[GREET] Start detected, transitioning to WELCOME_VIDEO")
+                sess["state"] = "WELCOME_VIDEO"
+                sess["sub_state"] = "WELCOME_VIDEO"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                await _handle(phone, "__kick__")
+                return
 
             # Welcome FAQ handling: answer common questions and keep in WELCOME
             if _is_question(text) and not sess.get("_state_handled_question"):
