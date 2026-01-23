@@ -2804,7 +2804,6 @@ async def _handle(phone: str, text: str):
                         log.warning(f"[GREET] Failed to persist template: {e}", exc_info=True)
                     
                     # Small delay to ensure template is delivered before sending text messages
-                    import asyncio
                     await asyncio.sleep(1.0)
                     
                 except Exception as e:

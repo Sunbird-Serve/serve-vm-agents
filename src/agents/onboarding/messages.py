@@ -172,7 +172,7 @@ Volunteering with SERVE usually means:
 
 * teaching students online using laptop or a tablet (not phone)  
 
-* spending around *2 hours a week*
+* spending around *2 hours a week*, ideally spread across two weekdays
 
 * contributing in a *voluntary (unpaid)* role
 
