@@ -999,19 +999,7 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
             return
         else:
             # User responded to name question
-            text_lower = text.lower().strip()
-            if "?" in text_lower or re.search(r"\b(what|why|how|can|do|does|is|are)\b", text_lower):
-                if "name" in text_lower and ("required" in text_lower or "need" in text_lower):
-                    reply = "Yes, we need your name to create your volunteer profile. What name should I use?"
-                else:
-                    reply = "Happy to help with questions once I have your name. What name should I use?"
-                await mcp_wa_send(phone, reply)
-                _add_to_history(phone, bot_msg=reply)
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
-                return
-
-            # Step 1: Rule-based classification
+            # Step 1: Rule-based classification (prefer name extraction before question handling)
             intent, extracted_name = classify_name_response(text)
             log.info(f"[IDENTITY] Name classification: intent={intent}, name={extracted_name}")
             
@@ -1032,6 +1020,20 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
                             log.info(f"[IDENTITY] LLM helped extract name: {extracted_name}")
                 except Exception as e:
                     log.warning(f"[IDENTITY] LLM classification failed: {e}")
+            
+            # If still not a valid name, handle questions about the name request
+            if intent != "NAME_OK":
+                text_lower = text.lower().strip()
+                if "?" in text_lower or re.search(r"\b(what|why|how|can|do|does|is|are)\b", text_lower):
+                    if "name" in text_lower and ("required" in text_lower or "need" in text_lower):
+                        reply = "Yes, we need your name to create your volunteer profile. What name should I use?"
+                    else:
+                        reply = "Happy to help with questions once I have your name. What name should I use?"
+                    await mcp_wa_send(phone, reply)
+                    _add_to_history(phone, bot_msg=reply)
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+                    return
             
             # Step 3: Handle based on intent
             if intent == "NAME_OK" and extracted_name:
