@@ -15,6 +15,9 @@ from ..messages import (
     VIDEO_INTRO,
     VIDEO_FOOTER,
     VIDEO_DONE_PROMPT,
+    PEEK_NEEDS_PROMPT,
+    PEEK_SKIP_MESSAGE,
+    PEEK_MAYBE_MESSAGE,
 )
 
 log = logging.getLogger(__name__)
@@ -67,7 +70,7 @@ async def handle_video(
     from ..wa_loop import (
         mcp_wa_send, mcp_wa_send_class_video,
         _add_to_history, _handle, SESSIONS,
-        mcp_deferral_create
+        mcp_deferral_create, _peek_planner_llm
     )
     from ..messages import VIDEO_ERROR_MSG
     
@@ -177,9 +180,10 @@ async def handle_video(
             except:
                 pass
         
-        # Footer: prompt to reply Done
-        await mcp_wa_send(phone, VIDEO_FOOTER)
-        _add_to_history(phone, bot_msg=VIDEO_FOOTER)
+        # Footer + needs preview question in the same message
+        combined_footer = f"{VIDEO_FOOTER}\n\n{PEEK_NEEDS_PROMPT}"
+        await mcp_wa_send(phone, combined_footer)
+        _add_to_history(phone, bot_msg=combined_footer)
         
         # Persistence: Update state and tool_state
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -349,8 +353,48 @@ async def handle_video(
     except Exception as e:
         log.warning(f"[VIDEO] Failed to persist: {e}", exc_info=True)
     
-    # Route to next state (default NEEDS_PREVIEW)
-    next_state = sess.pop("_video_next_state", "NEEDS_PREVIEW")
+    # Decide needs preview action based on user's reply
+    text_lower = (text or "").lower().strip()
+    needs_action = None
+    tone_reply = ""
+    if text_lower in {"maybe", "maybe later"}:
+        needs_action = "SKIP"
+        sess["_peek_soft_deferral"] = True
+    elif text_lower in {"no", "nope", "nah", "no thanks", "not now", "skip"}:
+        needs_action = "SKIP"
+    elif text_lower in {"yes", "y", "sure", "ok", "okay", "show", "see", "view", "yes please"}:
+        needs_action = "SHOW_NEEDS"
+    else:
+        try:
+            plan = await _peek_planner_llm(text, stage="NEEDS")
+            needs_action = (plan.get("action") or "").upper()
+            tone_reply = (plan.get("tone_reply") or "").strip()
+        except Exception as e:
+            log.warning(f"[VIDEO] Needs planner failed: {e}")
+            needs_action = ""
+            tone_reply = ""
+    
+    if needs_action == "CLARIFY":
+        if tone_reply:
+            await mcp_wa_send(phone, tone_reply)
+            _add_to_history(phone, bot_msg=tone_reply)
+        else:
+            await mcp_wa_send(phone, PEEK_NEEDS_PROMPT)
+            _add_to_history(phone, bot_msg=PEEK_NEEDS_PROMPT)
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+        return
+    if needs_action == "SKIP":
+        skip_msg = PEEK_MAYBE_MESSAGE if sess.get("_peek_soft_deferral") else PEEK_SKIP_MESSAGE
+        await mcp_wa_send(phone, skip_msg)
+        _add_to_history(phone, bot_msg=skip_msg)
+        sess.pop("_peek_soft_deferral", None)
+        next_state = "CONTINUE_CONFIRM"
+    else:
+        next_state = "NEEDS_PREVIEW"
+
+    # Route to next state
+    next_state = sess.pop("_video_next_state", next_state)
     log.info(f"[VIDEO] Proceeding to {next_state} after user response")
     sess["state"] = next_state
     sess["sub_state"] = next_state

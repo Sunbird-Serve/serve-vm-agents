@@ -57,7 +57,9 @@ You can pause anytime."""
 WELCOME_START_BUTTONS = ["Let's start", "I'll do this later"]
 
 WELCOME_VIDEO_INTRO = "Here’s a quick hello from our team 🙂"
-WELCOME_VIDEO_FOOTER = "When you’re done watching, just reply Done."
+WELCOME_VIDEO_FOOTER = """That’s our world in a nutshell 🌱
+Take a moment to soak it in — just message me when you feel ready."""
+WELCOME_VIDEO_CONTINUE = "Thanks for sharing — let’s continue."
 
 GENERIC_DEFERRED_MSG = """No worries — take your time.
 Whenever you're ready, just reply here and we'll continue from where you left off."""
@@ -118,7 +120,8 @@ CLASS_PREVIEW_ASK_BUTTONS = ["Yes, show me", "Skip for now"]
 # ---------- Section 2.4: Video ----------
 VIDEO_INTRO = "Here's a short glimpse of how a class usually looks"
 
-VIDEO_FOOTER = "Reply Done when ready"
+VIDEO_FOOTER = """Simple, right?
+That’s how most SERVE classes feel."""
 
 VIDEO_DONE_PROMPT = "Thanks for watching 🙂"
 

@@ -28,7 +28,7 @@ from .messages import (
     WELCOME, WELCOME_MAYBE_LATER,
     WELCOME_INTRO, WELCOME_INSTRUCTIONS, WELCOME_START_BUTTONS, WELCOME_VIDEO_INTRO, WELCOME_VIDEO_FOOTER,
     GENERIC_DEFERRED_MSG, WELCOME_SERVE_OVERVIEW, WELCOME_CONSENT_ACK, WELCOME_CONSENT_REMINDER,
-    WELCOME_FAQ_FOLLOWUP,
+    WELCOME_FAQ_FOLLOWUP, WELCOME_VIDEO_CONTINUE,
     WELCOME_STATEMENT_ACK,
     INTENT_PROMPT, INTENT_EXIT,
     ELIGIBILITY_PROMPT, ELIGIBILITY_EXIT,
@@ -3102,7 +3102,7 @@ async def _handle(phone: str, text: str):
 
     # ========== WELCOME_VIDEO STATE (Quick hello video) ==========
     if state == "WELCOME_VIDEO":
-        from .messages import QA_STOP_ACK
+        from .messages import QA_STOP_ACK, WELCOME_MAYBE_LATER
         text_lower = text.lower().strip()
         
         if text == "__kick__" or not sess.get("_welcome_video_sent"):
@@ -3127,18 +3127,44 @@ async def _handle(phone: str, text: str):
             SESSIONS[phone] = sess
             return
         
-        # If user asks what the video is about, answer and re-ask footer
-        if "video" in text_lower and _is_question(text):
-            # Try to answer any FAQ content in the same message first
+        # Handle deferral / clear decline
+        if (
+            is_no_response(text)
+            or is_defer_response(text)
+            or _detect_deferral(text)
+            or re.search(r"\b(not interested|don'?t want|do not want|dont want)\b", text_lower)
+        ):
+            await mcp_wa_send(phone, WELCOME_MAYBE_LATER)
+            _add_to_history(phone, bot_msg=WELCOME_MAYBE_LATER)
+            sess["_deferred_prev_state"] = "WELCOME_VIDEO"
+            sess["_deferred_reason"] = "WELCOME_LATER"
+            sess["state"] = "DEFERRED"
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+        
+        # If user asks a question, answer then move on (no footer re-ask)
+        if _is_question(text):
             answered = await _maybe_answer_global_faq(text)
-            if not answered:
+            if not answered and "video" in text_lower:
                 about_msg = "It’s a quick hello from our team and a peek into real classrooms."
                 await mcp_wa_send(phone, about_msg)
                 _add_to_history(phone, bot_msg=about_msg)
                 sess["_state_handled_question"] = True
-            if not sess.get("_state_handled_question"):
-                await mcp_wa_send(phone, WELCOME_VIDEO_FOOTER)
-                _add_to_history(phone, bot_msg=WELCOME_VIDEO_FOOTER)
+            if not answered and not sess.get("_state_handled_question"):
+                fallback = "Thanks for asking — I’ll share more as we go."
+                await mcp_wa_send(phone, fallback)
+                _add_to_history(phone, bot_msg=fallback)
+                sess["_state_handled_question"] = True
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            # Continue to intent after answering
+            thanks_intent_msg = f"{WELCOME_VIDEO_CONTINUE} {INTENT_PROMPT}"
+            await mcp_wa_send(phone, thanks_intent_msg)
+            _add_to_history(phone, bot_msg=thanks_intent_msg)
+            sess["_intent_prompted"] = True
+            sess["state"] = "INTENT"
+            sess["sub_state"] = "INTENT"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             return
@@ -3163,13 +3189,47 @@ async def _handle(phone: str, text: str):
             SESSIONS[phone] = sess
             return
         
-        # Ambiguous response: re-ask footer unless we already answered a question
-        if _is_question(text) and sess.get("_state_handled_question"):
+        # Ambiguous response: use LLM to decide; default to continue
+        intent_detected = None
+        try:
+            llm_context = build_llm_context("WELCOME", sess, last_prompt=WELCOME_VIDEO_FOOTER)
+            llm_result = await mcp_llm_classify_intent(text, "WELCOME", llm_context)
+            llm_intent = (llm_result.get("intent") or "").upper()
+            llm_conf = float(llm_result.get("confidence") or 0.0)
+            if llm_conf >= 0.7:
+                intent_detected = llm_intent
+            elif llm_intent == "DEFERRAL" and llm_conf >= 0.3:
+                intent_detected = "DEFERRAL"
+            else:
+                intent_detected = "AMBIGUOUS"
+        except Exception as e:
+            log.warning(f"[WELCOME_VIDEO] LLM classification failed: {e}")
+            intent_detected = "AMBIGUOUS"
+        
+        if intent_detected in {"STOP"}:
+            await mcp_wa_send(phone, QA_STOP_ACK)
+            _add_to_history(phone, bot_msg=QA_STOP_ACK)
+            sess["state"] = "OPTOUT"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             return
-        await mcp_wa_send(phone, WELCOME_VIDEO_FOOTER)
-        _add_to_history(phone, bot_msg=WELCOME_VIDEO_FOOTER)
+        if intent_detected in {"DEFERRAL", "CONSENT_NO"}:
+            await mcp_wa_send(phone, WELCOME_MAYBE_LATER)
+            _add_to_history(phone, bot_msg=WELCOME_MAYBE_LATER)
+            sess["_deferred_prev_state"] = "WELCOME_VIDEO"
+            sess["_deferred_reason"] = "WELCOME_LATER"
+            sess["state"] = "DEFERRED"
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+        
+        # Default: continue
+        thanks_intent_msg = f"{WELCOME_VIDEO_CONTINUE} {INTENT_PROMPT}"
+        await mcp_wa_send(phone, thanks_intent_msg)
+        _add_to_history(phone, bot_msg=thanks_intent_msg)
+        sess["_intent_prompted"] = True
+        sess["state"] = "INTENT"
+        sess["sub_state"] = "INTENT"
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         return

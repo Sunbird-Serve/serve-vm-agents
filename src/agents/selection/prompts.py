@@ -13,14 +13,12 @@ def get_sel_video_intro(name: str = "there") -> str:
     return f"Here's a quick note from our team, {name} - we're in the last stretch now 🙂"
 
 
-def get_sel_video_done_prompt() -> str:
-    """Get video done prompt"""
-    return "Reply Done when you're ready.."
-
-
 def get_sel_video_followup(name: str = "there") -> str:
     """Get video followup message"""
-    return f"Thanks for staying with me, {name} 🙂 This is the last part — just a few things to get to know you better."
+    return (
+        f"Thank you for being open to this, {name} 🌱\n"
+        "Shall we finish this together? Just a few questions to help me understand you better."
+    )
 
 
 def get_sel_about_you(name: str = "there") -> str:
@@ -38,6 +36,8 @@ def get_sel_language_comfort_prompt(language: str, name: str = "there") -> str:
 
 SEL_DEFERRED_MSG = """No worries — take your time.
 Whenever you're ready, just reply here and we’ll pick up from where we left off."""
+
+SEL_VIDEO_FOLLOWUP_BUTTONS = ["Yes, continue", "Later"]
 
 
 # Recommended message

@@ -11,12 +11,12 @@ from typing import Optional
 from .types import SelectionState, RecommendationOutcome
 from .prompts import (
     get_sel_video_intro,
-    get_sel_video_done_prompt,
     get_sel_video_followup,
     get_sel_about_you,
     get_sel_recommended_msg,
     SEL_NOT_RECOMMENDED_MSG,
     SEL_DEFERRED_MSG,
+    SEL_VIDEO_FOLLOWUP_BUTTONS,
 )
 from agents.onboarding.validators import is_defer_response, is_resume_response
 from .config import settings
@@ -175,10 +175,12 @@ async def handle_selection_start(phone: str, text: str, session: dict):
         mcp_wa_send_thankyou_video = _get_mcp_wa_send_thankyou_video()
         video_msg_id = await mcp_wa_send_thankyou_video(phone)
 
-        # Send done prompt
-        done_prompt = get_sel_video_done_prompt()
-        done_prompt_msg_id = await mcp_wa_send(phone, done_prompt)
-        session["_last_agent_prompt"] = done_prompt
+        # Send followup with continue/later buttons
+        profile = session.get("profile", {})
+        name = profile.get("name") or "there"
+        followup = get_sel_video_followup(name)
+        followup_msg_id = await mcp_wa_send(phone, followup, buttons=SEL_VIDEO_FOLLOWUP_BUTTONS)
+        session["_last_agent_prompt"] = followup
         
         # Persistence: Store selection start and video sent
         try:
@@ -204,7 +206,7 @@ async def handle_selection_start(phone: str, text: str, session: dict):
                     wa_phone=phone,
                     state="SELECTION",
                     sub_state=SelectionState.WAIT_VIDEO_DONE,
-                    last_outbound_msg_id=done_prompt_msg_id or video_msg_id,
+                    last_outbound_msg_id=followup_msg_id or video_msg_id,
                     tool_state_updates=tool_state_updates
                 )
                 
@@ -250,25 +252,17 @@ async def handle_selection_start(phone: str, text: str, session: dict):
 
 async def handle_selection_wait_video_done(phone: str, text: str, session: dict):
     """
-    Handle SEL_WAIT_VIDEO_DONE state: wait for video acknowledgement.
+    Handle SEL_WAIT_VIDEO_DONE state: wait for continue/deferral response.
     
     Interpret responses:
-    - "done", "watched", "yes", "ok", "okay", "completed" -> proceed
+    - "yes"/"continue"/affirmation -> proceed
     - Question -> answer briefly and re-ask
-    - Cannot watch -> allow "skip" and proceed
     """
     text_lower = text.lower().strip() if text else ""
     
-    # Check for done/confirmation keywords
-    done_keywords = ["done", "watched", "yes", "ok", "okay", "completed", "finished", "viewed"]
-    skip_keywords = ["skip", "cannot", "can't", "cant", "not now", "later"]
-    appreciation_keywords = [
-        "nice", "good", "great", "awesome", "love", "loved", "thanks",
-        "thank you", "thanku", "cool", "amazing"
-    ]
-    
-    is_appreciation = any(keyword in text_lower for keyword in appreciation_keywords)
-    if any(keyword in text_lower for keyword in done_keywords) or any(keyword in text_lower for keyword in skip_keywords) or is_appreciation:
+    # Check for confirmation keywords
+    done_keywords = ["yes", "ok", "okay", "sure", "continue", "start", "ready", "let's go", "lets go"]
+    if any(keyword in text_lower for keyword in done_keywords):
         # Mark response as received to prevent timeout
         session["_selection_video_response_received"] = True
         session["ts"] = time.time()
@@ -285,10 +279,6 @@ async def handle_selection_wait_video_done(phone: str, text: str, session: dict)
         name = profile.get("name") or "there"
         
         mcp_wa_send = _get_mcp_wa_send()
-        
-        # Send followup
-        followup = get_sel_video_followup(name)
-        followup_msg_id = await mcp_wa_send(phone, followup)
         
         # Send about-you question
         about_you = get_sel_about_you(name)
@@ -318,7 +308,7 @@ async def handle_selection_wait_video_done(phone: str, text: str, session: dict)
                     existing_selection = result[0].get("selection", {})
                 
                 # Determine ack type
-                ack_type = "done" if any(kw in text_lower for kw in done_keywords) else "skip"
+                ack_type = "continue"
                 
                 selection_update = existing_selection.copy()
                 if "video" not in selection_update:
@@ -336,7 +326,7 @@ async def handle_selection_wait_video_done(phone: str, text: str, session: dict)
                     wa_phone=phone,
                     state="SELECTION",
                     sub_state=SelectionState.KNOWING_VOLUNTEER_LOOP,
-                    last_outbound_msg_id=about_you_msg_id or followup_msg_id,
+                    last_outbound_msg_id=about_you_msg_id,
                     tool_state_updates={"selection": selection_update}
                 )
                 
@@ -380,16 +370,18 @@ async def handle_selection_wait_video_done(phone: str, text: str, session: dict)
         # Question asked - answer briefly and re-ask
         log.info(f"[SELECTION] Question asked by {phone} while waiting for video")
         mcp_wa_send = _get_mcp_wa_send()
-        await mcp_wa_send(phone, "It's a quick note from our team. Reply Done when you're ready..")
+        followup = get_sel_video_followup(session.get("profile", {}).get("name") or "there")
+        await mcp_wa_send(phone, followup, buttons=SEL_VIDEO_FOLLOWUP_BUTTONS)
         
         session["ts"] = time.time()
         from agents.onboarding.wa_loop import SESSIONS
         SESSIONS[phone] = session
     else:
-        # Ambiguous response - re-ask
-        log.info(f"[SELECTION] Ambiguous response from {phone}, re-asking video done prompt")
+        # Ambiguous or appreciation response - re-ask
+        log.info(f"[SELECTION] Ambiguous response from {phone}, re-asking followup")
         mcp_wa_send = _get_mcp_wa_send()
-        await mcp_wa_send(phone, get_sel_video_done_prompt())
+        followup = get_sel_video_followup(session.get("profile", {}).get("name") or "there")
+        await mcp_wa_send(phone, followup, buttons=SEL_VIDEO_FOLLOWUP_BUTTONS)
         
         session["ts"] = time.time()
         from agents.onboarding.wa_loop import SESSIONS
