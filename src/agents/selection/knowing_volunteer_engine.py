@@ -973,10 +973,29 @@ async def run_knowing_volunteer_step(
     collected_after = {k: v for k, v in profile.items() if v is not None}
     log.info(f"[KNOWING_VOLUNTEER] After merging: next_target={next_target_after_merge}, collected={list(collected_after.keys())}, discussed={list(discussed_fields)}, low_conf_streak={low_conf_streak}")
     
-    # Increment question_index
+    # If expected_target is commitment, enforce a direct commitment question
+    if expected_target == "commitment_horizon":
+        if not tone_reply or not re.search(r"\b(3\s*months?|three\s*months?|continue|commit)\b", tone_reply, re.I):
+            tone_reply = "Would you be open to volunteering for around 3 months?"
+    
+    def _asked_expected_target(reply: str, target: Optional[str]) -> bool:
+        if not reply or not target:
+            return False
+        patterns = {
+            "motivation": r"\b(why|motivated|motivation|draw|what made you|reason)\b",
+            "commitment_horizon": r"\b(3\s*months?|three\s*months?|continue|commit)\b",
+            "teaching_readiness": r"\b(comfortable|excited|ready|feel about teaching|teach children)\b",
+            "teaching_experience": r"\b(experience|taught|teaching before|worked with children|helped someone learn)\b",
+            "language": r"\b(language|read|write|speak)\b",
+        }
+        pattern = patterns.get(target)
+        return bool(pattern and re.search(pattern, reply, re.I))
+    
+    # Increment question_index only when we asked the expected rubric
     if "question_index" not in session["tool_state"]["selection"]:
         session["tool_state"]["selection"]["question_index"] = 0
-    session["tool_state"]["selection"]["question_index"] += 1
+    if _asked_expected_target(tone_reply, expected_target):
+        session["tool_state"]["selection"]["question_index"] += 1
     question_index = session["tool_state"]["selection"]["question_index"]
     
     # Hard cap on number of questions to prevent long loops
