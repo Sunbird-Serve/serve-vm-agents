@@ -2885,13 +2885,19 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
         else:
             # Handle deferral early to avoid FAQ + reminder loops
             deferral_payload = ""
+            deferral_title = ""
             if evt:
                 data = evt.get("data") or {}
                 deferral_payload = data.get("payload") or data.get("button_id") or data.get("button_payload") or ""
+                deferral_title = data.get("title") or data.get("text") or data.get("button_text") or ""
+            deferral_text = f"{text} {deferral_payload} {deferral_title}".lower().strip()
+            deferral_text_norm = re.sub(r"[^a-z0-9]+", " ", deferral_text).strip()
             if (
                 is_defer_response(text)
                 or _detect_deferral(text)
                 or (isinstance(deferral_payload, str) and deferral_payload.lower() in {"ill_do_this_later", "later", "defer", "do_later"})
+                or "do this later" in deferral_text_norm
+                or "ill do this later" in deferral_text_norm
             ):
                 await mcp_wa_send(phone, GENERIC_DEFERRED_MSG)
                 _add_to_history(phone, bot_msg=GENERIC_DEFERRED_MSG)

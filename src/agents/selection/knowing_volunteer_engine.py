@@ -117,7 +117,7 @@ You MUST return ONLY JSON with the required schema.
 Rules:
 - English only, one question per message.
 - Keep tone warm and human.
-- If fatigue is true OR question_index is even (every 2 questions), use next_target="summary_confirm".
+- If fatigue is true, use next_target="summary_confirm".
 - Prioritize decision-critical rubrics first if unknown/partial: commitment_horizon, teaching_readiness.
 - Avoid asking resolved rubrics.
 - If critical rubrics are resolved and remaining questions are optional, you may return next_target="stop".
@@ -539,6 +539,23 @@ def _status_from_value(rubric: str, value: str) -> str:
         return "partial"
     return "resolved"
 
+
+def _clean_question(text: str) -> str:
+    if not text:
+        return text
+    cleaned = text.strip()
+    # Collapse multiple question marks at the end
+    cleaned = re.sub(r"\?{2,}$", "?", cleaned)
+    return cleaned
+
+
+def _is_affirmative(text: str) -> bool:
+    return bool(re.search(r"\b(yes|yeah|yep|sure|ok|okay|confirm|correct)\b", text, re.I))
+
+
+def _is_negative(text: str) -> bool:
+    return bool(re.search(r"\b(no|nope|not really|dont|don't)\b", text, re.I))
+
 # Confidence threshold for trusting new extractions
 LOW_CONF_THRESHOLD = 0.55
 
@@ -722,6 +739,20 @@ async def run_knowing_volunteer_step(
     preferred_language = session.get("profile", {}).get("preferences", {}).get("language")
     fatigue = _detect_fatigue(user_text, session) if user_text != "__kick__" else False
 
+    # Handle summary_confirm replies explicitly to avoid loops
+    if last_target == "summary_confirm" and user_text != "__kick__":
+        if _is_affirmative(user_text):
+            # Resolve non-critical remaining rubrics as optional when confirmed
+            for rubric in RUBRIC_ORDER:
+                if rubric in CRITICAL_RUBRICS:
+                    continue
+                if rubric_status.get(rubric) != "resolved":
+                    rubric_status[rubric] = "resolved"
+            selection["last_target"] = None
+        elif _is_negative(user_text):
+            selection["last_target"] = None
+        # Continue to planner for next step after handling summary confirm
+
     # Extractor step (only if we have a previous target)
     rule_extracted = _rule_extract(user_text, last_target) if last_target and user_text != "__kick__" else {}
     llm_extracted: Dict[str, Dict] = {}
@@ -850,7 +881,7 @@ async def run_knowing_volunteer_step(
 
     selection["last_planner"] = planner
     next_target = (planner.get("next_target") or "").strip()
-    question = (planner.get("question") or "").strip()
+    question = _clean_question((planner.get("question") or "").strip())
 
     if question_index >= 6:
         return {
