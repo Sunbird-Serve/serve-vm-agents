@@ -954,6 +954,11 @@ async def run_knowing_volunteer_step(
             discussed_fields.add(field_name)
             log.info(f"[KNOWING_VOLUNTEER] Marked '{field_name}' as discussed (signal extracted)")
     
+    # If we asked for commitment and got no clear signal, mark as discussed to avoid repeats
+    if expected_target == "commitment_horizon" and "commitment_horizon" not in signals_extracted:
+        discussed_fields.add("commitment_horizon")
+        log.info("[KNOWING_VOLUNTEER] Marked 'commitment_horizon' as discussed to avoid repeats")
+    
     # Log if expected signal was not extracted
     if "expected_target" in session.get("tool_state", {}).get("selection", {}):
         expected_target = session["tool_state"]["selection"]["expected_target"]

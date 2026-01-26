@@ -1,11 +1,13 @@
 import json
 import re
 import logging
+import random
 from typing import List, Dict, Tuple
 
 from .config import settings
 import httpx
 import uuid
+from .messages import FAQ_ACK_CHOICES, FAQ_BRIDGE, FAQ_FALLBACK
 
 log = logging.getLogger(__name__)
 
@@ -135,5 +137,78 @@ async def compose_answer(query: str, context_entries: List[Dict]) -> str:
         best = context_entries[0]
         return (best.get("a") or "").strip()
     return "Your question is noted — our coordinator will answer it soon."
+
+
+async def compose_answer_no_bridge(query: str, context_entries: List[Dict]) -> str:
+    """Compose an FAQ answer without adding any bridge text."""
+    kb_context = ""
+    if context_entries:
+        lines = []
+        for entry in context_entries:
+            q = (entry.get("q") or "").strip()
+            a = (entry.get("a") or "").strip()
+            if q or a:
+                lines.append(f"Q: {q}\nA: {a}".strip())
+        if lines:
+            kb_context = "FAQ context (use only this):\n" + "\n\n".join(lines)
+    policy_ctx = (
+        "weekday-only 8–15; 100% volunteer (no pay); ~2 hrs/week; "
+        "tablet or laptop required (no smartphones); "
+        "video shown is a real volunteer-led class demo to show how SERVE sessions feel; "
+        "everything happens here on WhatsApp; do not mention orientation, scheduling, or internal stages. "
+        "Answer strictly using the FAQ context provided. If the answer is not in the FAQ context, say: "
+        "\"Your question is noted — our coordinator will answer it soon.\""
+    )
+    if kb_context:
+        policy_ctx = f"{policy_ctx}\n\n{kb_context}"
+    try:
+        resp = await _mcp_call(
+            "faq.answer",
+            {
+                "question": query,
+                "policy_context": policy_ctx,
+                "kb_scope": "onboarding-basic",
+                "top_k": 3,
+            },
+            timeout=10,
+        )
+        answer = (resp.get("answer") or "").strip()
+        if answer:
+            return answer
+    except Exception as e:
+        log.warning(f"[FAQ] faq.answer failed, falling back to KB: {e}")
+    if context_entries:
+        best = context_entries[0]
+        return (best.get("a") or "").strip()
+    return ""
+
+
+async def send_global_faq_response(
+    phone: str,
+    question: str,
+    send_fn,
+    add_history_fn=None,
+) -> bool:
+    """Send global FAQ response with ack + answer + bridge. Returns True if handled."""
+    top = retrieve(question, k=3)
+    if not top:
+        msg = FAQ_FALLBACK
+        await send_fn(phone, msg)
+        if add_history_fn:
+            add_history_fn(phone, bot_msg=msg)
+        return True
+    answer = await compose_answer_no_bridge(question, top)
+    if not answer:
+        msg = FAQ_FALLBACK
+        await send_fn(phone, msg)
+        if add_history_fn:
+            add_history_fn(phone, bot_msg=msg)
+        return True
+    ack = random.choice(FAQ_ACK_CHOICES)
+    msg = f"{ack}\n{answer}\n{FAQ_BRIDGE}"
+    await send_fn(phone, msg)
+    if add_history_fn:
+        add_history_fn(phone, bot_msg=msg)
+    return True
 
 

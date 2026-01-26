@@ -23,6 +23,7 @@ from .prompts import (
 )
 from .config import settings
 from agents.onboarding.validators import is_defer_response, is_resume_response
+from agents.onboarding.faq import looks_like_question, send_global_faq_response
 
 log = logging.getLogger(__name__)
 
@@ -401,6 +402,20 @@ async def handle_fulfillment(phone: str, text: str, session: dict):
             await onboarding_handle(phone, "__kick__")
             return
     
+    # Global FAQ intercept
+    if text != "__kick__" and looks_like_question(text or ""):
+        handled = await send_global_faq_response(
+            phone=phone,
+            question=text,
+            send_fn=mcp_wa_send,
+            add_history_fn=None,
+        )
+        if handled:
+            session["ts"] = time.time()
+            from agents.onboarding.wa_loop import SESSIONS
+            SESSIONS[phone] = session
+            return
+
     # Route to appropriate state handler
     if state == FulfillmentState.INTRO:
         await handle_fulfill_intro(phone, text, session)

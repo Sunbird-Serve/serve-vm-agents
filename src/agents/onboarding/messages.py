@@ -79,6 +79,18 @@ WELCOME_CONSENT_REMINDER = """Quick reminder — shall we continue with the onbo
 WELCOME_FAQ_FOLLOWUP = """Let's get started — I'll explain things along the way."""
 WELCOME_STATEMENT_ACK = "Got it 🙂 I'm here to help."
 
+# ---------- FAQ Acknowledgement & Bridge ----------
+FAQ_ACK_CHOICES = [
+    "Good question 🙂",
+    "That’s a common question 🙂",
+    "I get why you’re asking 🙂",
+    "Thanks for checking 🙂",
+]
+FAQ_BRIDGE = "This will become clearer as we go — let’s continue?"
+FAQ_FALLBACK = """That’s a thoughtful question 🙂
+I may not have the full answer right now, but I’ll make sure a coordinator follows up.
+For now, let’s continue — this part will give you more clarity."""
+
 
 # ---------- Section 2: Intent (Purpose Acknowledgement) ----------
 INTENT_PROMPT = """Before we continue, I'm just curious - What made you explore this today? 🙂"""
@@ -253,11 +265,11 @@ Thank you for your interest, and wishing you a lovely day 🌼"""
 # ---------- Section 4: Identity Collection ----------
 IDENTITY_NAME_PROMPT = """Lovely!  
 
-May I know your **name**? 🙂"""
+BTW! What is your name? 🙂"""
 
 IDENTITY_CONTACT_PROMPT = """Thanks {name}!  
 
-Could you share your **email**?  
+Could you share your email?  
 
 This helps create your volunteer profile and keep you updated on sessions."""
 
@@ -411,9 +423,12 @@ Example: "Math for Grade 8 in Tamil" """
 
 
 # ---------- Section 4: Teaching Preferences (continued) ----------
-PREFS_INTRO_COLLAB = """Let's find a rhythm that works for you and the students 🌱
+PREFS_INTRO_COLLAB = """Let’s find a rhythm that works for you and the students 🌱
 
-Which 2–3 weekdays usually suit you? Do mornings, lunch hours, or early afternoons feel better? And which language would you prefer teaching in?"""
+Just tell me:
+• 2–3 weekdays (Mon–Fri) that usually work
+• the time that feels easiest (morning / lunch / early afternoon)
+• a regional teaching language you prefer (Hindi, Tamil, Kannada, Telugu, etc.)"""
 
 PREFS_FOLLOWUP_DAYS = """Beautiful. Which weekdays would you lean on? You can name 2–3 that feel realistic."""
 

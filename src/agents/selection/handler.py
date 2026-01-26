@@ -27,6 +27,7 @@ from .knowing_volunteer_engine import (
     init_volunteer_profile,
     KnowingVolunteerResult,
 )
+from agents.onboarding.faq import looks_like_question, send_global_faq_response
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +134,21 @@ async def handle_selection(phone: str, text: str, session: dict):
             SESSIONS[phone] = session
             return
     
+    # Global FAQ intercept (skip knowing volunteer loop)
+    if text != "__kick__" and state != SelectionState.KNOWING_VOLUNTEER_LOOP:
+        if looks_like_question(text):
+            handled = await send_global_faq_response(
+                phone=phone,
+                question=text,
+                send_fn=mcp_wa_send,
+                add_history_fn=None,
+            )
+            if handled:
+                session["ts"] = time.time()
+                from agents.onboarding.wa_loop import SESSIONS
+                SESSIONS[phone] = session
+                return
+
     # Route to appropriate state handler
     if state == SelectionState.START:
         await handle_selection_start(phone, text, session)

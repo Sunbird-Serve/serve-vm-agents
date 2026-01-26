@@ -419,6 +419,7 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
         mcp_wa_send, _add_to_history, _handle, SESSIONS,
         mcp_llm_classify_intent, build_llm_context
     )
+    from ..faq import send_global_faq_response
     
     # Handle re-entry from REJECTED state
     if sess.get("state") == "REJECTED":
@@ -1136,12 +1137,19 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
                 await mcp_wa_send(phone, faq_answer)
                 _add_to_history(phone, bot_msg=faq_answer)
             else:
-                await mcp_wa_send(phone, ELIGIBILITY_TELL_ME_MORE_MSG)
-                _add_to_history(phone, bot_msg=ELIGIBILITY_TELL_ME_MORE_MSG)
+                handled = await send_global_faq_response(
+                    phone=phone,
+                    question=text,
+                    send_fn=mcp_wa_send,
+                    add_history_fn=_add_to_history,
+                )
+                if not handled:
+                    await mcp_wa_send(phone, ELIGIBILITY_TELL_ME_MORE_MSG)
+                    _add_to_history(phone, bot_msg=ELIGIBILITY_TELL_ME_MORE_MSG)
             sess["_state_handled_question"] = True
-            await mcp_wa_send(phone, ELIGIBILITY_FAQ_MORE_PROMPT, buttons=ELIGIBILITY_FAQ_MORE_BUTTONS)
-            _add_to_history(phone, bot_msg=ELIGIBILITY_FAQ_MORE_PROMPT)
-            sess["_eligibility_faq_more_prompted"] = True
+            await mcp_wa_send(phone, ELIGIBILITY_CONFIRM_SHORT, buttons=["Yes", "No"])
+            _add_to_history(phone, bot_msg=ELIGIBILITY_CONFIRM_SHORT)
+            sess["_eligibility_faq_confirm_pending"] = True
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             return

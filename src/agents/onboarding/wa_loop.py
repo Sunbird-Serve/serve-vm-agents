@@ -68,7 +68,7 @@ from .messages import (
     format_message, format_subjects_list
 )
 from .validators import is_yes_response, is_no_response, is_defer_response, is_resume_response, normalize_phone
-from .faq import looks_like_question, retrieve, compose_answer
+from .faq import looks_like_question, send_global_faq_response
 from .prompts.master_prompt import MASTER_SYSTEM_PROMPT
 from .prompts.state_prompts import STATE_TASK_PROMPTS, DEFAULT_TASK_PROMPT
 from .prompts.few_shots import FEW_SHOT_EXAMPLES
@@ -2254,7 +2254,7 @@ async def _handle_with_idempotency(phone: str, text: str, inbound_msg_id: str, e
         outbound_msg_id = None
         try:
             # Call original _handle
-            await _handle(phone, text)
+            await _handle(phone, text, evt)
             
             # Note: outbound_msg_id would ideally be captured from mcp_wa_send return value
             # For now, we update idempotency after processing
@@ -2271,7 +2271,7 @@ async def _handle_with_idempotency(phone: str, text: str, inbound_msg_id: str, e
 
 
 # ---------- State Machine ----------
-async def _handle(phone: str, text: str):
+async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
     """
     Main state machine handler
     
@@ -2595,30 +2595,32 @@ async def _handle(phone: str, text: str):
     def _is_question(text_value: str) -> bool:
         if not text_value:
             return False
+        if "?" in text_value:
+            return True
+        # Allow question words at start or after a short preface (e.g., "sure, ... can I ...")
         return bool(
-            "?" in text_value
-            or re.search(r"^(what|how|when|why|where|who|which|can|could|do|does|is|are)\b", text_value, re.I)
+            re.search(
+                r"^(?:\w+\s+){0,3}(what|how|when|why|where|who|which|can|could|do|does|is|are|will|would|should)\b",
+                text_value.strip(),
+                re.I,
+            )
         )
     
     async def _maybe_answer_global_faq(text_value: str) -> bool:
         """Return True if global FAQ answered the question."""
         try:
-            top = retrieve(text_value, k=3)
-            if top:
-                ans = await compose_answer(text_value, top)
-                if ans:
-                    await mcp_wa_send(phone, ans)
-                    _add_to_history(phone, bot_msg=ans)
-                    sess["_state_handled_question"] = True
-                    sess["ts"] = time.time()
-                    SESSIONS[phone] = sess
-                    # If there was a pending question that we re-asked,
-                    # let that handler own the flow and stop here.
-                    if await _reask_pending_question(phone, state, sess):
-                        return True
-                    return True
-            else:
-                log.info("[FAQ] No KB match; skipping FAQ answer")
+            handled = await send_global_faq_response(
+                phone=phone,
+                question=text_value,
+                send_fn=mcp_wa_send,
+                add_history_fn=_add_to_history,
+            )
+            if handled:
+                sess["_state_handled_question"] = True
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return True
+            log.info("[FAQ] No KB match; skipping FAQ answer")
         except Exception as e:
             log.warning(f"[FAQ] Failed to answer FAQ: {e}")
         return False
@@ -2719,9 +2721,10 @@ async def _handle(phone: str, text: str):
         )
         if not same_day_commitment:
             answered = await _maybe_answer_global_faq(text)
-            if not answered:
-                await _handle_offtopic_redirect()
+            if answered:
                 return
+            await _handle_offtopic_redirect()
+            return
 
     # Unified parse hook: opportunistic fast-forward (skip for trivial rule hits)
     parsed = {}
@@ -2881,7 +2884,15 @@ async def _handle(phone: str, text: str):
             return
         else:
             # Handle deferral early to avoid FAQ + reminder loops
-            if is_defer_response(text) or _detect_deferral(text):
+            deferral_payload = ""
+            if evt:
+                data = evt.get("data") or {}
+                deferral_payload = data.get("payload") or data.get("button_id") or data.get("button_payload") or ""
+            if (
+                is_defer_response(text)
+                or _detect_deferral(text)
+                or (isinstance(deferral_payload, str) and deferral_payload.lower() in {"ill_do_this_later", "later", "defer", "do_later"})
+            ):
                 await mcp_wa_send(phone, GENERIC_DEFERRED_MSG)
                 _add_to_history(phone, bot_msg=GENERIC_DEFERRED_MSG)
                 sess["_deferred_prev_state"] = "WELCOME"
@@ -2924,12 +2935,7 @@ async def _handle(phone: str, text: str):
                     answered = await _maybe_answer_global_faq(text)
                     if not answered:
                         await _handle_offtopic_redirect()
-                
-                # Follow up in the same reply instead of re-sending welcome instructions
-                await mcp_wa_send(phone, WELCOME_FAQ_FOLLOWUP, buttons=WELCOME_START_BUTTONS)
-                _add_to_history(phone, bot_msg=WELCOME_FAQ_FOLLOWUP)
-                sess["ts"] = time.time()
-                SESSIONS[phone] = sess
+                        return
                 return
             
             # Acknowledge non-question statements and re-ask to begin
