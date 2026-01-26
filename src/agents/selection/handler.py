@@ -425,7 +425,6 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
         session["tool_state"]["selection"] = {}
     if "profile" not in session["tool_state"]["selection"]:
         session["tool_state"]["selection"]["profile"] = init_volunteer_profile()
-        session["tool_state"]["selection"]["discussed_fields"] = set()
     if "question_index" not in session["tool_state"]["selection"]:
         session["tool_state"]["selection"]["question_index"] = 0
     
@@ -579,13 +578,14 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
                     existing_selection = result[0].get("selection", {})
                 
                 # Get updated profile and question index
-                current_profile = session.get("tool_state", {}).get("selection", {}).get("profile", {})
-                question_index = session.get("tool_state", {}).get("selection", {}).get("question_index", 0)
-                discussed_fields = session.get("tool_state", {}).get("selection", {}).get("discussed_fields", set())
-                
-                # Convert set to list for JSON serialization
-                if isinstance(discussed_fields, set):
-                    discussed_fields = list(discussed_fields)
+                selection_state = session.get("tool_state", {}).get("selection", {})
+                current_profile = selection_state.get("profile", {})
+                question_index = selection_state.get("question_index", 0)
+                rubric_status = selection_state.get("rubric_status", {})
+                rubric_confidence = selection_state.get("rubric_confidence", {})
+                clarification_count = selection_state.get("clarification_count", {})
+                last_planner = selection_state.get("last_planner")
+                last_extractor = selection_state.get("last_extractor")
                 
                 selection_update = existing_selection.copy()
                 if "knowing_volunteer" not in selection_update:
@@ -593,7 +593,11 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
                 selection_update["knowing_volunteer"].update({
                     "questions_asked": question_index,
                     "profile": current_profile.copy(),
-                    "discussed_fields": discussed_fields
+                    "rubric_status": rubric_status,
+                    "rubric_confidence": rubric_confidence,
+                    "clarification_count": clarification_count,
+                    "last_planner": last_planner,
+                    "last_extractor": last_extractor,
                 })
                 
                 update_session_state_and_tool_state(
@@ -654,14 +658,14 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
                 if result and result[0] and isinstance(result[0], dict):
                     existing_selection = result[0].get("selection", {})
                 
-                # Get current profile and question index
-                current_profile = session.get("tool_state", {}).get("selection", {}).get("profile", {})
-                question_index = session.get("tool_state", {}).get("selection", {}).get("question_index", 0)
-                discussed_fields = session.get("tool_state", {}).get("selection", {}).get("discussed_fields", set())
-                
-                # Convert set to list for JSON serialization
-                if isinstance(discussed_fields, set):
-                    discussed_fields = list(discussed_fields)
+                selection_state = session.get("tool_state", {}).get("selection", {})
+                current_profile = selection_state.get("profile", {})
+                question_index = selection_state.get("question_index", 0)
+                rubric_status = selection_state.get("rubric_status", {})
+                rubric_confidence = selection_state.get("rubric_confidence", {})
+                clarification_count = selection_state.get("clarification_count", {})
+                last_planner = selection_state.get("last_planner")
+                last_extractor = selection_state.get("last_extractor")
                 
                 selection_update = existing_selection.copy()
                 if "knowing_volunteer" not in selection_update:
@@ -670,7 +674,11 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
                     "completed_at": now_iso,
                     "questions_asked": question_index,
                     "profile": current_profile.copy(),
-                    "discussed_fields": discussed_fields
+                    "rubric_status": rubric_status,
+                    "rubric_confidence": rubric_confidence,
+                    "clarification_count": clarification_count,
+                    "last_planner": last_planner,
+                    "last_extractor": last_extractor,
                 })
                 
                 update_session_state_and_tool_state(
@@ -755,8 +763,12 @@ async def handle_selection_evaluate(phone: str, session: dict):
         reason_codes.append("USER_STOP_REQUESTED")
     if teaching_readiness == "no":
         reason_codes.append("TEACHING_READINESS_NO")
+    if teaching_readiness == "maybe":
+        reason_codes.append("TEACHING_READINESS_MAYBE")
     if commitment_horizon == "no":
         reason_codes.append("COMMITMENT_HORIZON_NO")
+    if commitment_horizon == "maybe":
+        reason_codes.append("COMMITMENT_HORIZON_MAYBE")
     
     hold_for_human = len(reason_codes) > 0
     

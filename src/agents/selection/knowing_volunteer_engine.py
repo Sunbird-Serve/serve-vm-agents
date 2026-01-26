@@ -90,9 +90,7 @@ Tone:
 - Never salesy or pushy
 
 - Always respond in simple English (no regional scripts). Do NOT switch languages or scripts.
-- Output must be English-only and ASCII-safe. Do NOT include any non-ASCII characters.
-
-- CRITICAL: Do NOT use emojis in ANY responses (encoding limitations). Never include emojis, even if you see them in conversation history.
+- You may use at most ONE emoji per assistant message.
 
 Context you will receive:
 
@@ -111,6 +109,51 @@ Never assume consent.
 Never store or repeat sensitive information unnecessarily.
 
 You are guiding a human, not completing a form."""
+
+
+# Planner prompt for next question selection
+PLANNER_SYSTEM_PROMPT = """You are a planning module for a volunteer conversation.
+You MUST return ONLY JSON with the required schema.
+Rules:
+- English only, one question per message.
+- Keep tone warm and human.
+- If fatigue is true OR question_index is even (every 2 questions), use next_target="summary_confirm".
+- Prioritize decision-critical rubrics first if unknown/partial: commitment_horizon, teaching_readiness.
+- Avoid asking resolved rubrics.
+- If critical rubrics are resolved and remaining questions are optional, you may return next_target="stop".
+
+Output JSON schema:
+{
+  "next_target": "motivation|commitment_horizon|teaching_readiness|teaching_experience|language|summary_confirm|stop",
+  "question": "string",
+  "expected_answer_type": "free_text|yes_no_maybe|multi_choice",
+  "stop_reason": "optional string",
+  "why_internal": "string"
+}
+"""
+
+
+EXTRACTOR_SYSTEM_PROMPT = """You are an extraction module. Return ONLY JSON with required schema.
+Rules:
+- Use last_target to focus extraction.
+- Do NOT invent facts. If unclear, use value "unknown" or "maybe".
+- Only ask clarification for critical rubrics (commitment_horizon, teaching_readiness) and only once.
+
+Output JSON schema:
+{
+  "extracted": {
+    "motivation": {"value":"high|medium|low|unknown","confidence":0-1},
+    "commitment_horizon": {"value":"yes|no|maybe|unknown","confidence":0-1},
+    "teaching_readiness": {"value":"yes|no|maybe|unknown","confidence":0-1},
+    "teaching_experience": {"value":"yes|no|maybe|unknown","confidence":0-1},
+    "language": {"value":"resolved|unknown","confidence":0-1}
+  },
+  "rubric_status_updates": {"rubric":"unknown|partial|resolved"},
+  "needs_clarification": true|false,
+  "clarification_question": "string",
+  "notes_internal": "string"
+}
+"""
 
 
 # KNOWING_VOLUNTEER state prompt (from selectionagent.py, cleaned)
@@ -333,45 +376,181 @@ IMPORTANT JSON rules:
 
 # Ordered list of rubrics to fill (deterministic questioning)
 RUBRIC_ORDER = ["motivation", "commitment_horizon", "teaching_readiness", "teaching_experience", "language"]
+CRITICAL_RUBRICS = {"commitment_horizon", "teaching_readiness"}
+
+
+def _init_rubric_trackers(session: Dict) -> None:
+    selection = session.setdefault("tool_state", {}).setdefault("selection", {})
+    rubric_status = selection.setdefault("rubric_status", {})
+    rubric_confidence = selection.setdefault("rubric_confidence", {})
+    clarification_count = selection.setdefault("clarification_count", {})
+    for rubric in RUBRIC_ORDER:
+        rubric_status.setdefault(rubric, "unknown")
+        rubric_confidence.setdefault(rubric, 0.0)
+        clarification_count.setdefault(rubric, 0)
+    # Preserve existing behavior: skip language unless explicitly enabled
+    if selection.get("skip_language", True):
+        rubric_status["language"] = "resolved"
+
+
+def _rubric_open(
+    rubric: str,
+    rubric_status: Dict[str, str],
+    clarification_count: Dict[str, int],
+) -> bool:
+    status = rubric_status.get(rubric, "unknown")
+    if status == "resolved":
+        return False
+    if status == "partial" and clarification_count.get(rubric, 0) >= 1:
+        return False
+    return True
+
+
+def _get_open_rubrics(
+    rubric_status: Dict[str, str],
+    clarification_count: Dict[str, int],
+) -> List[str]:
+    return [r for r in RUBRIC_ORDER if _rubric_open(r, rubric_status, clarification_count)]
+
+
+def _parse_llm_json(raw_text: str) -> Dict:
+    if not raw_text:
+        raise ValueError("LLM returned empty response")
+    repaired_text = raw_text
+    repaired_text = re.sub(
+        r'```(?:json)?\s*({.*?})\s*```',
+        r"\1",
+        repaired_text,
+        flags=re.DOTALL,
+    )
+    try:
+        return json.loads(repaired_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"LLM response is not valid JSON: {raw_text[:500]}") from exc
+
+
+async def _llm_call_json(messages: List[Dict], schema: Optional[Dict] = None, timeout: int = 20) -> Dict:
+    _mcp_call = _get_mcp_call()
+    payload = {
+        "messages": messages,
+        "temperature": 0.4,
+        "max_tokens": 300,
+        "response_format": "json_object",
+    }
+    result = await _mcp_call("llm.call", payload, timeout=timeout)
+    raw_text = ""
+    if isinstance(result, dict):
+        if "content" in result:
+            content = result["content"]
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        raw_text = item.get("text", "")
+                        break
+            elif isinstance(content, str):
+                raw_text = content
+        elif "text" in result:
+            raw_text = result["text"]
+        elif "reply" in result:
+            raw_text = result["reply"]
+        elif "result" in result and isinstance(result["result"], dict):
+            nested = result["result"]
+            if "content" in nested and isinstance(nested["content"], list):
+                for item in nested["content"]:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        raw_text = item.get("text", "")
+                        break
+    parsed = _parse_llm_json(raw_text)
+    if schema:
+        try:
+            import jsonschema
+            jsonschema.validate(parsed, schema)
+        except Exception:
+            pass
+    return parsed
+
+
+def _detect_fatigue(user_text: str, session: Dict) -> bool:
+    text_lower = (user_text or "").lower().strip()
+    low_info = len(text_lower.split()) <= 2 or re.search(r"\b(idk|not sure|unsure|no idea)\b", text_lower)
+    selection = session.setdefault("tool_state", {}).setdefault("selection", {})
+    streak = selection.get("low_info_streak", 0)
+    if low_info:
+        streak += 1
+    else:
+        streak = 0
+    selection["low_info_streak"] = streak
+    return bool(low_info or streak >= 2)
+
+
+def _rule_extract(user_text: str, target: Optional[str]) -> Dict[str, Dict]:
+    """High-precision rule extraction. Returns rubric -> {value, confidence}."""
+    text_lower = (user_text or "").lower().strip()
+    extracted: Dict[str, Dict] = {}
+    if target == "teaching_readiness":
+        if re.search(r"\b(very\s+)?comfortable|confident|ready|okay|ok|sure|excited\b", text_lower):
+            extracted["teaching_readiness"] = {"value": "yes", "confidence": 0.9}
+        elif re.search(r"\b(not comfortable|uncomfortable|not confident)\b", text_lower):
+            extracted["teaching_readiness"] = {"value": "no", "confidence": 0.9}
+        elif re.search(r"\b(unsure|not sure|maybe|nervous)\b", text_lower):
+            extracted["teaching_readiness"] = {"value": "maybe", "confidence": 0.9}
+    elif target == "commitment_horizon":
+        if re.search(r"\b(yes|ok|okay|sure|can|will|possible|fine)\b", text_lower):
+            extracted["commitment_horizon"] = {"value": "yes", "confidence": 0.9}
+        elif re.search(r"\b(not sure|maybe|unsure)\b", text_lower):
+            extracted["commitment_horizon"] = {"value": "maybe", "confidence": 0.9}
+        elif re.search(r"\b(no|cannot|can't|cant)\b", text_lower):
+            extracted["commitment_horizon"] = {"value": "no", "confidence": 0.9}
+    elif target == "teaching_experience":
+        if re.search(r"\b(yes|have|taught|teaching|mentor|mentored|trained|experience)\b", text_lower):
+            extracted["teaching_experience"] = {"value": "yes", "confidence": 0.9}
+        elif re.search(r"\b(no|not really|never|haven't|have not|didn't|did not)\b", text_lower):
+            extracted["teaching_experience"] = {"value": "no", "confidence": 0.9}
+    elif target == "motivation":
+        if re.search(r"\b(help|teach|support|give back|contribute|volunteer|kids|children|students|education)\b", text_lower):
+            extracted["motivation"] = {"value": "high", "confidence": 0.9}
+    elif target == "language":
+        if re.search(r"\b(read|write|speak|all)\b", text_lower):
+            extracted["language"] = {"value": "resolved", "confidence": 0.9}
+    return extracted
+
+
+def _merge_extractions(
+    rule_extracted: Dict[str, Dict],
+    llm_extracted: Dict[str, Dict],
+) -> Dict[str, Dict]:
+    merged = {}
+    for rubric in set(rule_extracted.keys()) | set(llm_extracted.keys()):
+        rule_val = rule_extracted.get(rubric)
+        llm_val = llm_extracted.get(rubric)
+        if not rule_val:
+            merged[rubric] = llm_val
+        elif not llm_val:
+            merged[rubric] = rule_val
+        else:
+            merged[rubric] = rule_val if rule_val["confidence"] >= llm_val["confidence"] else llm_val
+    return merged
+
+
+def _status_from_value(rubric: str, value: str) -> str:
+    if value in {"unknown"}:
+        return "unknown"
+    if value in {"maybe"}:
+        return "partial"
+    return "resolved"
 
 # Confidence threshold for trusting new extractions
 LOW_CONF_THRESHOLD = 0.55
 
 
-def _get_next_missing_rubric(profile: Dict, discussed_fields: Optional[set] = None) -> Optional[str]:
-    """
-    Find the first missing rubric in ORDER.
-    
-    Language counts as present if either language OR language_comfort is set.
-    Skips fields that are already filled OR already discussed.
-    
-    Args:
-        profile: Volunteer profile dict
-        discussed_fields: Set of field names that have been discussed (even if not extracted)
-    
-    Returns:
-        Next missing rubric name, or None if all are filled or discussed
-    """
-    if discussed_fields is None:
-        discussed_fields = set()
-    
+def _get_next_missing_rubric(
+    rubric_status: Dict[str, str],
+    clarification_count: Dict[str, int],
+) -> Optional[str]:
+    """Find the first rubric that is not resolved (partial allowed once)."""
     for rubric in RUBRIC_ORDER:
-        # Skip if already discussed
-        if rubric in discussed_fields:
-            continue
-        
-        # Skip if already filled
-        if rubric == "language":
-            # Language counts if either field is present
-            if profile.get("language") or profile.get("language_comfort"):
-                continue
-        else:
-            if profile.get(rubric) is not None:
-                continue
-        
-        # This rubric is missing and not discussed - return it
-        return rubric
-    
+        if _rubric_open(rubric, rubric_status, clarification_count):
+            return rubric
     return None
 
 
@@ -525,517 +704,180 @@ async def run_knowing_volunteer_step(
     last_agent_prompt: Optional[str],
     history_messages: Optional[List[Dict]] = None
 ) -> Dict:
-    """
-    Run one step of the knowing volunteer loop.
-    
-    Args:
-        session: Session dict (modified in place)
-        user_text: User's message text
-        last_agent_prompt: Last prompt/question sent to user (optional)
-        history_messages: List of previous messages in format [{"role": "user|assistant", "content": "..."}, ...] (optional)
-    
-    Returns:
-        Dict with keys: intent, confidence, assistant_text, signals, decision
-    """
-    # Get LLM calling function (use existing infrastructure)
-    _mcp_call = _get_mcp_call()
-    
-    # Get current profile to determine next target
+    """Run one step of the knowing volunteer loop (planner -> extractor)."""
     if "tool_state" not in session:
         session["tool_state"] = {}
     if "selection" not in session["tool_state"]:
         session["tool_state"]["selection"] = {}
     if "profile" not in session["tool_state"]["selection"]:
         session["tool_state"]["selection"]["profile"] = init_volunteer_profile()
-        session["tool_state"]["selection"]["discussed_fields"] = set()
-    
-    current_profile = session["tool_state"]["selection"]["profile"]
-    
-    # Get discussed fields (fields that have been discussed even if not extracted)
-    discussed_fields = session["tool_state"]["selection"].get("discussed_fields", set())
-    if not isinstance(discussed_fields, set):
-        discussed_fields = set(discussed_fields) if discussed_fields else set()
-    # Pre-mark language as discussed to skip asking it for now
-    discussed_fields.add("language")
-    session["tool_state"]["selection"]["discussed_fields"] = discussed_fields
-    
-    # Calculate next target (skip discussed fields)
-    next_target = _get_next_missing_rubric(current_profile, discussed_fields)
-    
-    # Store expected target for validation later
-    session["tool_state"]["selection"]["expected_target"] = next_target
-    
-    # Build profile state summary for LLM
-    collected_fields = {k: v for k, v in current_profile.items() if v is not None}
-    missing_fields = [r for r in RUBRIC_ORDER if r not in collected_fields and r not in discussed_fields]
-    
-    log.info(f"[KNOWING_VOLUNTEER] Before LLM call: next_target={next_target}, collected={list(collected_fields.keys())}, discussed={list(discussed_fields)}, missing={missing_fields}")
-    
+    _init_rubric_trackers(session)
+    selection = session["tool_state"]["selection"]
+    profile = selection["profile"]
+    rubric_status = selection["rubric_status"]
+    rubric_confidence = selection["rubric_confidence"]
+    clarification_count = selection["clarification_count"]
+    question_index = selection.get("question_index", 0)
+    last_target = selection.get("last_target")
     preferred_language = session.get("profile", {}).get("preferences", {}).get("language")
+    fatigue = _detect_fatigue(user_text, session) if user_text != "__kick__" else False
 
-    # Build messages with dynamic prompt (include profile state)
-    messages = [
-        {"role": "system", "content": MASTER_SYSTEM_PROMPT},
-        {"role": "system", "content": get_knowing_volunteer_prompt(
-            next_target=next_target,
-            collected_fields=collected_fields,
-            discussed_fields=discussed_fields,
-            preferred_language=preferred_language
-        )}
-    ]
-    
-    # Add last agent prompt if available (strip emojis to prevent LLM from copying them)
-    if last_agent_prompt:
-        cleaned_prompt = _strip_emojis(last_agent_prompt)
-        if cleaned_prompt:  # Only add if there's content after stripping
-            messages.append({"role": "assistant", "content": cleaned_prompt})
-    
-    # Add history messages (last 6) - strip emojis from all history messages
-    if history_messages:
-        for msg in history_messages[-6:]:
-            if isinstance(msg, dict) and "role" in msg and "content" in msg:
-                cleaned_content = _strip_emojis(msg["content"])
-                if cleaned_content:  # Only add if there's content after stripping
-                    messages.append({
-                        "role": msg["role"],
-                        "content": cleaned_content
-                    })
-    
-    # Add current user message (strip emojis from user input too, just to be safe)
-    cleaned_user_text = _strip_emojis(user_text)
-    messages.append({"role": "user", "content": cleaned_user_text})
-    
-    # Define response schema
-    response_schema = {
+    # Extractor step (only if we have a previous target)
+    rule_extracted = _rule_extract(user_text, last_target) if last_target and user_text != "__kick__" else {}
+    llm_extracted: Dict[str, Dict] = {}
+    rubric_status_updates: Dict[str, str] = {}
+    needs_clarification = False
+    clarification_question = ""
+    if last_target and user_text != "__kick__":
+        extractor_schema = {
+            "type": "object",
+            "required": ["extracted", "rubric_status_updates", "needs_clarification"],
+            "properties": {
+                "extracted": {"type": "object"},
+                "rubric_status_updates": {"type": "object"},
+                "needs_clarification": {"type": "boolean"},
+                "clarification_question": {"type": "string"},
+                "notes_internal": {"type": "string"},
+            },
+        }
+        messages = [
+            {"role": "system", "content": EXTRACTOR_SYSTEM_PROMPT},
+            {"role": "system", "content": f"Last target: {last_target}. Preferred language: {preferred_language}."},
+            {"role": "user", "content": user_text},
+        ]
+        try:
+            parsed = await _llm_call_json(messages, schema=extractor_schema, timeout=20)
+            extracted = parsed.get("extracted", {})
+            for rubric, payload in extracted.items():
+                if isinstance(payload, dict) and "value" in payload:
+                    llm_extracted[rubric] = {
+                        "value": payload.get("value", "unknown"),
+                        "confidence": float(payload.get("confidence", 0.0) or 0.0),
+                    }
+            rubric_status_updates = parsed.get("rubric_status_updates", {}) or {}
+            needs_clarification = bool(parsed.get("needs_clarification", False))
+            clarification_question = (parsed.get("clarification_question") or "").strip()
+            selection["last_extractor"] = parsed
+        except Exception as e:
+            log.warning(f"[KNOWING_VOLUNTEER] Extractor failed: {e}")
+
+    merged_extracted = _merge_extractions(rule_extracted, llm_extracted)
+    for rubric, payload in merged_extracted.items():
+        value = payload.get("value", "unknown")
+        confidence = float(payload.get("confidence", 0.0) or 0.0)
+        if confidence >= rubric_confidence.get(rubric, 0.0):
+            rubric_confidence[rubric] = confidence
+            if rubric == "teaching_experience" and value in {"yes", "no", "maybe"}:
+                profile["teaching_experience"] = value
+            elif rubric == "teaching_readiness" and value in {"yes", "no", "maybe"}:
+                profile["teaching_readiness"] = value
+            elif rubric == "commitment_horizon" and value in {"yes", "no", "maybe"}:
+                profile["commitment_horizon"] = value
+            elif rubric == "motivation" and value in {"high", "medium", "low"}:
+                profile["motivation"] = value
+        status = _status_from_value(rubric, value)
+        if status == "resolved":
+            rubric_status[rubric] = "resolved"
+        elif status == "partial" and rubric_status.get(rubric) != "resolved":
+            rubric_status[rubric] = "partial"
+
+    for rubric, status in rubric_status_updates.items():
+        if status in {"unknown", "partial", "resolved"}:
+            if status == "resolved":
+                rubric_status[rubric] = "resolved"
+            elif status == "partial" and rubric_status.get(rubric) != "resolved":
+                rubric_status[rubric] = "partial"
+
+    # Clarification for critical rubrics
+    if (
+        last_target in CRITICAL_RUBRICS
+        and needs_clarification
+        and clarification_count.get(last_target, 0) < 1
+        and rubric_status.get(last_target, "unknown") != "resolved"
+    ):
+        clarification_count[last_target] = clarification_count.get(last_target, 0) + 1
+        selection["last_target"] = last_target
+        assistant_text = clarification_question or "Just to confirm — does that work for you?"
+        selection["question_index"] = question_index + 1
+        return {
+            "intent": "CLARIFY",
+            "confidence": 1.0,
+            "assistant_text": assistant_text,
+            "signals": profile.copy(),
+            "decision": KnowingVolunteerResult.CONTINUE.value,
+        }
+
+    open_rubrics = _get_open_rubrics(rubric_status, clarification_count)
+    remaining_questions = max(0, 6 - question_index)
+    planner_schema = {
         "type": "object",
-        "required": ["intent", "confidence"],
+        "required": ["next_target", "question", "expected_answer_type"],
         "properties": {
-            "intent": {"type": "string"},
-            "confidence": {"type": ["number", "string"]},
-            "tone_reply": {"type": ["string", "null"]},
-            "signals": {
-                "type": "object",
-                "properties": {
-                    "teaching_experience": {"type": ["boolean", "null"]},
-                    "teaching_readiness": {"type": ["string", "null"]},
-                    "motivation": {"type": ["string", "null"]},
-                    "commitment_horizon": {"type": ["string", "null"]},
-                    "language": {"type": ["string", "null"]},
-                    "language_comfort": {"type": ["string", "null"]}
-                }
-            }
-        }
+            "next_target": {"type": "string"},
+            "question": {"type": "string"},
+            "expected_answer_type": {"type": "string"},
+            "stop_reason": {"type": "string"},
+            "why_internal": {"type": "string"},
+        },
     }
-    
-    # Call LLM with JSON response format
-    try:
-        import jsonschema
-        from jsonschema import ValidationError
-        
-        # Use MCP llm.call with response_format=json_object
-        _mcp_call = _get_mcp_call()
-        payload = {
-            "messages": messages,
-            "temperature": 0.4,
-            "max_tokens": 300,
-            "response_format": "json_object"
-        }
-        
-        mcp_result = await _mcp_call("llm.call", payload, timeout=20)
-        
-        # Extract text from MCP response (use same logic as _extract_llm_text)
-        raw_text = ""
-        if isinstance(mcp_result, dict):
-            if "content" in mcp_result:
-                content = mcp_result["content"]
-                if isinstance(content, list):
-                    for item in content:
-                        if isinstance(item, dict) and item.get("type") == "text":
-                            raw_text = item.get("text", "")
-                            break
-                elif isinstance(content, str):
-                    raw_text = content
-            elif "text" in mcp_result:
-                raw_text = mcp_result["text"]
-            elif "reply" in mcp_result:
-                raw_text = mcp_result["reply"]
-            elif "result" in mcp_result:
-                # Try nested result
-                result_data = mcp_result["result"]
-                if isinstance(result_data, dict):
-                    if "content" in result_data:
-                        content = result_data["content"]
-                        if isinstance(content, list):
-                            for item in content:
-                                if isinstance(item, dict) and item.get("type") == "text":
-                                    raw_text = item.get("text", "")
-                                    break
-                        elif isinstance(content, str):
-                            raw_text = content
-        
-        if not raw_text:
-            raise ValueError("LLM returned empty response")
-        
-        # Repair common JSON issues before parsing
-        # Fix unquoted string values (e.g., maybe -> "maybe", yes -> "yes", no -> "no")
-        repaired_text = raw_text
-        # Replace unquoted string values in teaching_readiness field
-        repaired_text = re.sub(
-            r'"teaching_readiness"\s*:\s*(excited|comfortable_with_guidance|unsure_but_open|no)(?=\s*[,}])',
-            r'"teaching_readiness": "\1"',
-            repaired_text,
-            flags=re.IGNORECASE
-        )
-        # Replace unquoted string values in motivation field (common values)
-        repaired_text = re.sub(
-            r'"motivation"\s*:\s*(help|serve|uplift|outreach|empower)(?=\s*[,}])',
-            r'"motivation": "\1"',
-            repaired_text,
-            flags=re.IGNORECASE
-        )
-        # Replace unquoted string values in commitment_horizon field
-        repaired_text = re.sub(
-            r'"commitment_horizon"\s*:\s*(yes|unsure|no)(?=\s*[,}])',
-            r'"commitment_horizon": "\1"',
-            repaired_text,
-            flags=re.IGNORECASE
-        )
-        # Replace unquoted string values in language_comfort field
-        repaired_text = re.sub(
-            r'"language_comfort"\s*:\s*(read|write|speak|all)(?=\s*[,}])',
-            r'"language_comfort": "\1"',
-            repaired_text,
-            flags=re.IGNORECASE
-        )
-        
-        # Parse JSON
-        try:
-            result = json.loads(repaired_text)
-        except json.JSONDecodeError as exc:
-            # If repair didn't work, try to extract JSON from markdown code blocks
-            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', repaired_text, re.DOTALL)
-            if json_match:
-                try:
-                    result = json.loads(json_match.group(1))
-                except json.JSONDecodeError:
-                    raise ValueError(f"LLM response is not valid JSON even after repair: {raw_text[:500]}") from exc
-            else:
-                raise ValueError(f"LLM response is not valid JSON: {raw_text[:500]}") from exc
-        
-        # Validate against schema
-        try:
-            jsonschema.validate(result, response_schema)
-        except ValidationError as exc:
-            # Try to prune extra keys
-            if isinstance(result, dict) and response_schema.get("properties"):
-                allowed_keys = set(response_schema["properties"].keys())
-                pruned = {k: v for k, v in result.items() if k in allowed_keys}
-                if pruned != result:
-                    try:
-                        jsonschema.validate(pruned, response_schema)
-                        result = pruned
-                    except ValidationError:
-                        pass
-                else:
-                    log.warning(f"[KNOWING_VOLUNTEER] Schema validation failed: {exc.message}, using result anyway")
-            else:
-                log.warning(f"[KNOWING_VOLUNTEER] Schema validation failed: {exc.message}, using result anyway")
-        
-    except Exception as e:
-        log.error(f"[KNOWING_VOLUNTEER] LLM call failed: {e}", exc_info=True)
-        # Fallback: return ambiguous result
-        result = {
-            "intent": "AMBIGUOUS",
-            "confidence": 0.0,
-            "tone_reply": "I see. Could you tell me a bit more about yourself?",
-            "signals": {}
-        }
-    
-    # Extract values
-    intent = result.get("intent", "AMBIGUOUS")
-    confidence = float(result.get("confidence", 0.0))
-    tone_reply = result.get("tone_reply", "")
-    
-    # Strip emojis from tone_reply (safety measure for encoding issues)
-    if tone_reply:
-        tone_reply = _strip_emojis(tone_reply)
-    
-    signals = result.get("signals", {})
-    if isinstance(signals, dict):
-        comfort = signals.get("language_comfort")
-        if isinstance(comfort, str):
-            comfort_norm = comfort.strip().lower()
-            comfort_map = {
-                "read": "Read",
-                "write": "Write",
-                "speak": "Speak",
-                "all": "All",
-            }
-            if comfort_norm in comfort_map:
-                signals["language_comfort"] = comfort_map[comfort_norm]
-        # Backward-compat: map old keys to new ones if present
-        if "teaching_experience" not in signals and "has_teaching_experience" in signals:
-            signals["teaching_experience"] = signals.get("has_teaching_experience")
-        if "teaching_readiness" not in signals and "teaching_interest" in signals:
-            interest = signals.get("teaching_interest")
-            if isinstance(interest, str):
-                interest_norm = interest.strip().lower()
-                readiness_map = {
-                    "yes": "excited",
-                    "maybe": "unsure_but_open",
-                    "no": "no",
+    planner_messages = [
+        {"role": "system", "content": MASTER_SYSTEM_PROMPT},
+        {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "open_rubrics": open_rubrics,
+                    "rubric_status": rubric_status,
+                    "question_index": question_index,
+                    "remaining_questions": remaining_questions,
+                    "fatigue": fatigue,
+                    "last_target": last_target,
+                    "last_agent_prompt": last_agent_prompt,
                 }
-                if interest_norm in readiness_map:
-                    signals["teaching_readiness"] = readiness_map[interest_norm]
-            elif interest is None:
-                signals["teaching_readiness"] = None
-    
-    # Get expected target (rubric we were aiming for this turn)
-    expected_target = session["tool_state"]["selection"].get("expected_target")
-    
-    # Initialize / read low confidence streak
-    low_conf_streak = session["tool_state"]["selection"].get("low_conf_streak", 0)
-    
-    clarification_for_target = False
-    
-    # Rule-based fallback for common replies (helps avoid loops on simple responses)
-    force_commit_target = False
-    if expected_target:
-        text_lower = (user_text or "").lower().strip()
-        rule_signals = {}
-        if expected_target == "teaching_readiness":
-            if re.search(r"\b(very\s+)?comfortable|confident|ready|okay|ok|sure\b", text_lower):
-                rule_signals["teaching_readiness"] = "comfortable_with_guidance"
-            elif re.search(r"\b(not comfortable|uncomfortable|not confident)\b", text_lower):
-                rule_signals["teaching_readiness"] = "no"
-            elif re.search(r"\b(unsure|not sure|maybe|nervous)\b", text_lower):
-                rule_signals["teaching_readiness"] = "unsure_but_open"
-        elif expected_target == "motivation":
-            if re.search(r"\b(help|teach|support|give back|contribute|volunteer|kids|children|students|education)\b", text_lower):
-                rule_signals["motivation"] = "help"
-        elif expected_target == "teaching_experience":
-            if re.search(r"\b(yes|have|taught|teaching|mentor|mentored|trained|experience)\b", text_lower):
-                rule_signals["teaching_experience"] = True
-            elif re.search(r"\b(no|not really|never|haven't|have not|didn't|did not)\b", text_lower):
-                rule_signals["teaching_experience"] = False
-        elif expected_target == "commitment_horizon":
-            if re.search(r"\b(yes|ok|okay|sure|can|will|possible|fine)\b", text_lower):
-                rule_signals["commitment_horizon"] = "yes"
-            elif re.search(r"\b(not sure|maybe|unsure)\b", text_lower):
-                rule_signals["commitment_horizon"] = "unsure"
-            elif re.search(r"\b(no|cannot|can't|cant)\b", text_lower):
-                rule_signals["commitment_horizon"] = "no"
-        elif expected_target == "language" and preferred_language:
-            if re.search(r"\b(very\s+)?comfortable|confident|good|ok|okay|fine\b", text_lower):
-                rule_signals["language_comfort"] = "All"
-        if rule_signals:
-            signals.update(rule_signals)
-            force_commit_target = True
-    
-    # Guard: if confidence is low and LLM claims to extract a new signal for expected_target,
-    # do NOT commit that field yet. Instead, ask a simple clarification question and
-    # increment low_conf_streak.
-    if expected_target and confidence < LOW_CONF_THRESHOLD and not force_commit_target:
-        new_signal_for_target = False
-        
-        if expected_target == "language":
-            # Language rubric: treat either language or language_comfort as a claimed signal
-            new_lang = signals.get("language")
-            new_comfort = signals.get("language_comfort")
-            if ((new_lang is not None and session["tool_state"]["selection"]["profile"].get("language") is None) or
-                (new_comfort is not None and session["tool_state"]["selection"]["profile"].get("language_comfort") is None)):
-                new_signal_for_target = True
-        else:
-            # Simple scalar fields
-            profile_val = session["tool_state"]["selection"]["profile"].get(expected_target)
-            if signals.get(expected_target) is not None and profile_val is None:
-                new_signal_for_target = True
-        
-        if new_signal_for_target:
-            clarification_for_target = True
-            
-            # Strip out the low-confidence field(s) so they are not merged into profile
-            if expected_target == "language":
-                if signals.get("language") is not None:
-                    signals["language"] = None
-                if signals.get("language_comfort") is not None:
-                    signals["language_comfort"] = None
-            else:
-                signals[expected_target] = None
-            
-            # Keep the LLM's tone_reply (no hardcoded follow-up)
-            if not tone_reply:
-                tone_reply = "I see. Could you tell me a bit more?"
-            
-            # Increment low confidence streak
-            low_conf_streak += 1
-            session["tool_state"]["selection"]["low_conf_streak"] = low_conf_streak
-    
-    # Get current profile (already initialized above)
-    profile = session["tool_state"]["selection"]["profile"]
-    
-    # Merge signals into profile (only set non-null values, don't overwrite existing)
-    signals_extracted = {}
-    
-    if signals.get("motivation") is not None and profile.get("motivation") is None:
-        profile["motivation"] = signals.get("motivation")
-        signals_extracted["motivation"] = profile["motivation"]
-        log.info(f"[KNOWING_VOLUNTEER] Extracted motivation: {profile['motivation']}")
-    
-    if signals.get("teaching_experience") is not None and profile.get("teaching_experience") is None:
-        profile["teaching_experience"] = signals.get("teaching_experience")
-        signals_extracted["teaching_experience"] = profile["teaching_experience"]
-        log.info(f"[KNOWING_VOLUNTEER] Extracted teaching_experience: {profile['teaching_experience']}")
-    
-    if signals.get("teaching_readiness") is not None and profile.get("teaching_readiness") is None:
-        profile["teaching_readiness"] = signals.get("teaching_readiness")
-        signals_extracted["teaching_readiness"] = profile["teaching_readiness"]
-        log.info(f"[KNOWING_VOLUNTEER] Extracted teaching_readiness: {profile['teaching_readiness']}")
-    
-    if signals.get("commitment_horizon") is not None and profile.get("commitment_horizon") is None:
-        profile["commitment_horizon"] = signals.get("commitment_horizon")
-        signals_extracted["commitment_horizon"] = profile["commitment_horizon"]
-        log.info(f"[KNOWING_VOLUNTEER] Extracted commitment_horizon: {profile['commitment_horizon']}")
-    
-    if signals.get("language") is not None and profile.get("language") is None:
-        profile["language"] = signals.get("language")
-        signals_extracted["language"] = profile["language"]
-        log.info(f"[KNOWING_VOLUNTEER] Extracted language: {profile['language']}")
-    
-    if signals.get("language_comfort") is not None and profile.get("language_comfort") is None:
-        profile["language_comfort"] = signals.get("language_comfort")
-        signals_extracted["language_comfort"] = profile["language_comfort"]
-        log.info(f"[KNOWING_VOLUNTEER] Extracted language_comfort: {profile['language_comfort']}")
-
-        # If language is already known from preferences, persist it when comfort is captured
-        if preferred_language and profile.get("language") is None:
-            profile["language"] = preferred_language
-            signals_extracted["language"] = profile["language"]
-            log.info(f"[KNOWING_VOLUNTEER] Set language from preferences: {profile['language']}")
-    
-    # If we successfully extracted the expected_target with high confidence, reset low_conf_streak
-    high_conf_success = False
-    if expected_target and confidence >= LOW_CONF_THRESHOLD:
-        if expected_target in signals_extracted:
-            high_conf_success = True
-        elif expected_target == "language" and "language_comfort" in signals_extracted:
-            high_conf_success = True
-    if force_commit_target and expected_target:
-        if expected_target in signals_extracted or (expected_target == "language" and "language_comfort" in signals_extracted):
-            high_conf_success = True
-    
-    if high_conf_success:
-        if low_conf_streak != 0:
-            log.info(f"[KNOWING_VOLUNTEER] High-confidence extraction for {expected_target}, resetting low_conf_streak")
-        low_conf_streak = 0
-        session["tool_state"]["selection"]["low_conf_streak"] = 0
-    
-    # Mark fields as discussed based on intent (even if signal extraction failed)
-    discussed_fields = session["tool_state"]["selection"].get("discussed_fields", set())
-    if not isinstance(discussed_fields, set):
-        discussed_fields = set(discussed_fields) if discussed_fields else set()
-    
-    # Map intent to field and mark as discussed
-    field_from_intent = INTENT_TO_FIELD_MAP.get(intent)
-    if field_from_intent:
-        # If we are in clarification_for_target mode for this same rubric, do NOT mark it
-        # as discussed yet. We want the follow-up confirmation before treating it as covered.
-        if not (clarification_for_target and field_from_intent == expected_target):
-            discussed_fields.add(field_from_intent)
-            log.info(f"[KNOWING_VOLUNTEER] Marked '{field_from_intent}' as discussed based on intent '{intent}'")
-    
-    # Also mark fields as discussed if signal was extracted (even if null/negative)
-    for field_name in signals_extracted.keys():
-        # Special case: language_comfort extraction should mark "language" rubric as discussed
-        if field_name == "language_comfort":
-            discussed_fields.add("language")
-            log.info(f"[KNOWING_VOLUNTEER] Marked 'language' as discussed (language_comfort signal extracted)")
-        else:
-            discussed_fields.add(field_name)
-            log.info(f"[KNOWING_VOLUNTEER] Marked '{field_name}' as discussed (signal extracted)")
-    
-    # If we asked for commitment and got no clear signal, mark as discussed to avoid repeats
-    if expected_target == "commitment_horizon" and "commitment_horizon" not in signals_extracted:
-        discussed_fields.add("commitment_horizon")
-        log.info("[KNOWING_VOLUNTEER] Marked 'commitment_horizon' as discussed to avoid repeats")
-    
-    # Log if expected signal was not extracted
-    if "expected_target" in session.get("tool_state", {}).get("selection", {}):
-        expected_target = session["tool_state"]["selection"]["expected_target"]
-        if expected_target and expected_target not in signals_extracted:
-            # Still mark as discussed if intent matches
-            if field_from_intent == expected_target:
-                log.info(f"[KNOWING_VOLUNTEER] Expected signal '{expected_target}' not extracted, but intent matches - marked as discussed")
-            else:
-                log.warning(f"[KNOWING_VOLUNTEER] Expected signal '{expected_target}' was not extracted. Intent: {intent}, LLM signals: {signals}")
-    
-    # Update profile and discussed_fields in session
-    session["tool_state"]["selection"]["profile"] = profile
-    session["tool_state"]["selection"]["discussed_fields"] = discussed_fields
-    
-    # Recalculate next_target AFTER merging signals and updating discussed_fields
-    next_target_after_merge = _get_next_missing_rubric(profile, discussed_fields)
-    collected_after = {k: v for k, v in profile.items() if v is not None}
-    log.info(f"[KNOWING_VOLUNTEER] After merging: next_target={next_target_after_merge}, collected={list(collected_after.keys())}, discussed={list(discussed_fields)}, low_conf_streak={low_conf_streak}")
-    
-    # If expected_target is commitment, enforce a direct commitment question
-    if expected_target == "commitment_horizon":
-        if not tone_reply or not re.search(r"\b(3\s*months?|three\s*months?|continue|commit)\b", tone_reply, re.I):
-            tone_reply = "Would you be open to volunteering for around 3 months?"
-    
-    def _asked_expected_target(reply: str, target: Optional[str]) -> bool:
-        if not reply or not target:
-            return False
-        patterns = {
-            "motivation": r"\b(why|motivated|motivation|draw|what made you|reason)\b",
-            "commitment_horizon": r"\b(3\s*months?|three\s*months?|continue|commit)\b",
-            "teaching_readiness": r"\b(comfortable|excited|ready|feel about teaching|teach children)\b",
-            "teaching_experience": r"\b(experience|taught|teaching before|worked with children|helped someone learn)\b",
-            "language": r"\b(language|read|write|speak)\b",
+            ),
+        },
+    ]
+    try:
+        planner = await _llm_call_json(planner_messages, schema=planner_schema, timeout=20)
+    except Exception as e:
+        log.warning(f"[KNOWING_VOLUNTEER] Planner failed: {e}")
+        planner = {
+            "next_target": open_rubrics[0] if open_rubrics else "stop",
+            "question": "Could you share a bit more?",
+            "expected_answer_type": "free_text",
         }
-        pattern = patterns.get(target)
-        return bool(pattern and re.search(pattern, reply, re.I))
-    
-    # Increment question_index on every assistant question to enforce a hard cap
-    if "question_index" not in session["tool_state"]["selection"]:
-        session["tool_state"]["selection"]["question_index"] = 0
-    if tone_reply:
-        session["tool_state"]["selection"]["question_index"] += 1
-    question_index = session["tool_state"]["selection"]["question_index"]
-    
-    # Hard cap on number of questions to prevent long loops
-    MAX_KNOWING_VOLUNTEER_QUESTIONS = 6
-    if question_index >= MAX_KNOWING_VOLUNTEER_QUESTIONS:
-        log.info(f"[KNOWING_VOLUNTEER] Max questions reached ({question_index}), stopping")
-        decision = KnowingVolunteerResult.COMPLETE_INSUFFICIENT_INFO
-        tone_reply = "Thanks for sharing — I have enough to suggest a next step."
-    # Low-confidence escape hatch: if we have repeatedly low confidence, stop probing
-    elif low_conf_streak >= 2:
-        log.info("[KNOWING_VOLUNTEER] Low confidence streak >= 2, stopping with COMPLETE_INSUFFICIENT_INFO")
-        decision = KnowingVolunteerResult.COMPLETE_INSUFFICIENT_INFO
-        # Graceful closing (this will be sent instead of another probing question)
-        tone_reply = "That’s perfectly okay — I have enough to suggest a next step 😊"
-    else:
-        # Compute decision (pass user_text for deferral detection)
-        decision = evaluate_knowing_volunteer(intent, question_index, profile, user_text=user_text)
-    
-    # Ensure tone_reply has a question when CONTINUE (minimal safety check)
-    if decision == KnowingVolunteerResult.CONTINUE and tone_reply:
-        # Use the recalculated next_target (after signal merging) for logging only
-        next_target_for_question = next_target_after_merge
-        
-        # Minimal check: if no question mark, log warning but trust LLM
-        if "?" not in tone_reply:
-            log.warning(f"[KNOWING_VOLUNTEER] LLM tone_reply has no question mark. Expected target: {next_target_for_question}. tone_reply: {tone_reply[:100]}")
-            # Trust LLM - don't force a question, but log for monitoring
-        else:
-            log.info(f"[KNOWING_VOLUNTEER] LLM generated question for next_target={next_target_for_question}: {tone_reply[:100]}")
-    
+
+    selection["last_planner"] = planner
+    next_target = (planner.get("next_target") or "").strip()
+    question = (planner.get("question") or "").strip()
+
+    if question_index >= 6:
+        return {
+            "intent": "STOP",
+            "confidence": 1.0,
+            "assistant_text": "Thanks for sharing — I have enough to suggest a next step.",
+            "signals": profile.copy(),
+            "decision": KnowingVolunteerResult.COMPLETE_INSUFFICIENT_INFO.value,
+        }
+
+    if next_target == "stop":
+        return {
+            "intent": "STOP",
+            "confidence": 1.0,
+            "assistant_text": question or "Thanks for sharing — I have enough to suggest a next step.",
+            "signals": profile.copy(),
+            "decision": KnowingVolunteerResult.COMPLETE.value,
+        }
+
+    selection["last_target"] = next_target
+    selection["question_index"] = question_index + 1
+
     return {
-        "intent": intent,
-        "confidence": confidence,
-        "assistant_text": tone_reply,
-        "signals": profile.copy(),  # Return merged profile
-        "decision": decision.value
+        "intent": "CONTINUE",
+        "confidence": 1.0,
+        "assistant_text": question,
+        "signals": profile.copy(),
+        "decision": KnowingVolunteerResult.CONTINUE.value,
     }
 
