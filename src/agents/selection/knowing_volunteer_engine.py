@@ -117,14 +117,14 @@ You MUST return ONLY JSON with the required schema.
 Rules:
 - English only, one question per message.
 - Keep tone warm and human.
-- If fatigue is true, use next_target="summary_confirm".
 - Prioritize decision-critical rubrics first if unknown/partial: commitment_horizon, teaching_readiness.
 - Avoid asking resolved rubrics.
+- For commitment_horizon: ask ONLY about continuing for ~3 months; do NOT mention hours/week, weekly time, or availability.
 - If critical rubrics are resolved and remaining questions are optional, you may return next_target="stop".
 
 Output JSON schema:
 {
-  "next_target": "motivation|commitment_horizon|teaching_readiness|teaching_experience|language|summary_confirm|stop",
+  "next_target": "motivation|commitment_horizon|teaching_readiness|teaching_experience|language|stop",
   "question": "string",
   "expected_answer_type": "free_text|yes_no_maybe|multi_choice",
   "stop_reason": "optional string",
@@ -379,6 +379,112 @@ RUBRIC_ORDER = ["motivation", "commitment_horizon", "teaching_readiness", "teach
 CRITICAL_RUBRICS = {"commitment_horizon", "teaching_readiness"}
 
 
+# Few-shot examples (keep compact to avoid token bloat)
+PLANNER_FEW_SHOTS = [
+    {
+        "role": "user",
+        "content": json.dumps(
+            {
+                "open_rubrics": ["commitment_horizon", "teaching_readiness"],
+                "rubric_status": {"commitment_horizon": "unknown", "teaching_readiness": "unknown"},
+                "question_index": 1,
+                "remaining_questions": 5,
+                "fatigue": False,
+                "last_target": "motivation",
+                "last_agent_prompt": "What inspired you to volunteer?",
+            }
+        ),
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "{\"next_target\":\"commitment_horizon\",\"question\":\"Thanks for sharing that. "
+            "Do you feel you could continue volunteering for about 3 months?\","
+            "\"expected_answer_type\":\"yes_no_maybe\",\"why_internal\":\"commitment_horizon is critical\"}"
+        ),
+    },
+    {
+        "role": "user",
+        "content": json.dumps(
+            {
+                "open_rubrics": ["teaching_readiness", "teaching_experience"],
+                "rubric_status": {"teaching_readiness": "unknown", "teaching_experience": "unknown"},
+                "question_index": 2,
+                "remaining_questions": 4,
+                "fatigue": False,
+                "last_target": "commitment_horizon",
+                "last_agent_prompt": "Do you feel you could continue volunteering for about 3 months?",
+            }
+        ),
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "{\"next_target\":\"teaching_readiness\",\"question\":\"How do you feel about teaching "
+            "children in a live class — excited to try, comfortable with guidance, or a bit unsure but open?\","
+            "\"expected_answer_type\":\"free_text\",\"why_internal\":\"readiness is critical\"}"
+        ),
+    },
+    {
+        "role": "user",
+        "content": json.dumps(
+            {
+                "open_rubrics": [],
+                "rubric_status": {
+                    "motivation": "resolved",
+                    "commitment_horizon": "resolved",
+                    "teaching_readiness": "resolved",
+                    "teaching_experience": "resolved",
+                    "language": "resolved",
+                },
+                "question_index": 5,
+                "remaining_questions": 1,
+                "fatigue": False,
+                "last_target": "language",
+                "last_agent_prompt": "Which option fits you best: Read, Write, Speak, or All?",
+            }
+        ),
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "{\"next_target\":\"stop\",\"question\":\"Thanks for sharing — I have enough to suggest a next step.\","
+            "\"expected_answer_type\":\"free_text\",\"why_internal\":\"all rubrics resolved\"}"
+        ),
+    },
+]
+
+EXTRACTOR_FEW_SHOTS = [
+    {"role": "user", "content": "User: I can give around 2 hours a week, mostly weekdays."},
+    {
+        "role": "assistant",
+        "content": (
+            "{\"extracted\":{\"commitment_horizon\":{\"value\":\"unknown\",\"confidence\":0.2}},"
+            "\"rubric_status_updates\":{},\"needs_clarification\":false,"
+            "\"clarification_question\":\"\",\"notes_internal\":\"Hours/week is not commitment horizon\"}"
+        ),
+    },
+    {"role": "user", "content": "User: Yes, I can commit for about 3 months."},
+    {
+        "role": "assistant",
+        "content": (
+            "{\"extracted\":{\"commitment_horizon\":{\"value\":\"yes\",\"confidence\":0.9}},"
+            "\"rubric_status_updates\":{\"commitment_horizon\":\"resolved\"},\"needs_clarification\":false,"
+            "\"clarification_question\":\"\",\"notes_internal\":\"Clear 3-month commitment\"}"
+        ),
+    },
+    {"role": "user", "content": "User: I feel a bit unsure but I am open to try."},
+    {
+        "role": "assistant",
+        "content": (
+            "{\"extracted\":{\"teaching_readiness\":{\"value\":\"maybe\",\"confidence\":0.85}},"
+            "\"rubric_status_updates\":{\"teaching_readiness\":\"partial\"},\"needs_clarification\":false,"
+            "\"clarification_question\":\"\",\"notes_internal\":\"Unsure but open\"}"
+        ),
+    },
+]
+
+
 def _init_rubric_trackers(session: Dict) -> None:
     selection = session.setdefault("tool_state", {}).setdefault("selection", {})
     rubric_status = selection.setdefault("rubric_status", {})
@@ -468,6 +574,39 @@ async def _llm_call_json(messages: List[Dict], schema: Optional[Dict] = None, ti
         except Exception:
             pass
     return parsed
+
+
+async def _compose_ack_and_question(user_text: str, question: str) -> str:
+    if not user_text or not question:
+        return question
+    prompt = (
+        "You are crafting a single WhatsApp message.\n"
+        "Add a short, warm acknowledgement of the user's reply, then ask the provided question.\n"
+        "Rules:\n"
+        "- 1-2 short lines total\n"
+        "- No emojis\n"
+        "- Do NOT add any other questions\n"
+        "- Use the question text exactly as given and place it at the end\n"
+        "Return ONLY valid JSON: {\"text\": \"...\"}"
+    )
+    schema = {
+        "type": "object",
+        "required": ["text"],
+        "properties": {"text": {"type": "string"}},
+    }
+    messages = [
+        {"role": "system", "content": MASTER_SYSTEM_PROMPT},
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": f"User reply: {user_text}\nQuestion: {question}"},
+    ]
+    try:
+        parsed = await _llm_call_json(messages, schema=schema, timeout=15)
+        combined = parsed.get("text")
+        if isinstance(combined, str) and combined.strip():
+            return combined.strip()
+    except Exception as e:
+        log.warning(f"[KNOWING_VOLUNTEER] Ack+question composition failed: {e}")
+    return f"Thanks for sharing. {question}"
 
 
 def _detect_fatigue(user_text: str, session: Dict) -> bool:
@@ -739,20 +878,6 @@ async def run_knowing_volunteer_step(
     preferred_language = session.get("profile", {}).get("preferences", {}).get("language")
     fatigue = _detect_fatigue(user_text, session) if user_text != "__kick__" else False
 
-    # Handle summary_confirm replies explicitly to avoid loops
-    if last_target == "summary_confirm" and user_text != "__kick__":
-        if _is_affirmative(user_text):
-            # Resolve non-critical remaining rubrics as optional when confirmed
-            for rubric in RUBRIC_ORDER:
-                if rubric in CRITICAL_RUBRICS:
-                    continue
-                if rubric_status.get(rubric) != "resolved":
-                    rubric_status[rubric] = "resolved"
-            selection["last_target"] = None
-        elif _is_negative(user_text):
-            selection["last_target"] = None
-        # Continue to planner for next step after handling summary confirm
-
     # Extractor step (only if we have a previous target)
     rule_extracted = _rule_extract(user_text, last_target) if last_target and user_text != "__kick__" else {}
     llm_extracted: Dict[str, Dict] = {}
@@ -774,6 +899,7 @@ async def run_knowing_volunteer_step(
         messages = [
             {"role": "system", "content": EXTRACTOR_SYSTEM_PROMPT},
             {"role": "system", "content": f"Last target: {last_target}. Preferred language: {preferred_language}."},
+            *EXTRACTOR_FEW_SHOTS,
             {"role": "user", "content": user_text},
         ]
         try:
@@ -854,6 +980,7 @@ async def run_knowing_volunteer_step(
     planner_messages = [
         {"role": "system", "content": MASTER_SYSTEM_PROMPT},
         {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+        *PLANNER_FEW_SHOTS,
         {
             "role": "user",
             "content": json.dumps(
@@ -892,6 +1019,9 @@ async def run_knowing_volunteer_step(
             "decision": KnowingVolunteerResult.COMPLETE_INSUFFICIENT_INFO.value,
         }
 
+    if next_target == "summary_confirm":
+        next_target = open_rubrics[0] if open_rubrics else "stop"
+
     if next_target == "stop":
         return {
             "intent": "STOP",
@@ -903,11 +1033,14 @@ async def run_knowing_volunteer_step(
 
     selection["last_target"] = next_target
     selection["question_index"] = question_index + 1
+    assistant_text = question
+    if user_text != "__kick__":
+        assistant_text = await _compose_ack_and_question(user_text, question)
 
     return {
         "intent": "CONTINUE",
         "confidence": 1.0,
-        "assistant_text": question,
+        "assistant_text": assistant_text,
         "signals": profile.copy(),
         "decision": KnowingVolunteerResult.CONTINUE.value,
     }

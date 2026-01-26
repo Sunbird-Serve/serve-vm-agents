@@ -6,6 +6,7 @@ Handles the Selection Agent state machine for volunteer screening and recommenda
 import logging
 import time
 import asyncio
+import re
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -49,6 +50,18 @@ def _sanitize_ascii(text: str) -> str:
 
 def _has_non_ascii(text: str) -> bool:
     return any(ord(ch) > 127 for ch in (text or ""))
+
+
+def _clean_assistant_text(text: str) -> str:
+    """Normalize assistant text: remove stray '?', strip emojis, keep content."""
+    if not text:
+        return text
+    cleaned = text.strip()
+    cleaned = re.sub(r"^\?\s+", "", cleaned)
+    cleaned = re.sub(r"([.!])\s*\?\s+", r"\1 ", cleaned)
+    cleaned = _sanitize_ascii(cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    return cleaned
 
 
 def _get_mcp_wa_send():
@@ -541,11 +554,9 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
             profile = session.get("profile", {})
             preferred_language = session.get("profile", {}).get("preferences", {}).get("language")
             expected_target = session.get("tool_state", {}).get("selection", {}).get("expected_target")
-            safe_text = assistant_text.strip()
-            if _has_non_ascii(safe_text):
-                profile = session.get("profile", {})
+            safe_text = _clean_assistant_text(assistant_text)
+            if not safe_text:
                 name = profile.get("name") or "there"
-                preferred_language = profile.get("preferences", {}).get("language")
                 if expected_target == "language":
                     safe_text = get_sel_language_comfort_prompt(preferred_language or "that language", name)
                 else:

@@ -409,6 +409,7 @@ async def handle_fulfillment(phone: str, text: str, session: dict):
             question=text,
             send_fn=mcp_wa_send,
             add_history_fn=None,
+            add_bridge=False,
         )
         if handled:
             session["ts"] = time.time()

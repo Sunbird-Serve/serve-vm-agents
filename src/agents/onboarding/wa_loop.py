@@ -2609,11 +2609,13 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
     async def _maybe_answer_global_faq(text_value: str) -> bool:
         """Return True if global FAQ answered the question."""
         try:
+            add_bridge = state not in {"COMPLETE"}
             handled = await send_global_faq_response(
                 phone=phone,
                 question=text_value,
                 send_fn=mcp_wa_send,
                 add_history_fn=_add_to_history,
+                add_bridge=add_bridge,
             )
             if handled:
                 sess["_state_handled_question"] = True
@@ -2666,6 +2668,7 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
             return (question_part, answer_part, True)
         return (None, text_value, False)
     
+    resume_intent = text != "__kick__" and is_resume_response(text)
     mixed_question, text_for_state, is_mixed_qna = (None, text, False)
     if text != "__kick__":
         mixed_question, text_for_state, is_mixed_qna = _split_question_and_answer(text)
@@ -2686,7 +2689,7 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
                     _add_to_history(phone, bot_msg=answer)
                     answered = True
                     break
-        if not answered:
+        if not answered and not resume_intent:
             answered = await _maybe_answer_global_faq(mixed_question)
         if not answered:
             fallback = "I can share more on that soon — for now, let’s continue."
@@ -2706,6 +2709,7 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
         text != "__kick__"
         and state != "QA_WINDOW"
         and not deferral_like
+        and not resume_intent
         and _is_question(text)
         and state not in {"WELCOME", "PEEK_CHOICE", "PEEK_NEEDS_OFFER", "ELIGIBILITY"}
         and not sess.get("_state_handled_question")
@@ -5073,8 +5077,15 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
         sess.pop("_last_msg_ts", None)
         SESSIONS[phone] = sess
 
-        # If user explicitly wants to resume, re-ask the pending question when possible.
+        # If user explicitly wants to resume, advance past WELCOME or re-ask pending question.
         if text != "__kick__" and is_resume_response(text):
+            if prev_state == "WELCOME":
+                sess["state"] = "WELCOME_VIDEO"
+                sess["sub_state"] = "WELCOME_VIDEO"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                await _handle(phone, "__kick__")
+                return
             if await _reask_pending_question(phone, prev_state, sess):
                 return
 

@@ -188,6 +188,7 @@ async def send_global_faq_response(
     question: str,
     send_fn,
     add_history_fn=None,
+    add_bridge: bool = True,
 ) -> bool:
     """Send global FAQ response with ack + answer + bridge. Returns True if handled."""
     top = retrieve(question, k=3)
@@ -205,7 +206,10 @@ async def send_global_faq_response(
             add_history_fn(phone, bot_msg=msg)
         return True
     ack = random.choice(FAQ_ACK_CHOICES)
-    msg = f"{ack}\n{answer}\n{FAQ_BRIDGE}"
+    if add_bridge:
+        msg = f"{ack}\n{answer}\n{FAQ_BRIDGE}"
+    else:
+        msg = f"{ack}\n{answer}"
     await send_fn(phone, msg)
     if add_history_fn:
         add_history_fn(phone, bot_msg=msg)
