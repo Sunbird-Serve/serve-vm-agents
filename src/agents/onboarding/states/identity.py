@@ -577,17 +577,17 @@ async def mcp_firebase_email_exists(email: str) -> Tuple[bool, Optional[str]]:
         raise
 
 
-async def mcp_firebase_ensure_user(email: str, display_name: str, generate_reset_link: bool = True) -> Tuple[str, Optional[str]]:
+async def mcp_firebase_ensure_user(email: str, display_name: str, generate_reset_link: bool = True) -> Tuple[str, Optional[bool]]:
     """
     Ensure Firebase user exists (create if missing).
     
     Args:
         email: Email address
         display_name: Display name
-        generate_reset_link: Whether to generate reset link
+        generate_reset_link: Whether to send reset email (MCP server flag)
         
     Returns:
-        (firebase_uid: str, reset_link: Optional[str])
+        (firebase_uid: str, reset_email_sent: Optional[bool])
     """
     try:
         from ..wa_loop import _mcp_call
@@ -604,13 +604,16 @@ async def mcp_firebase_ensure_user(email: str, display_name: str, generate_reset
         )
         
         firebase_uid = result.get("firebase_uid") or result.get("uid")
-        reset_link = result.get("reset_link")
+        reset_email_sent = result.get("reset_email_sent")
         
         if not firebase_uid:
             raise RuntimeError("Firebase ensure_user returned no firebase_uid")
         
-        log.info(f"[REG] Firebase user ensured: firebase_uid={firebase_uid}, reset_link_sent={reset_link is not None}")
-        return firebase_uid, reset_link
+        log.info(
+            f"[REG] Firebase user ensured: firebase_uid={firebase_uid}, "
+            f"reset_email_sent={bool(reset_email_sent)}"
+        )
+        return firebase_uid, reset_email_sent
     except Exception as e:
         log.error(f"[REG] Firebase ensure_user failed: {e}", exc_info=True)
         raise
@@ -747,13 +750,13 @@ async def run_registration_flow(
         if not firebase_exists:
             # Create Firebase user
             try:
-                firebase_uid, reset_link = await mcp_firebase_ensure_user(
+                firebase_uid, reset_email_sent = await mcp_firebase_ensure_user(
                     email=email,
                     display_name=name,
                     generate_reset_link=True
                 )
                 result["firebase"]["firebase_uid"] = firebase_uid
-                result["firebase"]["reset_link_sent"] = reset_link is not None
+                result["firebase"]["reset_link_sent"] = bool(reset_email_sent)
                 result["firebase"]["exists"] = True
                 
                 # Log event
@@ -775,7 +778,7 @@ async def run_registration_flow(
                             details={
                                 "created": True,
                                 "firebase_uid": firebase_uid,
-                                "reset_link_sent": reset_link is not None,
+                                "reset_link_sent": bool(reset_email_sent),
                                 "email": mask_email(email)
                             },
                             session_id=session_id

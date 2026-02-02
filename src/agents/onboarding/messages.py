@@ -483,7 +483,7 @@ QA_FALLBACK_SOFT = """Thanks for your question. Our coordinator will get in touc
 
 # ---------- Section 5.5: Feedback ----------
 QA_FEEDBACK_PROMPT = "Before we wrap up, how was this onboarding experience for you?"
-QA_FEEDBACK_BUTTONS = ["Great 👍", "Okay 🙂", "Needs improvement"]
+QA_FEEDBACK_BUTTONS = ["Helpful", "Not helpful"]
 QA_FEEDBACK_CLOSING = "Thank you, {name}! Your feedback helps us improve. A coordinator will be in touch if needed."
 
 QA_MANDATORY_ORIENT = """One last step: a short WhatsApp check-in (about 10–15 minutes) is required for all volunteers.
