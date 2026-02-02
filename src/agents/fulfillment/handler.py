@@ -933,12 +933,16 @@ async def handle_fulfill_nominate(phone: str, text: str, session: dict):
         except Exception as e:
             log.warning(f"[FULFILLMENT] Failed to persist successful nomination: {e}", exc_info=True)
         
-        # Move to done state
+        # Move to done state and immediately transition to QA window
         session["state"] = FulfillmentState.DONE
         session["ts"] = time.time()
         
         from agents.onboarding.wa_loop import SESSIONS
         SESSIONS[phone] = session
+        
+        # Kick off QA window right away (don't wait for user to message again)
+        await handle_fulfill_done(phone, "__kick__", session)
+        return
     else:
         # Failed
         log.warning(f"[FULFILLMENT] Nomination failed for {phone}, need_id: {need_id}")

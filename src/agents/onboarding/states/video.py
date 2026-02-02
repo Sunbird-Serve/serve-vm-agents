@@ -18,6 +18,7 @@ from ..messages import (
     PEEK_NEEDS_PROMPT,
     PEEK_SKIP_MESSAGE,
     PEEK_MAYBE_MESSAGE,
+    CLASS_VIDEO_CAPTION,
 )
 
 log = logging.getLogger(__name__)
@@ -94,7 +95,7 @@ async def handle_video(
         video_message_id = None
         video_sent_success = False
         try:
-            video_message_id = await mcp_wa_send_class_video(phone)
+            video_message_id = await mcp_wa_send_class_video(phone, caption=CLASS_VIDEO_CAPTION)
             
             if video_message_id:
                 log.info(f"[VIDEO] Video sent successfully, message_id: {video_message_id}")

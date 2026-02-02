@@ -16,7 +16,7 @@ def get_sel_video_intro(name: str = "there") -> str:
 def get_sel_video_followup(name: str = "there") -> str:
     """Get video followup message"""
     return (
-        f"Thank you for being open to this, {name} 🌱\n"
+        f"We're moving into the final part, {name} 🌱\n"
         "Shall we finish this together? Just a few questions to help me understand you better."
     )
 

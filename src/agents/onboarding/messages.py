@@ -131,6 +131,9 @@ CLASS_PREVIEW_ASK_BUTTONS = ["Yes, show me", "Skip for now"]
 
 # ---------- Section 2.4: Video ----------
 VIDEO_INTRO = "Here's a short glimpse of how a class usually looks"
+CLASS_VIDEO_CAPTION = (
+    "The session is led by one of our volunteers, Nishta Jain, teaching students in Kakori, Lucknow."
+)
 
 VIDEO_FOOTER = """Simple, right?
 That’s how most SERVE classes feel."""
@@ -141,7 +144,7 @@ VIDEO_ERROR_MSG = """I'm having trouble playing the video right now, but we can 
 
 PEEK_VIDEO_PROMPT = "By the way, would you like to watch a short live class glimpse? You can say yes, skip, or maybe."
 
-PEEK_NEEDS_PROMPT = "Would you like to see a quick preview of current requirements? You can say yes, skip, or maybe."
+PEEK_NEEDS_PROMPT = "Would you like a quick look at the volunteering needs we have right now? You can say yes, skip, or maybe."
 PEEK_REQUIREMENTS_NOTE = "This is just a preview — we’ll later look at what works for you."
 PEEK_SKIP_MESSAGE = "From here, we’ll move into a few basics — about 10 minutes, at your pace 🙂"
 PEEK_MAYBE_MESSAGE = "Totally okay — we can skip it for now and continue. You can always come back to it later."
@@ -189,6 +192,8 @@ Volunteering with SERVE usually means:
 * contributing in a *voluntary (unpaid)* role
 
 * are 18 years or above
+
+Choosing “Yes” means you’re giving your consent to proceed based on the details shared above.
 
 If this sounds like something you'd enjoy, we can continue"""
 

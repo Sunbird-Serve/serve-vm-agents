@@ -764,7 +764,7 @@ def _save_media_cache(cache: dict[str, str]):
         log.warning(f"[MEDIA] Failed to save cache file: {e}")
 
 
-async def mcp_wa_send_class_video(to_phone: str) -> Optional[str]:
+async def mcp_wa_send_class_video(to_phone: str, caption: Optional[str] = None) -> Optional[str]:
     """
     Send class preview video to WhatsApp recipient.
     The MCP server handles loading and sending the video file internally.
@@ -783,7 +783,8 @@ async def mcp_wa_send_class_video(to_phone: str) -> Optional[str]:
         result = await _mcp_call(
             "serve.whatsapp.send_class_video",
             {
-                "to_phone": to_phone
+                "to_phone": to_phone,
+                "caption": caption,
             },
             timeout=60  # Longer timeout for file upload and send
         )
@@ -2215,8 +2216,8 @@ async def _handle_with_idempotency(phone: str, text: str, inbound_msg_id: str, e
                     pass  # Best-effort
                 return  # Early return - don't process duplicate
         
-        # Check current agent and route accordingly
-        sess = SESSIONS.get(phone, {})
+        # Check current agent and route accordingly (rehydrate from DB if needed)
+        sess = _rehydrate_or_create_session(phone)
         current_agent = sess.get("agent", "onboarding")
         
         if current_agent == "selection":
@@ -2270,254 +2271,7 @@ async def _handle_with_idempotency(phone: str, text: str, inbound_msg_id: str, e
                 log.warning(f"[IDEMPOTENCY] Failed to update idempotency for {phone}: {e}")
 
 
-# ---------- State Machine ----------
-async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
-    """
-    Main state machine handler
-    
-    Args:
-        phone: Phone number
-        text: User's message
-    """
-    phone = normalize_phone(phone)
-    sess = SESSIONS.get(phone)
-    
-    if not sess:
-        log.warning(f"[HANDLE] No session for {phone}, creating new one")
-        db_session = None
-        try:
-            from storage.db import get_db_session
-            from storage.session_store import get_or_create_session
-            with get_db_session() as db:
-                db_session = get_or_create_session(
-                    db, wa_phone=phone, agent_name=settings.AGENT_NAME
-                )
-        except Exception as e:
-            log.warning(f"[PERSISTENCE] Failed to read DB session for {phone}: {e}", exc_info=True)
-        
-        if db_session:
-            db_state = db_session.get("state") or "WELCOME"
-            db_sub_state = db_session.get("sub_state")
-            profile_name = db_session.get("temp_name") or "Volunteer"
-            created_at = db_session.get("created_at")
-            updated_at = db_session.get("updated_at")
-            has_context = any([
-                db_session.get("tool_state"),
-                db_state not in ["WELCOME", None],
-                db_sub_state,
-                db_session.get("last_outbound_msg_id"),
-                db_session.get("temp_name"),
-                db_session.get("temp_email"),
-                db_session.get("temp_phone"),
-                db_session.get("eligibility_status"),
-            ])
-            looks_new = False
-            if created_at and updated_at:
-                try:
-                    looks_new = abs((updated_at - created_at).total_seconds()) < 1
-                except Exception:
-                    looks_new = False
-            is_restored = has_context or not looks_new
-            if db_state == "ONBOARDING":
-                sess_state = db_sub_state or "WELCOME"
-                agent_name = "onboarding"
-            elif db_state == "SELECTION":
-                sess_state = db_sub_state or "SEL_START"
-                agent_name = "selection"
-            elif db_state == "FULFILLMENT":
-                sess_state = db_sub_state or "FULFILL_INTRO"
-                agent_name = "fulfillment"
-            else:
-                sess_state = db_state
-                agent_name = "onboarding"
-            sess = {
-                "state": sess_state,
-                "agent": agent_name,
-                "sub_state": db_sub_state,
-                "profile": {
-                    "name": profile_name,
-                    "registration_data": None,
-                    "uuid": phone,
-                    "eligibility": {
-                        "q1_commitment": None,
-                        "q2_age": None,
-                        "q3_device": None,
-                        "passed": False,
-                        "rejection_reason": None
-                    },
-                    "subjects": [],
-                    "grades": "",
-                    "language": "",
-                    "parsing_method": "",
-                    "parsing_confidence": "",
-                    "slots": [],
-                    "chosen_slot": {},
-                    "meeting_url": "",
-                    "meeting_start": ""
-                },
-                "tool_state": db_session.get("tool_state") or {},
-                "ts": time.time(),
-                "_welcomed": False,
-                "_db_session_id": db_session.get("session_id"),
-            }
-            # Hydrate session fields from tool_state for better resume behavior
-            tool_state = sess.get("tool_state", {})
-            if isinstance(tool_state, dict):
-                profile = sess.get("profile", {})
-                reg = tool_state.get("registration")
-                if isinstance(reg, dict):
-                    if reg.get("name") and profile.get("name") == "Volunteer":
-                        profile["name"] = reg.get("name")
-                    if reg.get("email"):
-                        profile["email"] = reg.get("email")
-                    reg_phone = reg.get("wa_phone") or reg.get("phone")
-                    if reg_phone:
-                        profile["phone"] = reg_phone
-                    serve_block = reg.get("serve", {})
-                    if isinstance(serve_block, dict) and serve_block.get("volunteer_id"):
-                        profile["volunteer_id"] = serve_block.get("volunteer_id")
-                    sess["profile"] = profile
-
-                eligibility = tool_state.get("eligibility")
-                if isinstance(eligibility, dict):
-                    profile.setdefault("eligibility", {})
-                    for key in ["q1_commitment", "q2_age", "q3_device", "passed", "rejection_reason"]:
-                        if key in eligibility:
-                            profile["eligibility"][key] = eligibility.get(key)
-                    sess["profile"] = profile
-                    if eligibility.get("prompted_at"):
-                        sess["_eligibility_prompted"] = True
-
-                preferences = tool_state.get("preferences")
-                if isinstance(preferences, dict):
-                    profile.setdefault("preferences", {})
-                    if "days" in preferences:
-                        profile["preferences"]["days"] = preferences.get("days")
-                    if "time_band" in preferences:
-                        profile["preferences"]["time_band"] = preferences.get("time_band")
-                    if "language" in preferences:
-                        profile["preferences"]["language"] = preferences.get("language")
-                    sess["profile"] = profile
-                    if preferences.get("confirmed_at"):
-                        sess["_prefs_confirmed"] = True
-
-                welcome_state = tool_state.get("welcome")
-                if isinstance(welcome_state, dict):
-                    if welcome_state.get("template_sent_at"):
-                        sess["_template_sent"] = True
-                    if welcome_state.get("sent_at"):
-                        sess["_greet_sent"] = True
-
-                selection_state = tool_state.get("selection")
-                if isinstance(selection_state, dict):
-                    sess.setdefault("tool_state", {}).setdefault("selection", {})
-                    knowing = selection_state.get("knowing_volunteer", {})
-                    if isinstance(knowing, dict):
-                        if isinstance(knowing.get("profile"), dict):
-                            sess["tool_state"]["selection"]["profile"] = knowing.get("profile")
-                        discussed_fields = knowing.get("discussed_fields")
-                        if discussed_fields:
-                            sess["tool_state"]["selection"]["discussed_fields"] = set(discussed_fields)
-                        questions_asked = knowing.get("questions_asked")
-                        if isinstance(questions_asked, int):
-                            sess["tool_state"]["selection"]["question_index"] = questions_asked
-                    if isinstance(selection_state.get("discussed_fields"), list):
-                        sess["tool_state"]["selection"]["discussed_fields"] = set(selection_state.get("discussed_fields"))
-
-            log.info(f"[PERSISTENCE] Restored session from DB for {phone} (state: {db_state}, sub_state: {db_sub_state})")
-            if is_restored:
-                try:
-                    from storage.db import get_db_session
-                    from storage.event_logger import log_event
-                    with get_db_session() as db:
-                        log_event(
-                            db=db,
-                            wa_phone=phone,
-                            agent_name=settings.AGENT_NAME,
-                            event_type="SESSION_RESTORED",
-                            event_source="onboarding_agent",
-                            state=db_state,
-                            sub_state=db_sub_state,
-                            status="restored",
-                            details={"agent": agent_name},
-                            session_id=db_session.get("session_id")
-                        )
-                except Exception as e:
-                    log.warning(f"[PERSISTENCE] Failed to log SESSION_RESTORED for {phone}: {e}", exc_info=True)
-            else:
-                try:
-                    from storage.db import get_db_session
-                    from storage.event_logger import log_event
-                    with get_db_session() as db:
-                        log_event(
-                            db=db,
-                            wa_phone=phone,
-                            agent_name=settings.AGENT_NAME,
-                            event_type="SESSION_STARTED",
-                            event_source="onboarding_agent",
-                            state="WELCOME",
-                            session_id=db_session.get("session_id")
-                        )
-                except Exception as e:
-                    log.warning(f"[PERSISTENCE] Failed to log SESSION_STARTED for {phone}: {e}", exc_info=True)
-        else:
-            # Initialize a complete default profile to avoid KeyError later
-            sess = {
-                "state": "WELCOME",
-                "profile": {
-                    "name": "Volunteer",
-                    "registration_data": None,
-                    "uuid": phone,
-                    "eligibility": {
-                        "q1_commitment": None,
-                        "q2_age": None,
-                        "q3_device": None,
-                        "passed": False,
-                        "rejection_reason": None
-                    },
-                    "subjects": [],
-                    "grades": "",
-                    "language": "",
-                    "parsing_method": "",
-                    "parsing_confidence": "",
-                    "slots": [],
-                    "chosen_slot": {},
-                    "meeting_url": "",
-                    "meeting_start": ""
-                },
-                "ts": time.time(),
-                "_welcomed": False
-            }
-        SESSIONS[phone] = sess
-        
-        # Persistence: Create/upsert session in DB (checkpoint 1) if we didn't restore
-        if not db_session:
-            try:
-                from storage.db import get_db_session
-                from storage.session_store import get_or_create_session
-                from storage.event_logger import log_event
-                from .config import settings
-                
-                with get_db_session() as db:
-                    db_session = get_or_create_session(
-                        db, wa_phone=phone, agent_name=settings.AGENT_NAME
-                    )
-                    sess["_db_session_id"] = db_session["session_id"]
-                    # Log SESSION_STARTED event
-                    log_event(
-                        db=db,
-                        wa_phone=phone,
-                        agent_name=settings.AGENT_NAME,
-                        event_type="SESSION_STARTED",
-                        event_source="onboarding_agent",
-                        state="WELCOME",
-                        session_id=db_session["session_id"]
-                    )
-                    log.info(f"[PERSISTENCE] Created/updated session for {phone}")
-            except Exception as e:
-                log.warning(f"[PERSISTENCE] Failed to create session for {phone}: {e}", exc_info=True)
-                # Continue without DB - don't block flow
-    
+def _ensure_db_session_id(phone: str, sess: dict) -> None:
     # Ensure DB session exists even if in-memory session already existed
     if sess and not sess.get("_db_session_id"):
         try:
@@ -2531,10 +2285,272 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
                     db, wa_phone=phone, agent_name=settings.AGENT_NAME
                 )
                 sess["_db_session_id"] = db_session["session_id"]
-                log.info(f"[PERSISTENCE] Ensured DB session exists for {phone} (session_id: {db_session['session_id']})")
+                log.info(
+                    f"[PERSISTENCE] Ensured DB session exists for {phone} "
+                    f"(session_id: {db_session['session_id']})"
+                )
         except Exception as e:
             log.warning(f"[PERSISTENCE] Failed to ensure DB session for {phone}: {e}", exc_info=True)
             # Continue without DB - don't block flow
+
+
+def _rehydrate_or_create_session(phone: str) -> dict:
+    phone = normalize_phone(phone)
+    sess = SESSIONS.get(phone)
+    if sess:
+        _ensure_db_session_id(phone, sess)
+        return sess
+
+    log.warning(f"[HANDLE] No session for {phone}, creating new one")
+    db_session = None
+    try:
+        from storage.db import get_db_session
+        from storage.session_store import get_or_create_session
+        with get_db_session() as db:
+            db_session = get_or_create_session(
+                db, wa_phone=phone, agent_name=settings.AGENT_NAME
+            )
+    except Exception as e:
+        log.warning(f"[PERSISTENCE] Failed to read DB session for {phone}: {e}", exc_info=True)
+    
+    if db_session:
+        db_state = db_session.get("state") or "WELCOME"
+        db_sub_state = db_session.get("sub_state")
+        profile_name = db_session.get("temp_name") or "Volunteer"
+        created_at = db_session.get("created_at")
+        updated_at = db_session.get("updated_at")
+        has_context = any([
+            db_session.get("tool_state"),
+            db_state not in ["WELCOME", None],
+            db_sub_state,
+            db_session.get("last_outbound_msg_id"),
+            db_session.get("temp_name"),
+            db_session.get("temp_email"),
+            db_session.get("temp_phone"),
+            db_session.get("eligibility_status"),
+        ])
+        looks_new = False
+        if created_at and updated_at:
+            try:
+                looks_new = abs((updated_at - created_at).total_seconds()) < 1
+            except Exception:
+                looks_new = False
+        is_restored = has_context or not looks_new
+        if db_state == "ONBOARDING":
+            sess_state = db_sub_state or "WELCOME"
+            agent_name = "onboarding"
+        elif db_state == "SELECTION":
+            sess_state = db_sub_state or "SEL_START"
+            agent_name = "selection"
+        elif db_state == "FULFILLMENT":
+            sess_state = db_sub_state or "FULFILL_INTRO"
+            agent_name = "fulfillment"
+        else:
+            sess_state = db_state
+            agent_name = "onboarding"
+        sess = {
+            "state": sess_state,
+            "agent": agent_name,
+            "sub_state": db_sub_state,
+            "profile": {
+                "name": profile_name,
+                "registration_data": None,
+                "uuid": phone,
+                "eligibility": {
+                    "q1_commitment": None,
+                    "q2_age": None,
+                    "q3_device": None,
+                    "passed": False,
+                    "rejection_reason": None
+                },
+                "subjects": [],
+                "grades": "",
+                "language": "",
+                "parsing_method": "",
+                "parsing_confidence": "",
+                "slots": [],
+                "chosen_slot": {},
+                "meeting_url": "",
+                "meeting_start": ""
+            },
+            "tool_state": db_session.get("tool_state") or {},
+            "ts": time.time(),
+            "_welcomed": False,
+            "_db_session_id": db_session.get("session_id"),
+        }
+        # Hydrate session fields from tool_state for better resume behavior
+        tool_state = sess.get("tool_state", {})
+        if isinstance(tool_state, dict):
+            profile = sess.get("profile", {})
+            reg = tool_state.get("registration")
+            if isinstance(reg, dict):
+                if reg.get("name") and profile.get("name") == "Volunteer":
+                    profile["name"] = reg.get("name")
+                if reg.get("email"):
+                    profile["email"] = reg.get("email")
+                reg_phone = reg.get("wa_phone") or reg.get("phone")
+                if reg_phone:
+                    profile["phone"] = reg_phone
+                serve_block = reg.get("serve", {})
+                if isinstance(serve_block, dict) and serve_block.get("volunteer_id"):
+                    profile["volunteer_id"] = serve_block.get("volunteer_id")
+                sess["profile"] = profile
+
+            eligibility = tool_state.get("eligibility")
+            if isinstance(eligibility, dict):
+                profile.setdefault("eligibility", {})
+                for key in ["q1_commitment", "q2_age", "q3_device", "passed", "rejection_reason"]:
+                    if key in eligibility:
+                        profile["eligibility"][key] = eligibility.get(key)
+                sess["profile"] = profile
+                if eligibility.get("prompted_at"):
+                    sess["_eligibility_prompted"] = True
+
+            preferences = tool_state.get("preferences")
+            if isinstance(preferences, dict):
+                profile.setdefault("preferences", {})
+                if "days" in preferences:
+                    profile["preferences"]["days"] = preferences.get("days")
+                if "time_band" in preferences:
+                    profile["preferences"]["time_band"] = preferences.get("time_band")
+                if "language" in preferences:
+                    profile["preferences"]["language"] = preferences.get("language")
+                sess["profile"] = profile
+                if preferences.get("confirmed_at"):
+                    sess["_prefs_confirmed"] = True
+
+            welcome_state = tool_state.get("welcome")
+            if isinstance(welcome_state, dict):
+                if welcome_state.get("template_sent_at"):
+                    sess["_template_sent"] = True
+                if welcome_state.get("sent_at"):
+                    sess["_greet_sent"] = True
+
+            selection_state = tool_state.get("selection")
+            if isinstance(selection_state, dict):
+                sess.setdefault("tool_state", {}).setdefault("selection", {})
+                knowing = selection_state.get("knowing_volunteer", {})
+                if isinstance(knowing, dict):
+                    if isinstance(knowing.get("profile"), dict):
+                        sess["tool_state"]["selection"]["profile"] = knowing.get("profile")
+                    discussed_fields = knowing.get("discussed_fields")
+                    if discussed_fields:
+                        sess["tool_state"]["selection"]["discussed_fields"] = set(discussed_fields)
+                    questions_asked = knowing.get("questions_asked")
+                    if isinstance(questions_asked, int):
+                        sess["tool_state"]["selection"]["question_index"] = questions_asked
+                if isinstance(selection_state.get("discussed_fields"), list):
+                    sess["tool_state"]["selection"]["discussed_fields"] = set(selection_state.get("discussed_fields"))
+
+        log.info(f"[PERSISTENCE] Restored session from DB for {phone} (state: {db_state}, sub_state: {db_sub_state})")
+        if is_restored:
+            try:
+                from storage.db import get_db_session
+                from storage.event_logger import log_event
+                with get_db_session() as db:
+                    log_event(
+                        db=db,
+                        wa_phone=phone,
+                        agent_name=settings.AGENT_NAME,
+                        event_type="SESSION_RESTORED",
+                        event_source="onboarding_agent",
+                        state=db_state,
+                        sub_state=db_sub_state,
+                        status="restored",
+                        details={"agent": agent_name},
+                        session_id=db_session.get("session_id")
+                    )
+            except Exception as e:
+                log.warning(f"[PERSISTENCE] Failed to log SESSION_RESTORED for {phone}: {e}", exc_info=True)
+        else:
+            try:
+                from storage.db import get_db_session
+                from storage.event_logger import log_event
+                with get_db_session() as db:
+                    log_event(
+                        db=db,
+                        wa_phone=phone,
+                        agent_name=settings.AGENT_NAME,
+                        event_type="SESSION_STARTED",
+                        event_source="onboarding_agent",
+                        state="WELCOME",
+                        session_id=db_session.get("session_id")
+                    )
+            except Exception as e:
+                log.warning(f"[PERSISTENCE] Failed to log SESSION_STARTED for {phone}: {e}", exc_info=True)
+    else:
+        # Initialize a complete default profile to avoid KeyError later
+        sess = {
+            "state": "WELCOME",
+            "profile": {
+                "name": "Volunteer",
+                "registration_data": None,
+                "uuid": phone,
+                "eligibility": {
+                    "q1_commitment": None,
+                    "q2_age": None,
+                    "q3_device": None,
+                    "passed": False,
+                    "rejection_reason": None
+                },
+                "subjects": [],
+                "grades": "",
+                "language": "",
+                "parsing_method": "",
+                "parsing_confidence": "",
+                "slots": [],
+                "chosen_slot": {},
+                "meeting_url": "",
+                "meeting_start": ""
+            },
+            "ts": time.time(),
+            "_welcomed": False
+        }
+    SESSIONS[phone] = sess
+    
+    # Persistence: Create/upsert session in DB (checkpoint 1) if we didn't restore
+    if not db_session:
+        try:
+            from storage.db import get_db_session
+            from storage.session_store import get_or_create_session
+            from storage.event_logger import log_event
+            from .config import settings
+            
+            with get_db_session() as db:
+                db_session = get_or_create_session(
+                    db, wa_phone=phone, agent_name=settings.AGENT_NAME
+                )
+                sess["_db_session_id"] = db_session["session_id"]
+                # Log SESSION_STARTED event
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="SESSION_STARTED",
+                    event_source="onboarding_agent",
+                    state="WELCOME",
+                    session_id=db_session["session_id"]
+                )
+                log.info(f"[PERSISTENCE] Created/updated session for {phone}")
+        except Exception as e:
+            log.warning(f"[PERSISTENCE] Failed to create session for {phone}: {e}", exc_info=True)
+            # Continue without DB - don't block flow
+
+    _ensure_db_session_id(phone, sess)
+    return sess
+
+
+# ---------- State Machine ----------
+async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
+    """
+    Main state machine handler
+    
+    Args:
+        phone: Phone number
+        text: User's message
+    """
+    phone = normalize_phone(phone)
+    sess = _rehydrate_or_create_session(phone)
     
     state = sess["state"]
     profile = sess.get("profile", {})
