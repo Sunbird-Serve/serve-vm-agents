@@ -41,13 +41,14 @@ FULFILL_DEFERRED_MSG = """No worries — take your time.
 Whenever you're ready, just reply here and we’ll continue from where you left off."""
 
 
-def format_need_list(needs: list[NeedCard], max_items: int = 5) -> str:
+def format_need_list(needs: list[NeedCard], max_items: int = 5, start_index: int = 1) -> str:
     """
     Format a list of needs as a numbered WhatsApp message.
     
     Args:
         needs: List of NeedCard objects
         max_items: Maximum number of items to show (default: 5)
+        start_index: Starting number for list items (default: 1)
     
     Returns:
         Formatted string with numbered list
@@ -60,7 +61,7 @@ def format_need_list(needs: list[NeedCard], max_items: int = 5) -> str:
     
     lines = [FULFILL_LIST_HEADER, ""]
     
-    for idx, need in enumerate(display_needs, start=1):
+    for idx, need in enumerate(display_needs, start=start_index):
         # Line 1: Title (bold/italics using asterisks)
         lines.append(f"{idx}) *{need.title}*")
         

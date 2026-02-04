@@ -142,7 +142,7 @@ VIDEO_DONE_PROMPT = "Thanks for watching 🙂"
 
 VIDEO_ERROR_MSG = """I'm having trouble playing the video right now, but we can still continue."""
 
-PEEK_VIDEO_PROMPT = "By the way, would you like to watch a short live class glimpse? You can say yes, skip, or maybe."
+PEEK_VIDEO_PROMPT = "By the way, would you like to see a short glimpse of how a SERVE class usually looks ? You can say yes, skip, or maybe."
 
 PEEK_NEEDS_PROMPT = "Would you like a quick look at the volunteering needs we have right now? You can say yes, skip, or maybe."
 PEEK_REQUIREMENTS_NOTE = "This is just a preview — we’ll later look at what works for you."

@@ -510,7 +510,7 @@ async def handle_fulfill_list(phone: str, text: str, session: dict):
         log.info(f"[FULFILLMENT] Fetching and displaying needs list for {phone}")
         
         # Fetch needs via MCP tool (volunteer_id not supported by API)
-        needs = await fetch_open_needs(limit=5)
+        needs = await fetch_open_needs(limit=20)
 
         if not needs:
             # No needs available - notify and move to QA window
@@ -529,8 +529,17 @@ async def handle_fulfill_list(phone: str, text: str, session: dict):
             await onboarding_handle(phone, "__kick__")
             return
         
-        # Format list
-        list_message = format_need_list(needs, max_items=5)
+        # Pagination setup
+        page_size = 10
+        page_index = 0
+        total_needs = len(needs)
+        start_idx = (page_index * page_size) + 1
+        end_idx = min(start_idx + page_size - 1, total_needs)
+        
+        # Format list (first page)
+        list_message = format_need_list(needs[:page_size], max_items=page_size, start_index=start_idx)
+        if total_needs > page_size:
+            list_message += "\n\nType 'More' to see more opportunities or 'All' to see all."
         
         # Send list
         mcp_wa_send = _get_mcp_wa_send()
@@ -540,10 +549,13 @@ async def handle_fulfill_list(phone: str, text: str, session: dict):
         # Store needs in session for validation
         session["fulfillment"] = session.get("fulfillment", {})
         session["fulfillment"]["needs"] = [need.to_dict() for need in needs]
+        session["fulfillment"]["page"] = page_index
+        session["fulfillment"]["page_size"] = page_size
+        session["fulfillment"]["total_needs"] = total_needs
         
         # Create choice mapping: {"1": need_id1, "2": need_id2, ...}
         choice_map: Dict[str, str] = {}
-        for idx, need in enumerate(needs[:5], start=1):
+        for idx, need in enumerate(needs, start=1):
             choice_map[str(idx)] = need.need_id
         session["fulfillment"]["choice_map"] = choice_map
         
@@ -564,6 +576,8 @@ async def handle_fulfill_list(phone: str, text: str, session: dict):
                         "need_list_cached_at": now_iso,
                         "needs": needs_payload,
                         "need_map": choice_map,
+                        "page_size": page_size,
+                        "total_needs": total_needs,
                     }
                 }
                 
@@ -613,6 +627,50 @@ async def handle_fulfill_wait_pick(phone: str, text: str, session: dict):
     text_lower = text_stripped.lower()
     
     mcp_wa_send = _get_mcp_wa_send()
+
+    # Pagination controls
+    if any(k in text_lower for k in ["more", "show more", "next"]):
+        fulfillment = session.get("fulfillment", {})
+        needs_data = fulfillment.get("needs", [])
+        page_size = fulfillment.get("page_size", 10)
+        page_index = fulfillment.get("page", 0)
+        total_needs = len(needs_data)
+        if not needs_data:
+            await mcp_wa_send(phone, "I couldn't find more opportunities right now.")
+            return
+        max_page = (total_needs - 1) // page_size if total_needs else 0
+        if page_index >= max_page:
+            await mcp_wa_send(phone, "That’s all the available opportunities for now. Reply with a number to pick one.")
+            return
+        page_index += 1
+        start_idx = (page_index * page_size) + 1
+        end_idx = min(start_idx + page_size - 1, total_needs)
+        # Rebuild NeedCard objects for formatting
+        needs_page = [NeedCard(**n) for n in needs_data[start_idx - 1:end_idx] if isinstance(n, dict)]
+        list_message = format_need_list(needs_page, max_items=page_size, start_index=start_idx)
+        if end_idx < total_needs:
+            list_message += "\n\nType 'More' to see more opportunities or 'All' to see all."
+        await mcp_wa_send(phone, list_message)
+        session["fulfillment"]["page"] = page_index
+        session["ts"] = time.time()
+        from agents.onboarding.wa_loop import SESSIONS
+        SESSIONS[phone] = session
+        return
+    if any(k in text_lower for k in ["all", "show all"]):
+        fulfillment = session.get("fulfillment", {})
+        needs_data = fulfillment.get("needs", [])
+        total_needs = len(needs_data)
+        if not needs_data:
+            await mcp_wa_send(phone, "I couldn't find more opportunities right now.")
+            return
+        needs_all = [NeedCard(**n) for n in needs_data if isinstance(n, dict)]
+        list_message = format_need_list(needs_all, max_items=total_needs, start_index=1)
+        await mcp_wa_send(phone, list_message)
+        session["fulfillment"]["page"] = 0
+        session["ts"] = time.time()
+        from agents.onboarding.wa_loop import SESSIONS
+        SESSIONS[phone] = session
+        return
     
     # Helper: detect defer
     defer_keywords = ["not now", "later", "maybe", "think", "decide later"]
