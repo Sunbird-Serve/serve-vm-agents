@@ -82,11 +82,18 @@ async def handle_feedback(phone: str, text: str, sess: Dict[str, Any], profile: 
     except Exception as e:
         log.warning(f"[FEEDBACK] Failed to persist feedback: {e}", exc_info=True)
 
-    # Send closing message and transition to COMPLETE
+    # Send closing message and transition
     name = profile.get("name") or "there"
     closing = format_message(QA_FEEDBACK_CLOSING, name=name)
     await mcp_wa_send(phone, closing)
     _add_to_history(phone, bot_msg=closing)
+
+    if sess.get("_feedback_onhold"):
+        sess["state"] = "CLOSE"
+        sess["ended"] = True
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+        return
 
     sess["state"] = "COMPLETE"
     sess["ts"] = time.time()

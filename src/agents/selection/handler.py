@@ -968,13 +968,22 @@ Thank you for your interest in SERVE! 💛"""
     except Exception as e:
         log.warning(f"[SELECTION] Failed to persist stop: {e}", exc_info=True)
     
-    # Mark session as ended
-    session["state"] = "CLOSE"
-    session["ended"] = True
-    session["ts"] = time.time()
-    
-    from agents.onboarding.wa_loop import SESSIONS
-    SESSIONS[phone] = session
+    # After on-hold, collect feedback (do not route to fulfillment)
+    try:
+        from agents.onboarding.wa_loop import SESSIONS, _handle as onboarding_handle
+        session["agent"] = "onboarding"
+        session["state"] = "FEEDBACK"
+        session["_feedback_onhold"] = True
+        session["ts"] = time.time()
+        SESSIONS[phone] = session
+        await onboarding_handle(phone, "__kick__")
+    except Exception as e:
+        log.warning(f"[SELECTION] Failed to transition to FEEDBACK after on-hold: {e}", exc_info=True)
+        session["state"] = "CLOSE"
+        session["ended"] = True
+        session["ts"] = time.time()
+        from agents.onboarding.wa_loop import SESSIONS
+        SESSIONS[phone] = session
 
 
 async def handle_selection_recommended(phone: str, session: dict):
