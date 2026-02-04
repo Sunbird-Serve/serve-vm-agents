@@ -13,8 +13,10 @@ log = logging.getLogger(__name__)
 
 def _normalize_feedback(text: str) -> str | None:
     text_lower = (text or "").lower().strip()
-    if "great" in text_lower or "good" in text_lower:
+    if "helpful" in text_lower or "great" in text_lower or "good" in text_lower:
         return "great"
+    if "not helpful" in text_lower:
+        return "needs_improvement"
     if "okay" in text_lower or "ok" in text_lower:
         return "okay"
     if "improve" in text_lower or "needs" in text_lower:
