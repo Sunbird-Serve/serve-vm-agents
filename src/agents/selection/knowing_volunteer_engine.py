@@ -919,6 +919,9 @@ async def run_knowing_volunteer_step(
             log.warning(f"[KNOWING_VOLUNTEER] Extractor failed: {e}")
 
     merged_extracted = _merge_extractions(rule_extracted, llm_extracted)
+    # Guard: when last_target is teaching_experience, do not let readiness update
+    if last_target == "teaching_experience" and "teaching_readiness" in merged_extracted:
+        merged_extracted.pop("teaching_readiness", None)
     for rubric, payload in merged_extracted.items():
         value = payload.get("value", "unknown")
         confidence = float(payload.get("confidence", 0.0) or 0.0)
