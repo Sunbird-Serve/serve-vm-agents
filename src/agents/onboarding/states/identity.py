@@ -219,7 +219,7 @@ def validate_name(text: str) -> bool:
     non_name_phrases = [
         "i don't know", "i dont know", "idk", "don't know", "dont know",
         "not sure", "unsure", "skip", "later", "no", "none", "nothing",
-        "n/a", "na", "not applicable", "prefer not", "rather not",
+        "n/a", "not applicable", "prefer not", "rather not",
         # Common button labels / control phrases
         "yes, this works", "yes this works", "tell me more", "something won't work",
         "something wont work", "skip for now", "yes, continue", "yes continue",
@@ -229,6 +229,10 @@ def validate_name(text: str) -> bool:
     for phrase in non_name_phrases:
         if phrase in text_lower:
             return False
+    
+    # Reject standalone short acknowledgements without matching inside names
+    if re.search(r"\b(yes|yeah|yep|ya|na)\b", text_lower):
+        return False
     
     # Check for digits (names shouldn't contain digits)
     if re.search(r'\d', text):
@@ -1037,6 +1041,45 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
                     sess["ts"] = time.time()
                     SESSIONS[phone] = sess
                     return
+                
+                # Explicit refusal to share name -> exit
+                refusal_patterns = [
+                    r"\b(don'?t want|dont want|not sharing|won'?t share|wont share|prefer not|rather not|no thanks)\b",
+                    r"\b(not comfortable|privacy|don'?t want to share|dont want to share)\b",
+                    r"\b(can'?t share|cannot share|cant share|unable to share)\b",
+                ]
+                is_refusal = any(re.search(pattern, text_lower) for pattern in refusal_patterns)
+                if is_refusal and "name" in text_lower:
+                    log.info(f"[IDENTITY] User refused to share name, sending exit")
+                    name = profile.get("name", "there")
+                    await mcp_wa_send(phone, IDENTITY_BOUNDARY)
+                    _add_to_history(phone, bot_msg=IDENTITY_BOUNDARY)
+                    await asyncio.sleep(1)
+                    exit_msg = format_message(IDENTITY_EXIT, name=name)
+                    await mcp_wa_send(phone, exit_msg)
+                    _add_to_history(phone, bot_msg=exit_msg)
+                    
+                    sess["state"] = "REJECTED"
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+                    
+                    # Persistence: Mark as refused
+                    try:
+                        from storage.db import get_db_session
+                        from storage.session_store import update_session_state_and_tool_state
+                        
+                        with get_db_session() as db:
+                            update_session_state_and_tool_state(
+                                db=db,
+                                wa_phone=phone,
+                                state="REJECTED",
+                                sub_state=None,
+                                ended=True,
+                                end_reason="refused_name"
+                            )
+                    except Exception as e:
+                        log.warning(f"[IDENTITY] Failed to persist rejection: {e}")
+                    return
             
             # Step 3: Handle based on intent
             if intent == "NAME_OK" and extracted_name:
@@ -1094,35 +1137,31 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
                         SESSIONS[phone] = sess
                         return
                     else:
-                        # Second invalid attempt - exit gracefully
-                        log.info(f"[IDENTITY] Name still invalid after 2 attempts, exiting gracefully")
-                        name = profile.get("name", "there")
-                        
-                        # Send exit message with community link
-                        exit_msg = format_message(IDENTITY_EXIT, name=name)
-                        await mcp_wa_send(phone, exit_msg)
-                        _add_to_history(phone, bot_msg=exit_msg)
-                        
-                        sess["state"] = "REJECTED"
+                        # Second invalid attempt - use placeholder and continue
+                        log.info(f"[IDENTITY] Name still invalid after 2 attempts, using placeholder")
+                        extracted_name = "Friend"
+                        profile["name"] = extracted_name
+                        sess["profile"] = profile
+                        sess["_identity_name_collected"] = True
+                        sess["_identity_name_asked"] = False
+                        sess["_identity_name_retry_count"] = 0
                         sess["ts"] = time.time()
                         SESSIONS[phone] = sess
                         
-                        # Persistence: Mark as refused
-                        try:
-                            from storage.db import get_db_session
-                            from storage.session_store import update_session_state_and_tool_state
-                            
-                            with get_db_session() as db:
-                                update_session_state_and_tool_state(
-                                    db=db,
-                                    wa_phone=phone,
-                                    state="REJECTED",
-                                    sub_state=None,
-                                    ended=True,
-                                    end_reason="refused_contacts"
-                                )
-                        except Exception as e:
-                            log.warning(f"[IDENTITY] Failed to persist rejection: {e}")
+                        # Ask for email only (phone is already available from WhatsApp)
+                        display_phone = phone
+                        if not display_phone.startswith("+"):
+                            if len(display_phone) == 10:
+                                display_phone = f"+91{display_phone}"
+                            else:
+                                display_phone = f"+{display_phone}"
+                        
+                        contact_msg = format_message(IDENTITY_CONTACT_PROMPT, name=extracted_name, phone=display_phone)
+                        await mcp_wa_send(phone, contact_msg)
+                        _add_to_history(phone, bot_msg=contact_msg)
+                        sess["_identity_contact_asked"] = True
+                        sess["ts"] = time.time()
+                        SESSIONS[phone] = sess
                         return
                 else:
                     # NAME_UNCLEAR but not obviously invalid - retry once
@@ -1135,10 +1174,28 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
                         SESSIONS[phone] = sess
                         return
                     else:
-                        # Already retried once - ask again briefly
-                        log.info(f"[IDENTITY] Name still unclear after retry, asking once more")
-                        await mcp_wa_send(phone, IDENTITY_NAME_RETRY)
-                        _add_to_history(phone, bot_msg=IDENTITY_NAME_RETRY)
+                        # Already retried once - use placeholder and continue
+                        log.info(f"[IDENTITY] Name still unclear after retry, using placeholder")
+                        extracted_name = "Friend"
+                        profile["name"] = extracted_name
+                        sess["profile"] = profile
+                        sess["_identity_name_collected"] = True
+                        sess["_identity_name_asked"] = False
+                        sess["_identity_name_retry_count"] = 0
+                        sess["ts"] = time.time()
+                        SESSIONS[phone] = sess
+                        
+                        display_phone = phone
+                        if not display_phone.startswith("+"):
+                            if len(display_phone) == 10:
+                                display_phone = f"+91{display_phone}"
+                            else:
+                                display_phone = f"+{display_phone}"
+                        
+                        contact_msg = format_message(IDENTITY_CONTACT_PROMPT, name=extracted_name, phone=display_phone)
+                        await mcp_wa_send(phone, contact_msg)
+                        _add_to_history(phone, bot_msg=contact_msg)
+                        sess["_identity_contact_asked"] = True
                         sess["ts"] = time.time()
                         SESSIONS[phone] = sess
                         return
