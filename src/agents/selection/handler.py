@@ -968,12 +968,15 @@ Thank you for your interest in SERVE! 💛"""
     except Exception as e:
         log.warning(f"[SELECTION] Failed to persist stop: {e}", exc_info=True)
     
-    # After on-hold, collect feedback (do not route to fulfillment)
+    # After on-hold, route to onboarding QA window then feedback (do not route to fulfillment)
     try:
         from agents.onboarding.wa_loop import SESSIONS, _handle as onboarding_handle
         session["agent"] = "onboarding"
-        session["state"] = "FEEDBACK"
-        session["_feedback_onhold"] = True
+        session["state"] = "QA_WINDOW"
+        session.setdefault("_qa_count", 0)
+        session.setdefault("_qa_topics", [])
+        session.setdefault("_qa_summary_sent", False)
+        session["_onhold_flow"] = True
         session["ts"] = time.time()
         SESSIONS[phone] = session
         await onboarding_handle(phone, "__kick__")
@@ -1056,10 +1059,9 @@ async def handle_selection_not_recommended(phone: str, session: dict):
     profile = session.get("profile", {})
     name = profile.get("name") or "there"
     
-    # Coordinator follow-up message (no transition to Fulfillment)
+    # Coordinator follow-up message
     hold_msg = (
-        f"Thank you, {name} 💛 A SERVE Coordinator will get in touch with you to guide the next step. "
-        "If you have questions meanwhile, you can message here anytime."
+        f"Thank you, {name} 💛 A SERVE Coordinator will get in touch with you to guide the next step."
     )
     
     mcp_wa_send = _get_mcp_wa_send()
@@ -1097,10 +1099,38 @@ async def handle_selection_not_recommended(phone: str, session: dict):
     except Exception as e:
         log.warning(f"[SELECTION] Failed to persist not recommended: {e}", exc_info=True)
     
-    # Mark session as ended
-    session["state"] = "CLOSE"
-    session["ended"] = True
-    session["ts"] = time.time()
+    # Persist transition to onboarding QA flow for on-hold users
+    try:
+        from storage.db import get_db_session
+        from storage.session_store import update_session_state_and_tool_state
+        
+        with get_db_session() as db:
+            update_session_state_and_tool_state(
+                db=db,
+                wa_phone=phone,
+                state="ONBOARDING",
+                sub_state="QA_WINDOW",
+                tool_state_updates={"onhold": {"at": datetime.now(timezone.utc).isoformat()}}
+            )
+    except Exception as e:
+        log.warning(f"[SELECTION] Failed to persist onhold QA transition: {e}", exc_info=True)
     
-    from agents.onboarding.wa_loop import SESSIONS
-    SESSIONS[phone] = session
+    # Route to onboarding QA immediately, then feedback
+    try:
+        from agents.onboarding.wa_loop import SESSIONS, _handle as onboarding_handle
+        session["agent"] = "onboarding"
+        session["state"] = "QA_WINDOW"
+        session.setdefault("_qa_count", 0)
+        session.setdefault("_qa_topics", [])
+        session.setdefault("_qa_summary_sent", False)
+        session["_onhold_flow"] = True
+        session["ts"] = time.time()
+        SESSIONS[phone] = session
+        await onboarding_handle(phone, "__kick__")
+    except Exception as e:
+        log.warning(f"[SELECTION] Failed to transition to QA after on-hold: {e}", exc_info=True)
+        session["state"] = "CLOSE"
+        session["ended"] = True
+        session["ts"] = time.time()
+        from agents.onboarding.wa_loop import SESSIONS
+        SESSIONS[phone] = session

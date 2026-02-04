@@ -88,7 +88,7 @@ async def handle_feedback(phone: str, text: str, sess: Dict[str, Any], profile: 
     await mcp_wa_send(phone, closing)
     _add_to_history(phone, bot_msg=closing)
 
-    if sess.get("_feedback_onhold"):
+    if sess.get("_feedback_onhold") or sess.get("_onhold_flow"):
         sess["state"] = "CLOSE"
         sess["ended"] = True
         sess["ts"] = time.time()
