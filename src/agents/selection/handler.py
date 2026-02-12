@@ -535,8 +535,9 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
             "decision": KnowingVolunteerResult.CONTINUE.value
         }
     
-    decision = result.get("decision")
-    assistant_text = result.get("assistant_text", "")
+    kv_result = result
+    decision = kv_result.get("decision")
+    assistant_text = kv_result.get("assistant_text", "")
     
     # Add user message to history
     try:
@@ -549,6 +550,7 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
     if decision == KnowingVolunteerResult.CONTINUE.value:
         # Continue: send assistant text and remain in loop
         question_msg_id = None
+        sent_text = None
         if assistant_text:
             mcp_wa_send = _get_mcp_wa_send()
             profile = session.get("profile", {})
@@ -563,6 +565,7 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
                     safe_text = "Could you share that in English? I can only reply in English here."
             question_msg_id = await mcp_wa_send(phone, safe_text)
             session["_last_agent_prompt"] = safe_text
+            sent_text = safe_text
             
             # Add to history
             try:
@@ -583,10 +586,10 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
                 stmt = select(serve_agent_sessions.c.tool_state).where(
                     serve_agent_sessions.c.wa_phone == phone
                 )
-                result = db.execute(stmt).first()
+                db_result = db.execute(stmt).first()
                 existing_selection = {}
-                if result and result[0] and isinstance(result[0], dict):
-                    existing_selection = result[0].get("selection", {})
+                if db_result and db_result[0] and isinstance(db_result[0], dict):
+                    existing_selection = db_result[0].get("selection", {})
                 
                 # Get updated profile and question index
                 selection_state = session.get("tool_state", {}).get("selection", {})
@@ -610,6 +613,42 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
                     "last_planner": last_planner,
                     "last_extractor": last_extractor,
                 })
+
+                now_iso = datetime.now(timezone.utc).isoformat()
+                conversation_entry = {
+                    "at": now_iso,
+                    "user": text,
+                    "assistant": sent_text,
+                    "assistant_suggested": assistant_text,
+                    "last_agent_prompt": last_agent_prompt,
+                    "decision": decision,
+                    "intent": kv_result.get("intent"),
+                    "confidence": kv_result.get("confidence"),
+                }
+                conversation = selection_update["knowing_volunteer"].get("conversation", [])
+                conversation.append(conversation_entry)
+                selection_update["knowing_volunteer"]["conversation"] = conversation[-20:]
+
+                log_event = _get_log_event()
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="SELECTION_KNOWING_VOLUNTEER_TURN",
+                    event_source="selection_agent",
+                    state="SELECTION",
+                    sub_state=SelectionState.KNOWING_VOLUNTEER_LOOP,
+                    status="SUCCESS",
+                    details={
+                        "question_index": question_index,
+                        "user": text,
+                        "assistant": sent_text,
+                        "assistant_suggested": assistant_text,
+                        "decision": decision,
+                        "intent": kv_result.get("intent"),
+                        "confidence": kv_result.get("confidence"),
+                    }
+                )
                 
                 update_session_state_and_tool_state(
                     db=db,
@@ -635,10 +674,12 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
         # Only send assistant_text if it doesn't contain a question (to avoid orphaned questions)
         # The "thanks" will be included in the recommended message instead
         final_msg_id = None
+        sent_text = None
         if assistant_text and "?" not in assistant_text:
             mcp_wa_send = _get_mcp_wa_send()
             final_msg_id = await mcp_wa_send(phone, assistant_text)
             session["_last_agent_prompt"] = assistant_text
+            sent_text = assistant_text
             
             # Add to history
             try:
@@ -664,10 +705,10 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
                 stmt = select(serve_agent_sessions.c.tool_state).where(
                     serve_agent_sessions.c.wa_phone == phone
                 )
-                result = db.execute(stmt).first()
+                db_result = db.execute(stmt).first()
                 existing_selection = {}
-                if result and result[0] and isinstance(result[0], dict):
-                    existing_selection = result[0].get("selection", {})
+                if db_result and db_result[0] and isinstance(db_result[0], dict):
+                    existing_selection = db_result[0].get("selection", {})
                 
                 selection_state = session.get("tool_state", {}).get("selection", {})
                 current_profile = selection_state.get("profile", {})
@@ -691,6 +732,40 @@ async def handle_selection_knowing_volunteer_loop(phone: str, text: str, session
                     "last_planner": last_planner,
                     "last_extractor": last_extractor,
                 })
+
+                conversation_entry = {
+                    "at": now_iso,
+                    "user": text,
+                    "assistant": sent_text,
+                    "assistant_suggested": assistant_text,
+                    "last_agent_prompt": last_agent_prompt,
+                    "decision": decision,
+                    "intent": kv_result.get("intent"),
+                    "confidence": kv_result.get("confidence"),
+                }
+                conversation = selection_update["knowing_volunteer"].get("conversation", [])
+                conversation.append(conversation_entry)
+                selection_update["knowing_volunteer"]["conversation"] = conversation[-20:]
+
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="SELECTION_KNOWING_VOLUNTEER_TURN",
+                    event_source="selection_agent",
+                    state="SELECTION",
+                    sub_state=SelectionState.KNOWING_VOLUNTEER_LOOP,
+                    status="SUCCESS",
+                    details={
+                        "question_index": question_index,
+                        "user": text,
+                        "assistant": sent_text,
+                        "assistant_suggested": assistant_text,
+                        "decision": decision,
+                        "intent": kv_result.get("intent"),
+                        "confidence": kv_result.get("confidence"),
+                    }
+                )
                 
                 update_session_state_and_tool_state(
                     db=db,

@@ -270,7 +270,7 @@ Thank you for your interest, and wishing you a lovely day 🌼"""
 # ---------- Section 4: Identity Collection ----------
 IDENTITY_NAME_PROMPT = """Lovely!  
 
-BTW! What is your name? 🙂"""
+BTW! What name should I call you? Please reply with just your first name (e.g., Asha). 🙂"""
 
 IDENTITY_CONTACT_PROMPT = """Thanks {name}!  
 
@@ -282,6 +282,7 @@ IDENTITY_CONTACT_RETRY = """Could you share your email?"""
 
 IDENTITY_CONFIRM_CONTACT = """Got it! 
 
+Name: **{name}**  
 Phone: **{phone}**  
 Email: **{email}**  
 
@@ -294,6 +295,8 @@ IDENTITY_FAQ_PHONE_REQUIRED = "Your phone number helps us reach you for session 
 IDENTITY_FAQ_PROMO_EMAIL = "We won’t send promotional emails. We use your email only for volunteering updates."
 
 IDENTITY_NAME_RECHECK = """Just checking — what name should I use to address you?"""
+
+IDENTITY_NAME_CONFIRM = """Got it. Just to confirm — what name should I call you?"""
 
 IDENTITY_REGISTRATION_START = """Perfect, thanks! I'm just creating your SERVE profile — this may take a few seconds. You don't need to type anything, I'll let you know once it's done ✅"""
 

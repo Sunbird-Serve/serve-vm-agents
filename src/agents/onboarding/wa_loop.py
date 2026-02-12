@@ -2579,6 +2579,31 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
     if text != "__kick__":  # Don't add internal triggers
         _add_to_history(phone, user_msg=text)
 
+    # Store mid-flow questions asked by users
+    if text != "__kick__" and looks_like_question(text):
+        try:
+            from storage import db as storage_db
+            from storage.event_logger import log_event as _log_event
+            with storage_db.get_db_session() as db:
+                session_id = sess.get("_db_session_id")
+                _log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="USER_QUESTION",
+                    event_source="user",
+                    state=state,
+                    sub_state=sess.get("sub_state"),
+                    status="RECEIVED",
+                    details={
+                        "text": text,
+                        "last_agent_prompt": sess.get("_last_agent_prompt")
+                    },
+                    session_id=session_id
+                )
+        except Exception as e:
+            log.warning(f"[QUESTION] Failed to log question: {e}", exc_info=True)
+
     # Helper: detect reschedule intent
     text_lower_global = text.lower().strip()
     def _wants_reschedule() -> bool:
@@ -2776,7 +2801,6 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
 
             # Step 1: Send template message first (required by Meta for first outbound)
             template_sent = sess.get("_template_sent", False)
-            from .config import settings
             if not template_sent:
                 try:
                     template_name = settings.WHATSAPP_WELCOME_TEMPLATE_NAME
@@ -2791,9 +2815,7 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
                     # Persistence: record template sent
                     try:
                         from datetime import datetime, timezone
-                        from storage.db import get_db_session
                         from storage.session_store import update_session_state_and_tool_state
-                        from storage.event_logger import log_event
                         
                         now_iso = datetime.now(timezone.utc).isoformat()
                         with get_db_session() as db:
@@ -2846,10 +2868,7 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
             # Persistence: record welcome text messages in sessions + events
             try:
                 from datetime import datetime, timezone
-                from storage.db import get_db_session
                 from storage.session_store import update_session_state_and_tool_state
-                from storage.event_logger import log_event
-                from .config import settings
 
                 now_iso = datetime.now(timezone.utc).isoformat()
                 last_msg_id = instructions_msg_id or intro_msg_id
@@ -3350,10 +3369,7 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
             if not sess.get("_complete_message_sent"):
                 # Persistence: Finalize onboarding (checkpoint 3)
                 try:
-                    from storage.db import get_db_session
                     from storage.session_store import finalize_onboarding
-                    from storage.event_logger import log_event
-                    from .config import settings
                     
                     # Determine eligibility status
                     # Default to ELIGIBLE if passed is True or not set (assume passed if reached COMPLETE)

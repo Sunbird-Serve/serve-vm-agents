@@ -17,7 +17,7 @@ from ..messages import (
     IDENTITY_REGISTRATION_CREATED, IDENTITY_REGISTRATION_FAILED,
     IDENTITY_REGISTRATION_WAIT_REASSURANCE,
     IDENTITY_FAQ_EMAIL_STORAGE, IDENTITY_FAQ_EMAIL_REQUIRED, IDENTITY_FAQ_PHONE_REQUIRED,
-    IDENTITY_FAQ_PROMO_EMAIL
+    IDENTITY_FAQ_PROMO_EMAIL, IDENTITY_NAME_CONFIRM
 )
 from ..validators import is_yes_response, is_no_response
 from ..config import settings
@@ -203,6 +203,40 @@ def extract_email(text: str) -> Optional[str]:
     return None
 
 
+def is_non_name_response(text: str) -> bool:
+    """
+    Rule-based filter for common acknowledgements/control phrases
+    that users mistakenly send instead of their name.
+    """
+    text_lower = re.sub(r"\s+", " ", text.lower()).strip()
+    normalized = re.sub(r"[^\w\s']", "", text_lower)
+
+    # Explicit phrases seen in pilot + common variants
+    non_name_phrases = [
+        "continue", "continue now", "please continue", "go ahead", "proceed",
+        "yes", "ok", "okay", "sure", "alright", "fine", "good", "great",
+        "nice", "awesome", "perfect", "cool",
+        "thank you", "thanks", "thank you so much", "thanks a lot",
+        "ohh nice", "oh nice", "ohh", "oh",
+        "clear", "its clear", "it's clear", "got it", "understood",
+        "ok clear", "okay clear", "thanks its clear", "thanks it's clear",
+        "its fine", "it's fine", "fine its clear", "fine it's clear",
+        "skip for now", "later works better", "i'll do this later", "ill do this later"
+    ]
+
+    for phrase in non_name_phrases:
+        if text_lower == phrase or normalized == phrase:
+            return True
+
+    # Acknowledgement + honorifics (e.g., "continue mam", "thanks sir")
+    if re.match(r"^(continue|proceed|go ahead)\s+(mam|maam|madam|sir)$", text_lower):
+        return True
+    if re.match(r"^(thank you|thanks)\s+(mam|maam|madam|sir|so much)$", text_lower):
+        return True
+
+    return False
+
+
 def validate_name(text: str) -> bool:
     """
     Validate name input - check for common non-name phrases and invalid patterns.
@@ -214,6 +248,9 @@ def validate_name(text: str) -> bool:
         True if valid name, False if invalid (non-name phrase, digits, @, too short/long)
     """
     text_lower = text.lower().strip()
+
+    if is_non_name_response(text):
+        return False
     
     # Check for common non-name phrases
     non_name_phrases = [
@@ -463,6 +500,9 @@ def validate_name_strict(text: str) -> bool:
         True if valid name, False if invalid
     """
     text_lower = text.lower().strip()
+
+    if is_non_name_response(text):
+        return False
     
     # Check for common non-name phrases
     non_name_phrases = [
@@ -1030,6 +1070,17 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
             
             # If still not a valid name, handle questions about the name request
             if intent != "NAME_OK":
+                if is_non_name_response(text):
+                    retry_count = sess.get("_identity_name_retry_count", 0)
+                    if retry_count < 1:
+                        log.info(f"[IDENTITY] Suspected non-name reply, asking to confirm name")
+                        sess["_identity_name_retry_count"] = retry_count + 1
+                        await mcp_wa_send(phone, IDENTITY_NAME_CONFIRM)
+                        _add_to_history(phone, bot_msg=IDENTITY_NAME_CONFIRM)
+                        sess["ts"] = time.time()
+                        SESSIONS[phone] = sess
+                        return
+
                 text_lower = text.lower().strip()
                 if "?" in text_lower or re.search(r"\b(what|why|how|can|do|does)\b", text_lower):
                     if "name" in text_lower and ("required" in text_lower or "need" in text_lower):
@@ -1380,10 +1431,11 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
                     sess.pop("_identity_waiting_confirmation", None)
                     sess.pop("_identity_pending_email", None)
                     sess["_identity_name_collected"] = False
-                    sess["_identity_name_asked"] = False
+                    sess["_identity_name_asked"] = True
+                    sess["_identity_name_retry_count"] = 0
                     sess["_identity_edit_mode"] = False
-                    await mcp_wa_send(phone, IDENTITY_NAME_PROMPT)
-                    _add_to_history(phone, bot_msg=IDENTITY_NAME_PROMPT)
+                    await mcp_wa_send(phone, IDENTITY_NAME_RECHECK)
+                    _add_to_history(phone, bot_msg=IDENTITY_NAME_RECHECK)
                     sess["ts"] = time.time()
                     SESSIONS[phone] = sess
                     return
@@ -1413,7 +1465,12 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
                         display_phone = f"+91{display_phone}"
                     else:
                         display_phone = f"+{display_phone}"
-                confirm_msg = format_message(IDENTITY_CONFIRM_CONTACT, phone=display_phone, email=stored_email)
+                confirm_msg = format_message(
+                    IDENTITY_CONFIRM_CONTACT,
+                    name=profile.get("name", "there"),
+                    phone=display_phone,
+                    email=stored_email
+                )
                 await mcp_wa_send(phone, confirm_msg)
                 _add_to_history(phone, bot_msg=confirm_msg)
                 sess["ts"] = time.time()
@@ -1438,6 +1495,42 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             return
+
+        # If user explicitly wants to change name while we are asking for email
+        if re.search(r"\b(name|change name|edit name)\b", text_lower) and not extract_email(text):
+            log.info(f"[IDENTITY] User wants to edit name during email step")
+            sess["_identity_name_collected"] = False
+            sess["_identity_name_asked"] = True
+            sess["_identity_name_retry_count"] = 0
+            sess["_identity_edit_mode"] = True
+            await mcp_wa_send(phone, IDENTITY_NAME_RECHECK)
+            _add_to_history(phone, bot_msg=IDENTITY_NAME_RECHECK)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+
+        # If user sends a name when we're asking for email, treat it as a name update
+        if text and not is_non_name_response(text):
+            name_candidate, is_valid_name = extract_name(text)
+            if is_valid_name and name_candidate:
+                log.info(f"[IDENTITY] Detected name update during email step: {name_candidate}")
+                profile["name"] = name_candidate
+                sess["profile"] = profile
+
+                display_phone = phone
+                if not display_phone.startswith("+"):
+                    if len(display_phone) == 10:
+                        display_phone = f"+91{display_phone}"
+                    else:
+                        display_phone = f"+{display_phone}"
+
+                contact_msg = format_message(IDENTITY_CONTACT_PROMPT, name=name_candidate, phone=display_phone)
+                await mcp_wa_send(phone, contact_msg)
+                _add_to_history(phone, bot_msg=contact_msg)
+                sess["_identity_contact_asked"] = True
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
 
         # Step 1: Extract email only (ignore phone in user response)
         extracted_email = extract_email(text)
@@ -1576,7 +1669,12 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
                 else:
                     display_phone = f"+{display_phone}"
             
-            confirm_msg = format_message(IDENTITY_CONFIRM_CONTACT, phone=display_phone, email=extracted_email)
+            confirm_msg = format_message(
+                IDENTITY_CONFIRM_CONTACT,
+                name=profile.get("name", "there"),
+                phone=display_phone,
+                email=extracted_email
+            )
             await mcp_wa_send(phone, confirm_msg)
             _add_to_history(phone, bot_msg=confirm_msg)
             
