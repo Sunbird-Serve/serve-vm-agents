@@ -28,7 +28,7 @@ from .messages import (
     WELCOME, WELCOME_MAYBE_LATER,
     WELCOME_INTRO, WELCOME_INSTRUCTIONS, WELCOME_START_BUTTONS, WELCOME_VIDEO_INTRO, WELCOME_VIDEO_FOOTER,
     GENERIC_DEFERRED_MSG, WELCOME_SERVE_OVERVIEW, WELCOME_CONSENT_ACK, WELCOME_CONSENT_REMINDER,
-    WELCOME_FAQ_FOLLOWUP, WELCOME_VIDEO_CONTINUE,
+    WELCOME_FAQ_FOLLOWUP, WELCOME_VIDEO_CONTINUE, WELCOME_FAQ_PROMPT, WELCOME_FAQ_BUTTONS, WELCOME_FAQ_PAID,
     WELCOME_STATEMENT_ACK,
     INTENT_PROMPT, INTENT_EXIT,
     ELIGIBILITY_PROMPT, ELIGIBILITY_EXIT,
@@ -2949,6 +2949,12 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
             
             # Handle welcome start button text robustly (strip punctuation/emojis)
             normalized_text = re.sub(r"[^a-z0-9]+", " ", text_lower_global).strip()
+            if normalized_text in {"i have questions", "have questions", "i have a question", "questions"}:
+                await mcp_wa_send(phone, WELCOME_FAQ_PROMPT, buttons=WELCOME_FAQ_BUTTONS)
+                _add_to_history(phone, bot_msg=WELCOME_FAQ_PROMPT)
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
             if normalized_text in {"lets start", "let s start", "start"}:
                 log.info(f"[GREET] Start detected, transitioning to WELCOME_VIDEO")
                 sess["state"] = "WELCOME_VIDEO"
@@ -2956,6 +2962,24 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
                 await _handle(phone, "__kick__")
+                return
+
+            # Handle FAQ button selections from welcome
+            faq_answer = None
+            if "paid" in normalized_text:
+                faq_answer = WELCOME_FAQ_PAID
+            elif "certificate" in normalized_text:
+                faq_answer = QA_FAQ_CERTIFICATE
+            elif "serve" in normalized_text or "know" in normalized_text or "about" in normalized_text:
+                faq_answer = QA_FAQ_ABOUT_SERVE
+
+            if faq_answer:
+                await mcp_wa_send(phone, faq_answer)
+                _add_to_history(phone, bot_msg=faq_answer)
+                await mcp_wa_send(phone, WELCOME_FAQ_FOLLOWUP, buttons=WELCOME_START_BUTTONS)
+                _add_to_history(phone, bot_msg=WELCOME_FAQ_FOLLOWUP)
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
                 return
 
             # Welcome FAQ handling: answer common questions and keep in WELCOME
@@ -3416,12 +3440,7 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
                 
                 # Get volunteer name from profile
                 name = profile.get("name") or "there"
-                # Combine "Let's continue" message with Selection intro
-                combined_msg = (
-                    f"Here's a quick note from our team, {name} - we're in the last stretch now 🙂"
-                )
-                await mcp_wa_send(phone, combined_msg)
-                _add_to_history(phone, bot_msg=combined_msg)
+                # Skip selection intro message (temporarily disabled)
                 sess["_complete_message_sent"] = True
                 # Mark that selection intro was already sent
                 sess["_selection_intro_sent"] = True

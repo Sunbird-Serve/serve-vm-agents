@@ -10,7 +10,7 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Tuple
 from ..messages import (
-    IDENTITY_NAME_PROMPT, IDENTITY_CONTACT_PROMPT,
+    IDENTITY_PROGRESS, IDENTITY_NAME_PROMPT, IDENTITY_CONTACT_PROMPT,
     IDENTITY_NUDGE, IDENTITY_BOUNDARY, IDENTITY_EXIT, format_message,
     IDENTITY_CONFIRM_CONTACT, IDENTITY_EMAIL_CORRECTION, IDENTITY_CONTACT_RETRY,
     IDENTITY_NAME_RECHECK, IDENTITY_REGISTRATION_START, IDENTITY_REGISTRATION_EXISTING,
@@ -1035,8 +1035,12 @@ async def handle_identity(phone: str, text: str, sess: Dict[str, Any], profile: 
     # Step A: Ask for name if not collected
     if not sess.get("_identity_name_collected"):
         if text == "__kick__" or not sess.get("_identity_name_asked"):
-            # First time: ask for name
+            # First time: send progress, then ask for name
             log.info(f"[IDENTITY] Asking for name from {phone}")
+            if not sess.get("_identity_progress_sent"):
+                await mcp_wa_send(phone, IDENTITY_PROGRESS)
+                _add_to_history(phone, bot_msg=IDENTITY_PROGRESS)
+                sess["_identity_progress_sent"] = True
             await mcp_wa_send(phone, IDENTITY_NAME_PROMPT)
             _add_to_history(phone, bot_msg=IDENTITY_NAME_PROMPT)
             sess["_identity_name_asked"] = True

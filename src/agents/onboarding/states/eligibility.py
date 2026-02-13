@@ -10,6 +10,10 @@ from typing import Dict, Any, Optional, Tuple
 from ..messages import (
     ELIGIBILITY_PROMPT, ELIGIBILITY_EXIT,
     ELIGIBILITY_BUTTONS,
+    ELIGIBILITY_PART1_PROMPT, ELIGIBILITY_PART2_PROMPT, ELIGIBILITY_YN_BUTTONS,
+    ELIGIBILITY_PROGRESS,
+    ELIGIBILITY_PART1_ISSUE_SELECTION_MSG, ELIGIBILITY_PART1_ISSUE_SELECTION_BUTTONS,
+    ELIGIBILITY_PART2_ISSUE_SELECTION_MSG, ELIGIBILITY_PART2_ISSUE_SELECTION_BUTTONS,
     ELIGIBILITY_TELL_ME_MORE_MSG,
     ELIGIBILITY_ISSUE_SELECTION_MSG, ELIGIBILITY_ISSUE_SELECTION_BUTTONS,
     ELIGIBILITY_ISSUE_AGE_PROMPT, ELIGIBILITY_ISSUE_AGE_BUTTONS,
@@ -432,13 +436,15 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
     
-    # ========== SINGLE ELIGIBILITY PROMPT WITH BUTTONS ==========
-    # Initial prompt - single compact message with interactive buttons
+    # ========== SPLIT ELIGIBILITY PROMPTS (PART 1 + PART 2) ==========
+    # Initial prompt - part 1 (age + unpaid)
     if text == "__kick__" or not sess.get("_eligibility_prompted"):
-        log.info(f"[ELIGIBILITY] Sending single eligibility prompt with buttons to {phone}")
-        message_id = await mcp_wa_send(phone, ELIGIBILITY_PROMPT, buttons=ELIGIBILITY_BUTTONS)
-        _add_to_history(phone, bot_msg=ELIGIBILITY_PROMPT)
-        
+        log.info(f"[ELIGIBILITY] Sending eligibility part 1 prompt to {phone}")
+        await mcp_wa_send(phone, ELIGIBILITY_PROGRESS)
+        _add_to_history(phone, bot_msg=ELIGIBILITY_PROGRESS)
+        message_id = await mcp_wa_send(phone, ELIGIBILITY_PART1_PROMPT, buttons=ELIGIBILITY_YN_BUTTONS)
+        _add_to_history(phone, bot_msg=ELIGIBILITY_PART1_PROMPT)
+
         # Persistence: Update state and log event
         try:
             from datetime import datetime, timezone
@@ -446,7 +452,7 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
             from storage.session_store import update_session_state_and_tool_state
             from storage.event_logger import log_event
             from ..config import settings
-            
+
             now_iso = datetime.now(timezone.utc).isoformat()
             with get_db_session() as db:
                 session_id = sess.get("_db_session_id")
@@ -458,8 +464,8 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
                     last_outbound_msg_id=message_id,
                     tool_state_updates={
                         "eligibility": {
-                            "prompted_at": now_iso,
-                            "mode": "ALIGN"
+                            "part1_prompted_at": now_iso,
+                            "mode": "SPLIT"
                         }
                     }
                 )
@@ -467,19 +473,21 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
                     db=db,
                     wa_phone=phone,
                     agent_name=settings.AGENT_NAME,
-                    event_type="ELIGIBILITY_PROMPT_SENT",
+                    event_type="ELIGIBILITY_PART1_PROMPT_SENT",
                     event_source="agent",
                     state="ONBOARDING",
                     sub_state="ELIGIBILITY",
                     status="SUCCESS",
-                    details={"buttons": ELIGIBILITY_BUTTONS},
+                    details={"buttons": ELIGIBILITY_YN_BUTTONS},
                     session_id=session_id
                 )
         except Exception as e:
-            log.warning(f"[ELIGIBILITY] Failed to persist prompt: {e}", exc_info=True)
-        
+            log.warning(f"[ELIGIBILITY] Failed to persist part1 prompt: {e}", exc_info=True)
+
         sess["_eligibility_prompted"] = True
-        sess["_eligibility_mode"] = "ALIGN"  # Track current mode
+        sess["_eligibility_mode"] = "SPLIT_PART1"
+        sess["_eligibility_phase"] = "PART1"
+        sess["_eligibility_issue_scope"] = None
         sess["_eligibility_clarification_sent"] = False
         sess["_eligibility_missing_req"] = None
         sess["_eligibility_clarification_step"] = None
@@ -498,6 +506,13 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
     if sess.get("_eligibility_faq_more_prompted"):
         if is_no_response(text) or re.search(r"\b(no|that's all|thats all|nope|done|continue)\b", text_lower):
             sess["_eligibility_faq_more_prompted"] = False
+            if eligibility_mode in {"SPLIT_PART1", "SPLIT_PART2"}:
+                next_prompt = ELIGIBILITY_PART1_PROMPT if eligibility_mode == "SPLIT_PART1" else ELIGIBILITY_PART2_PROMPT
+                await mcp_wa_send(phone, next_prompt, buttons=ELIGIBILITY_YN_BUTTONS)
+                _add_to_history(phone, bot_msg=next_prompt)
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
             sess["_eligibility_faq_confirm_pending"] = True
             await mcp_wa_send(phone, ELIGIBILITY_CONFIRM_SHORT, buttons=["Yes", "No"])
             _add_to_history(phone, bot_msg=ELIGIBILITY_CONFIRM_SHORT)
@@ -519,6 +534,14 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
 
     # Handle confirmation after FAQ follow-up
     if sess.get("_eligibility_faq_confirm_pending"):
+        if eligibility_mode in {"SPLIT_PART1", "SPLIT_PART2"}:
+            sess["_eligibility_faq_confirm_pending"] = False
+            next_prompt = ELIGIBILITY_PART1_PROMPT if eligibility_mode == "SPLIT_PART1" else ELIGIBILITY_PART2_PROMPT
+            await mcp_wa_send(phone, next_prompt, buttons=ELIGIBILITY_YN_BUTTONS)
+            _add_to_history(phone, bot_msg=next_prompt)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
         if is_yes_response(text):
             forced_button_click = "YES_WORKS"
             sess["_eligibility_faq_confirm_pending"] = False
@@ -534,6 +557,222 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
 
     if forced_button_click:
         button_click = forced_button_click
+
+    # ========== SPLIT FLOW HANDLING ==========
+    if eligibility_mode in {"SPLIT_PART1", "SPLIT_PART2", "SPLIT_ISSUE_PART1", "SPLIT_ISSUE_PART2"}:
+        # Handle FAQ inside split flow
+        if "?" in (text or "") or re.search(r"^(what|how|when|why|where|who|which|can|could|do|does|is|are)\b", (text or ""), re.I):
+            faq_answer = get_faq_answer(text)
+            if faq_answer:
+                await mcp_wa_send(phone, faq_answer)
+                _add_to_history(phone, bot_msg=faq_answer)
+            await mcp_wa_send(
+                phone,
+                ELIGIBILITY_PART1_PROMPT if eligibility_mode == "SPLIT_PART1" else ELIGIBILITY_PART2_PROMPT,
+                buttons=ELIGIBILITY_YN_BUTTONS
+            )
+            _add_to_history(phone, bot_msg=ELIGIBILITY_PART1_PROMPT if eligibility_mode == "SPLIT_PART1" else ELIGIBILITY_PART2_PROMPT)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+
+        if eligibility_mode == "SPLIT_PART1":
+            if is_yes_response(text):
+                # Persist part1 yes
+                try:
+                    from datetime import datetime, timezone
+                    from storage.db import get_db_session
+                    from storage.session_store import update_session_state_and_tool_state
+                    from storage.event_logger import log_event
+                    from ..config import settings
+                    from sqlalchemy import select
+                    from storage.tables import serve_agent_sessions
+
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    with get_db_session() as db:
+                        session_id = sess.get("_db_session_id")
+                        stmt = select(serve_agent_sessions.c.tool_state).where(
+                            serve_agent_sessions.c.wa_phone == phone
+                        )
+                        db_result = db.execute(stmt).first()
+                        existing_eligibility = {}
+                        if db_result and db_result[0] and isinstance(db_result[0], dict):
+                            existing_eligibility = db_result[0].get("eligibility", {})
+                        eligibility_update = existing_eligibility.copy()
+                        eligibility_update.update({
+                            "age_ok": True,
+                            "unpaid_ok": True,
+                            "part1_response": "yes",
+                            "part1_responded_at": now_iso
+                        })
+                        update_session_state_and_tool_state(
+                            db=db,
+                            wa_phone=phone,
+                            state="ONBOARDING",
+                            sub_state="ELIGIBILITY",
+                            tool_state_updates={"eligibility": eligibility_update}
+                        )
+                        log_event(
+                            db=db,
+                            wa_phone=phone,
+                            agent_name=settings.AGENT_NAME,
+                            event_type="ELIGIBILITY_PART1_RESPONSE",
+                            event_source="user",
+                            state="ONBOARDING",
+                            sub_state="ELIGIBILITY",
+                            status="SUCCESS",
+                            details={"response": "yes", "raw_text": text},
+                            session_id=session_id
+                        )
+                except Exception as e:
+                    log.warning(f"[ELIGIBILITY] Failed to persist part1 response: {e}", exc_info=True)
+
+                profile.setdefault("eligibility", {})["q2_age"] = True
+                sess["profile"] = profile
+                # Move to part2
+                await mcp_wa_send(phone, ELIGIBILITY_PART2_PROMPT, buttons=ELIGIBILITY_YN_BUTTONS)
+                _add_to_history(phone, bot_msg=ELIGIBILITY_PART2_PROMPT)
+                sess["_eligibility_mode"] = "SPLIT_PART2"
+                sess["_eligibility_phase"] = "PART2"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            if is_no_response(text):
+                await mcp_wa_send(phone, ELIGIBILITY_PART1_ISSUE_SELECTION_MSG, buttons=ELIGIBILITY_PART1_ISSUE_SELECTION_BUTTONS)
+                _add_to_history(phone, bot_msg=ELIGIBILITY_PART1_ISSUE_SELECTION_MSG)
+                sess["_eligibility_mode"] = "SPLIT_ISSUE_PART1"
+                sess["_eligibility_issue_scope"] = "PART1"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            await mcp_wa_send(phone, ELIGIBILITY_INVALID_RESPONSE, buttons=ELIGIBILITY_YN_BUTTONS)
+            _add_to_history(phone, bot_msg=ELIGIBILITY_INVALID_RESPONSE)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+
+        if eligibility_mode == "SPLIT_PART2":
+            if is_yes_response(text):
+                # Persist part2 yes and proceed
+                try:
+                    from datetime import datetime, timezone
+                    from storage.db import get_db_session
+                    from storage.session_store import update_session_state_and_tool_state
+                    from storage.event_logger import log_event
+                    from ..config import settings
+                    from sqlalchemy import select
+                    from storage.tables import serve_agent_sessions
+
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    with get_db_session() as db:
+                        session_id = sess.get("_db_session_id")
+                        stmt = select(serve_agent_sessions.c.tool_state).where(
+                            serve_agent_sessions.c.wa_phone == phone
+                        )
+                        db_result = db.execute(stmt).first()
+                        existing_eligibility = {}
+                        if db_result and db_result[0] and isinstance(db_result[0], dict):
+                            existing_eligibility = db_result[0].get("eligibility", {})
+                        eligibility_update = existing_eligibility.copy()
+                        eligibility_update.update({
+                            "device_ok": True,
+                            "commitment_ok": True,
+                            "part2_response": "yes",
+                            "part2_responded_at": now_iso,
+                            "passed": True
+                        })
+                        update_session_state_and_tool_state(
+                            db=db,
+                            wa_phone=phone,
+                            state="ONBOARDING",
+                            sub_state="IDENTITY",
+                            tool_state_updates={"eligibility": eligibility_update}
+                        )
+                        log_event(
+                            db=db,
+                            wa_phone=phone,
+                            agent_name=settings.AGENT_NAME,
+                            event_type="ELIGIBILITY_PART2_RESPONSE",
+                            event_source="user",
+                            state="ONBOARDING",
+                            sub_state="ELIGIBILITY",
+                            status="SUCCESS",
+                            details={"response": "yes", "raw_text": text},
+                            session_id=session_id
+                        )
+                except Exception as e:
+                    log.warning(f"[ELIGIBILITY] Failed to persist part2 response: {e}", exc_info=True)
+
+                profile.setdefault("eligibility", {})["q1_commitment"] = True
+                profile.setdefault("eligibility", {})["q3_device"] = True
+                profile.setdefault("eligibility", {})["passed"] = True
+                sess["profile"] = profile
+                sess["state"] = "IDENTITY"
+                sess["_eligibility_mode"] = None
+                sess["_eligibility_issue_scope"] = None
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                await _handle(phone, "__kick__")
+                return
+            if is_no_response(text):
+                await mcp_wa_send(phone, ELIGIBILITY_PART2_ISSUE_SELECTION_MSG, buttons=ELIGIBILITY_PART2_ISSUE_SELECTION_BUTTONS)
+                _add_to_history(phone, bot_msg=ELIGIBILITY_PART2_ISSUE_SELECTION_MSG)
+                sess["_eligibility_mode"] = "SPLIT_ISSUE_PART2"
+                sess["_eligibility_issue_scope"] = "PART2"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            await mcp_wa_send(phone, ELIGIBILITY_INVALID_RESPONSE, buttons=ELIGIBILITY_YN_BUTTONS)
+            _add_to_history(phone, bot_msg=ELIGIBILITY_INVALID_RESPONSE)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+
+        if eligibility_mode == "SPLIT_ISSUE_PART1":
+            if button_click == "ISSUE_AGE" or text_lower in {"age", "18"}:
+                await mcp_wa_send(phone, ELIGIBILITY_ISSUE_AGE_PROMPT, buttons=ELIGIBILITY_ISSUE_AGE_BUTTONS)
+                _add_to_history(phone, bot_msg=ELIGIBILITY_ISSUE_AGE_PROMPT)
+                sess["_eligibility_mode"] = "ISSUE_AGE"
+                sess["_eligibility_issue_scope"] = "PART1"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            if button_click == "ISSUE_UNPAID" or "unpaid" in text_lower or "paid" in text_lower:
+                await mcp_wa_send(phone, ELIGIBILITY_ISSUE_UNPAID_PROMPT, buttons=ELIGIBILITY_ISSUE_UNPAID_BUTTONS)
+                _add_to_history(phone, bot_msg=ELIGIBILITY_ISSUE_UNPAID_PROMPT)
+                sess["_eligibility_mode"] = "ISSUE_UNPAID"
+                sess["_eligibility_issue_scope"] = "PART1"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            await mcp_wa_send(phone, ELIGIBILITY_PART1_ISSUE_SELECTION_MSG, buttons=ELIGIBILITY_PART1_ISSUE_SELECTION_BUTTONS)
+            _add_to_history(phone, bot_msg=ELIGIBILITY_PART1_ISSUE_SELECTION_MSG)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+
+        if eligibility_mode == "SPLIT_ISSUE_PART2":
+            if button_click == "ISSUE_DEVICE" or "device" in text_lower or "laptop" in text_lower or "tablet" in text_lower:
+                await mcp_wa_send(phone, ELIGIBILITY_ISSUE_DEVICE_PROMPT, buttons=ELIGIBILITY_ISSUE_DEVICE_BUTTONS)
+                _add_to_history(phone, bot_msg=ELIGIBILITY_ISSUE_DEVICE_PROMPT)
+                sess["_eligibility_mode"] = "ISSUE_DEVICE"
+                sess["_eligibility_issue_scope"] = "PART2"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            if button_click == "ISSUE_TIME" or "time" in text_lower or "hour" in text_lower:
+                await mcp_wa_send(phone, ELIGIBILITY_ISSUE_TIME_PROMPT, buttons=ELIGIBILITY_ISSUE_TIME_BUTTONS)
+                _add_to_history(phone, bot_msg=ELIGIBILITY_ISSUE_TIME_PROMPT)
+                sess["_eligibility_mode"] = "ISSUE_TIME"
+                sess["_eligibility_issue_scope"] = "PART2"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            await mcp_wa_send(phone, ELIGIBILITY_PART2_ISSUE_SELECTION_MSG, buttons=ELIGIBILITY_PART2_ISSUE_SELECTION_BUTTONS)
+            _add_to_history(phone, bot_msg=ELIGIBILITY_PART2_ISSUE_SELECTION_MSG)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
     
     if button_click:
         log.info(f"[ELIGIBILITY] Button clicked: {button_click}, mode: {eligibility_mode}")
@@ -677,7 +916,89 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
         
         # ========== ISSUE-SPECIFIC YES/NO BUTTONS ==========
         elif eligibility_mode in ["ISSUE_AGE", "ISSUE_DEVICE", "ISSUE_TIME", "ISSUE_UNPAID"]:
+            issue_scope = sess.get("_eligibility_issue_scope")
             if button_click == "YES":
+                if issue_scope in {"PART1", "PART2"}:
+                    # Resolve split issue and continue flow
+                    try:
+                        from datetime import datetime, timezone
+                        from storage.db import get_db_session
+                        from storage.session_store import update_session_state_and_tool_state
+                        from storage.event_logger import log_event
+                        from ..config import settings
+                        from sqlalchemy import select
+                        from storage.tables import serve_agent_sessions
+
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        with get_db_session() as db:
+                            session_id = sess.get("_db_session_id")
+                            stmt = select(serve_agent_sessions.c.tool_state).where(
+                                serve_agent_sessions.c.wa_phone == phone
+                            )
+                            db_result = db.execute(stmt).first()
+                            existing_eligibility = {}
+                            if db_result and db_result[0] and isinstance(db_result[0], dict):
+                                existing_eligibility = db_result[0].get("eligibility", {})
+                            eligibility_update = existing_eligibility.copy()
+                            if issue_scope == "PART1":
+                                eligibility_update.update({
+                                    "age_ok": True,
+                                    "unpaid_ok": True,
+                                    "part1_response": "yes",
+                                    "part1_responded_at": now_iso
+                                })
+                            else:
+                                eligibility_update.update({
+                                    "device_ok": True,
+                                    "commitment_ok": True,
+                                    "part2_response": "yes",
+                                    "part2_responded_at": now_iso,
+                                    "passed": True
+                                })
+                            update_session_state_and_tool_state(
+                                db=db,
+                                wa_phone=phone,
+                                state="ONBOARDING",
+                                sub_state="ELIGIBILITY" if issue_scope == "PART1" else "IDENTITY",
+                                tool_state_updates={"eligibility": eligibility_update}
+                            )
+                            log_event(
+                                db=db,
+                                wa_phone=phone,
+                                agent_name=settings.AGENT_NAME,
+                                event_type=f"ELIGIBILITY_{issue_scope}_ISSUE_RESOLVED",
+                                event_source="user",
+                                state="ONBOARDING",
+                                sub_state="ELIGIBILITY",
+                                status="SUCCESS",
+                                details={"issue": eligibility_mode, "response": "yes", "raw_text": text},
+                                session_id=session_id
+                            )
+                    except Exception as e:
+                        log.warning(f"[ELIGIBILITY] Failed to persist split issue resolution: {e}", exc_info=True)
+
+                    if issue_scope == "PART1":
+                        profile.setdefault("eligibility", {})["q2_age"] = True
+                        sess["profile"] = profile
+                        await mcp_wa_send(phone, ELIGIBILITY_PART2_PROMPT, buttons=ELIGIBILITY_YN_BUTTONS)
+                        _add_to_history(phone, bot_msg=ELIGIBILITY_PART2_PROMPT)
+                        sess["_eligibility_mode"] = "SPLIT_PART2"
+                        sess["_eligibility_issue_scope"] = None
+                        sess["ts"] = time.time()
+                        SESSIONS[phone] = sess
+                        return
+                    else:
+                        profile.setdefault("eligibility", {})["q1_commitment"] = True
+                        profile.setdefault("eligibility", {})["q3_device"] = True
+                        profile.setdefault("eligibility", {})["passed"] = True
+                        sess["profile"] = profile
+                        sess["state"] = "IDENTITY"
+                        sess["_eligibility_mode"] = None
+                        sess["_eligibility_issue_scope"] = None
+                        sess["ts"] = time.time()
+                        SESSIONS[phone] = sess
+                        await _handle(phone, "__kick__")
+                        return
                 # Issue resolved - re-show main prompt
                 log.info(f"[ELIGIBILITY] Issue {eligibility_mode} resolved, re-showing main prompt")
                 await mcp_wa_send(phone, ELIGIBILITY_PROMPT, buttons=ELIGIBILITY_BUTTONS)
@@ -937,7 +1258,31 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
     
     # If in issue-specific mode, handle yes/no typed responses
     if eligibility_mode in ["ISSUE_AGE", "ISSUE_DEVICE", "ISSUE_TIME", "ISSUE_UNPAID"]:
+        issue_scope = sess.get("_eligibility_issue_scope")
         if final_intent == "ELIGIBLE_YES":
+            if issue_scope in {"PART1", "PART2"}:
+                if issue_scope == "PART1":
+                    profile.setdefault("eligibility", {})["q2_age"] = True
+                    sess["profile"] = profile
+                    await mcp_wa_send(phone, ELIGIBILITY_PART2_PROMPT, buttons=ELIGIBILITY_YN_BUTTONS)
+                    _add_to_history(phone, bot_msg=ELIGIBILITY_PART2_PROMPT)
+                    sess["_eligibility_mode"] = "SPLIT_PART2"
+                    sess["_eligibility_issue_scope"] = None
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+                    return
+                else:
+                    profile.setdefault("eligibility", {})["q1_commitment"] = True
+                    profile.setdefault("eligibility", {})["q3_device"] = True
+                    profile.setdefault("eligibility", {})["passed"] = True
+                    sess["profile"] = profile
+                    sess["state"] = "IDENTITY"
+                    sess["_eligibility_mode"] = None
+                    sess["_eligibility_issue_scope"] = None
+                    sess["ts"] = time.time()
+                    SESSIONS[phone] = sess
+                    await _handle(phone, "__kick__")
+                    return
             # Issue resolved - re-show main prompt
             log.info(f"[ELIGIBILITY] Issue {eligibility_mode} resolved via typed response, re-showing main prompt")
             await mcp_wa_send(phone, ELIGIBILITY_PROMPT, buttons=ELIGIBILITY_BUTTONS)
@@ -1147,9 +1492,14 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
                     await mcp_wa_send(phone, ELIGIBILITY_TELL_ME_MORE_MSG)
                     _add_to_history(phone, bot_msg=ELIGIBILITY_TELL_ME_MORE_MSG)
             sess["_state_handled_question"] = True
-            await mcp_wa_send(phone, ELIGIBILITY_CONFIRM_SHORT, buttons=["Yes", "No"])
-            _add_to_history(phone, bot_msg=ELIGIBILITY_CONFIRM_SHORT)
-            sess["_eligibility_faq_confirm_pending"] = True
+            if eligibility_mode in {"SPLIT_PART1", "SPLIT_PART2"}:
+                next_prompt = ELIGIBILITY_PART1_PROMPT if eligibility_mode == "SPLIT_PART1" else ELIGIBILITY_PART2_PROMPT
+                await mcp_wa_send(phone, next_prompt, buttons=ELIGIBILITY_YN_BUTTONS)
+                _add_to_history(phone, bot_msg=next_prompt)
+            else:
+                await mcp_wa_send(phone, ELIGIBILITY_CONFIRM_SHORT, buttons=["Yes", "No"])
+                _add_to_history(phone, bot_msg=ELIGIBILITY_CONFIRM_SHORT)
+                sess["_eligibility_faq_confirm_pending"] = True
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             return

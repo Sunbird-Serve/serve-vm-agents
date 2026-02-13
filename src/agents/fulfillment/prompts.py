@@ -21,8 +21,12 @@ FULFILL_INVALID_PICK_MSG = "Please reply with a number like 1 or 2 😊 (or type
 FULFILL_CONFIRM_SUCCESS_MSG = """Done! 🎉
 
 I’ve nominated you for *{need_title}*.
-A SERVE coordinator will review this and get in touch with you soon with next steps.
-Thank you for stepping forward to make a difference 🌱"""
+A coordinator will review this and reach out soon.
+
+To track status, login at https://up.serve.net.in  
+Use your email. If needed, click “Forgot password” (or check spam for the reset link).
+
+Thank you for stepping forward 🌱"""
 
 # FULFILL_CONFIRM_FAILED message (nomination error)
 FULFILL_CONFIRM_FAILED_MSG = """Sorry — I hit a small issue while nominating you.
@@ -38,7 +42,10 @@ Thank you for taking the time to go through SERVE today 🌱"""
 
 # Generic pause message (resume later)
 FULFILL_DEFERRED_MSG = """No worries — take your time.
-Whenever you're ready, just reply here and we’ll continue from where you left off."""
+Whenever you're ready, just reply here and we’ll continue from where you left off.
+
+Alternatively, you can login at https://up.serve.net.in  
+Use your email. If needed, click “Forgot password” (or check spam for the reset link)."""
 
 
 def format_need_list(needs: list[NeedCard], max_items: int = 5, start_index: int = 1) -> str:

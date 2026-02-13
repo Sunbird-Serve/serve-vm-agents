@@ -39,22 +39,23 @@ WELCOME_MAYBE_LATER = """No worries! You can come back anytime using this same l
 
 Just send 'start' whenever you're ready."""
 
-WELCOME_INTRO = """Hi! I'm Siya - I represent eVidyaloka’s Volunteering Team.
+WELCOME_INTRO = """Hi! I’m Siya from the eVidyaloka Volunteer Team 👋
 
 You’re joining SERVE, our volunteer initiative for teaching students online and supporting children’s education in government schools.
-It’s my pleasure to welcome you on this journey 🌱"""
 
-WELCOME_INSTRUCTIONS = """I’m here to guide you through getting started as a volunteer —
-just three simple parts 🙂
+We currently work with 750+ schools across rural India, and we’re excited you’re here 🌱"""
 
-🌼 Say Hello - a warm welcome and a quick peek into real classrooms
-🌱 Find Your Rhythm - figuring out what works for your time and comfort
-🌿 Know You Better - a short, friendly chat about you
+WELCOME_INSTRUCTIONS = """I’ll guide you through getting started — just 4 simple steps 🙂
 
-About 10 minutes, at your pace.
-You can pause anytime."""
+1) Welcome & Preview - You're here
+2) Eligibility
+3) Identity & Preferences
+4) Final Check-in
 
-WELCOME_START_BUTTONS = ["Let's start", "I'll do this later"]
+Takes about 5–7 minutes, at your pace.
+You can pause anytime and continue later."""
+
+WELCOME_START_BUTTONS = ["Let's start", "I have questions", "I'll do it later"]
 
 WELCOME_VIDEO_INTRO = "Here’s a quick hello from our team 🙂"
 WELCOME_VIDEO_FOOTER = """That’s our world in a nutshell 🌱
@@ -63,6 +64,14 @@ WELCOME_VIDEO_CONTINUE = "Thanks for sharing — let’s continue."
 
 GENERIC_DEFERRED_MSG = """No worries — take your time.
 Whenever you're ready, just reply here and we'll continue from where you left off."""
+
+WELCOME_FAQ_PROMPT = """No problem 🙂 Here are a few common questions:
+If you have any other questions, you can ask too."""
+WELCOME_FAQ_BUTTONS = [
+    "Is it Paid?",
+    "About Certificate?",
+    "Know about us?",
+]
 
 WELCOME_SERVE_OVERVIEW = """Beautiful 🌼
 
@@ -78,6 +87,9 @@ WELCOME_CONSENT_REMINDER = """Quick reminder — shall we continue with the onbo
 
 WELCOME_FAQ_FOLLOWUP = """Let's get started — I'll explain things along the way."""
 WELCOME_STATEMENT_ACK = "Got it 🙂 I'm here to help."
+
+WELCOME_FAQ_PAID = "It’s a volunteer role with no payment."
+WELCOME_FAQ_OTHER = "If you have any other questions, you can ask here too 🙂"
 
 # ---------- FAQ Acknowledgement & Bridge ----------
 FAQ_ACK_CHOICES = [
@@ -181,7 +193,9 @@ ELIGIBILITY_COMMITMENT_PERSUASION = """That's completely okay — even small amo
 
 Many volunteers try one session on Saturday and another during the week."""
 
-ELIGIBILITY_PROMPT = """Just so you can decide if this feels right for you  
+ELIGIBILITY_PROMPT = """We’re here: ✅ Welcome & Preview → 🔵 Eligibility → ⚪ Identity & Preferences → ⚪ Final Check-in
+
+Just so you can decide if this feels right for you  
 
 Volunteering with SERVE usually means:
 
@@ -203,6 +217,31 @@ When you turn 18, message us here — we’d love to have you. 🌼"""
 
 # Button labels for ELIGIBILITY main prompt
 ELIGIBILITY_BUTTONS = ["Yes, this works", "Tell me more", "Something won't work"]
+
+ELIGIBILITY_PROGRESS = """Step 2/4 — You’re here → Eligibility
+✅ Welcome & Preview  →  🔵 Eligibility  →  ⚪ Identity & Preferences  →  ⚪ Final Check-in"""
+
+ELIGIBILITY_PART1_PROMPT = """Before we go ahead, just two quick checks:
+
+1) Are you 18 or above?
+2) Are you okay with this being a volunteer (unpaid) role?
+
+You can simply reply Yes or No 🙂"""
+
+ELIGIBILITY_PART2_PROMPT = """Two more quick checks:
+
+3) Do you have access to a laptop or tablet for classes?
+4) Are you comfortable with around 2 hours per week?
+
+Reply Yes or No 🙂"""
+
+ELIGIBILITY_YN_BUTTONS = ["Yes", "No"]
+
+ELIGIBILITY_PART1_ISSUE_SELECTION_MSG = "Which part doesn’t work right now — age or unpaid?"
+ELIGIBILITY_PART1_ISSUE_SELECTION_BUTTONS = ["Age", "Unpaid"]
+
+ELIGIBILITY_PART2_ISSUE_SELECTION_MSG = "Which part doesn’t work right now — device or time?"
+ELIGIBILITY_PART2_ISSUE_SELECTION_BUTTONS = ["Device", "Time"]
 
 # Follow-up after answering eligibility FAQ
 ELIGIBILITY_FAQ_MORE_PROMPT = "Do you have more questions, or can we continue?"
@@ -268,6 +307,9 @@ Thank you for your interest, and wishing you a lovely day 🌼"""
 
 
 # ---------- Section 4: Identity Collection ----------
+IDENTITY_PROGRESS = """Step 3/4 — You’re here → Identity & Preferences
+✅ Welcome & Preview  →  ✅ Eligibility  →  🔵 Identity & Preferences  →  ⚪ Final Check-in"""
+
 IDENTITY_NAME_PROMPT = """Lovely!  
 
 BTW! What name should I call you? Please reply with just your first name (e.g., Asha). 🙂"""

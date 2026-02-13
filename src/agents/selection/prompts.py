@@ -10,12 +10,14 @@ WELCOME_VIDEO_URL = os.getenv("WELCOME_VIDEO_URL", settings.WELCOME_VIDEO_URL)
 
 def get_sel_video_intro(name: str = "there") -> str:
     """Get video intro message with name"""
-    return f"Here's a quick note from our team, {name} - we're in the last stretch now 🙂"
+    return ""
 
 
 def get_sel_video_followup(name: str = "there") -> str:
     """Get video followup message"""
     return (
+        "Step 4/4 — You’re here → Final Check-in\n"
+        "✅ Welcome & Preview  →  ✅ Eligibility  →  ✅ Identity & Preferences  →  🔵 Final Check-in\n\n"
         f"We're moving into the final part, {name} 🌱\n"
         "Shall we finish this together? Just a few questions to help me understand you better."
     )

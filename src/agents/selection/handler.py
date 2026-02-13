@@ -195,21 +195,10 @@ async def handle_selection_start(phone: str, text: str, session: dict):
         now_iso = datetime.now(timezone.utc).isoformat()
         
         # Check if intro was already sent in COMPLETE state
-        if not session.get("_selection_intro_sent"):
-            # Send video intro (fallback if not sent from onboarding)
-            profile = session.get("profile", {})
-            name = profile.get("name") or "there"
-            mcp_wa_send = _get_mcp_wa_send()
-            video_intro = get_sel_video_intro(name)
-            await mcp_wa_send(phone, video_intro)
-        else:
-            log.info(f"[SELECTION] Intro already sent in COMPLETE state, skipping")
-            mcp_wa_send = _get_mcp_wa_send()
+        mcp_wa_send = _get_mcp_wa_send()
         
-        # Send thank-you video via MCP tool
-        mcp_wa_send_thankyou_video = _get_mcp_wa_send_thankyou_video()
-        video_msg_id = await mcp_wa_send_thankyou_video(phone)
-        await asyncio.sleep(2.0)
+        # Thank-you video skipped (temporarily disabled)
+        video_msg_id = None
 
         # Send followup with continue/later buttons
         profile = session.get("profile", {})
@@ -232,7 +221,8 @@ async def handle_selection_start(phone: str, text: str, session: dict):
                     "selection": {
                         "started_at": now_iso,
                         "video": {
-                            "sent_at": now_iso
+                            "sent": False,
+                            "sent_at": None
                         }
                     }
                 }
@@ -263,7 +253,7 @@ async def handle_selection_start(phone: str, text: str, session: dict):
                     db=db,
                     wa_phone=phone,
                     agent_name=settings.AGENT_NAME,
-                    event_type="SELECTION_VIDEO_SENT",
+                    event_type="SELECTION_VIDEO_SKIPPED",
                     event_source="selection_agent",
                     state="SELECTION",
                     sub_state=SelectionState.WAIT_VIDEO_DONE,
