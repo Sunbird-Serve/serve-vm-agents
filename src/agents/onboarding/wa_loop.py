@@ -2926,7 +2926,15 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
     # Handle inactivity follow-up responses
     if text != "__kick__" and sess.get("_inactivity_followup_stage"):
         stage = sess.get("_inactivity_followup_stage")
-        text_lower = text.lower().strip()
+        # Some WhatsApp button events can arrive with empty text; incorporate payload/title too.
+        payload = ""
+        title = ""
+        if evt:
+            data = evt.get("data") or {}
+            payload = str(data.get("payload") or data.get("button_id") or data.get("button_payload") or "")
+            title = str(data.get("title") or data.get("text") or data.get("button_text") or "")
+        choice_text = f"{text or ''} {payload} {title}".lower().strip()
+        text_lower = choice_text
         if stage == "FIRST":
             if "now" in text_lower:
                 sess["_inactivity_followup_sent"] = False
@@ -2953,13 +2961,20 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
         if stage == "SECOND":
             now = datetime.now(timezone.utc)
             when_iso = None
-            if "day" in text_lower and "3" not in text_lower:
+            if "weekend" in text_lower:
+                when_iso = _next_weekend_reminder_iso(now)
+            elif re.search(r"\b(3|three)\b", text_lower):
+                when_iso = (now + timedelta(days=3)).isoformat()
+            elif (
+                re.search(r"\b(a|one|1)\s*day\b", text_lower)
+                or "in_a_day" in text_lower
+                or ("day" in text_lower and "3" not in text_lower and "three" not in text_lower)
+            ):
                 # Schedule at 23h (not 24h) so WhatsApp template is typically not required.
                 when_iso = (now + timedelta(hours=23)).isoformat()
-            elif "3" in text_lower:
-                when_iso = (now + timedelta(days=3)).isoformat()
-            elif "weekend" in text_lower:
-                when_iso = _next_weekend_reminder_iso(now)
+            elif "hour" in text_lower or "hr" in text_lower:
+                # Keep text fallback support even though quick replies expose only day/3 days/weekend.
+                when_iso = (now + timedelta(hours=1)).isoformat()
             if when_iso:
                 try:
                     # Persist reminder locally (MCP reminder.create is a stub)
