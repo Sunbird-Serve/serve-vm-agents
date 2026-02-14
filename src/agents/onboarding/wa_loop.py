@@ -29,7 +29,11 @@ from .messages import (
     WELCOME_INTRO, WELCOME_INSTRUCTIONS, WELCOME_START_BUTTONS, WELCOME_VIDEO_INTRO, WELCOME_VIDEO_FOOTER,
     GENERIC_DEFERRED_MSG, WELCOME_SERVE_OVERVIEW, WELCOME_CONSENT_ACK, WELCOME_CONSENT_REMINDER,
     WELCOME_FAQ_FOLLOWUP, WELCOME_VIDEO_CONTINUE, WELCOME_FAQ_PROMPT, WELCOME_FAQ_BUTTONS, WELCOME_FAQ_PAID,
+    WELCOME_FAQ_EVIDYALOKA,
     WELCOME_STATEMENT_ACK,
+    INACTIVITY_FOLLOWUP_PROMPT, INACTIVITY_FOLLOWUP_BUTTONS,
+    INACTIVITY_FOLLOWUP_LATER_PROMPT, INACTIVITY_FOLLOWUP_LATER_BUTTONS,
+    INACTIVITY_FOLLOWUP_CONFIRM,
     INTENT_PROMPT, INTENT_EXIT,
     ELIGIBILITY_PROMPT, ELIGIBILITY_EXIT,
     ELIGIBILITY_INTRO, ELIGIBILITY_Q1, ELIGIBILITY_Q2, ELIGIBILITY_Q3,
@@ -96,6 +100,212 @@ CONVERSATION_HISTORIES: dict[str, object] = {}  # {phone: ChatHistory()} - SK Me
 MCP_BASE = settings.MCP_BASE
 MCP_JSONRPC_ENDPOINT = f"{MCP_BASE}/mcp/v1/jsonrpc"
 MCP_INITIALIZED = False
+
+# ---------- Reminder Worker (DB-backed, stored in serve_agent_sessions.tool_state JSONB) ----------
+REMINDER_WORKER_TASK: asyncio.Task | None = None
+REMINDER_WORKER_STARTED = False
+REMINDER_WORKER_ID = str(uuid.uuid4())
+DEFERRAL_REMINDER_HOURS = 23
+
+
+def _default_deferral_when_iso() -> str:
+    return (datetime.now(timezone.utc) + timedelta(hours=DEFERRAL_REMINDER_HOURS)).isoformat()
+
+
+def _persist_deferral_reminder(phone: str, *, sess: dict, reason: str) -> None:
+    """
+    Persist a local reminder in DB so we can nudge the volunteer within 24h (no template needed).
+    This reminder always uses buttons to make it easy to reply.
+    """
+    try:
+        from storage.reminders import add_reminder
+        when_iso = _default_deferral_when_iso()
+        with get_db_session() as db:
+            reminder = add_reminder(
+                db,
+                wa_phone=phone,
+                when_iso=when_iso,
+                reason=reason,
+                payload={
+                    "send_mode": "text",
+                    "text": INACTIVITY_FOLLOWUP_PROMPT,
+                    "buttons": INACTIVITY_FOLLOWUP_BUTTONS,
+                    "feedback_after_send": True,
+                },
+            )
+            log_event(
+                db=db,
+                wa_phone=phone,
+                agent_name=settings.AGENT_NAME,
+                event_type="REMINDER_SCHEDULED",
+                event_source="agent",
+                state=sess.get("state"),
+                sub_state=sess.get("sub_state"),
+                status="SUCCESS",
+                details={"reason": reason, "when_iso": when_iso, "reminder_id": reminder.get("id")},
+                session_id=sess.get("_db_session_id"),
+            )
+    except Exception as e:
+        log.warning(f"[REMINDER] Failed to persist deferral reminder: {e}", exc_info=True)
+
+
+def _start_reminder_worker_if_needed() -> None:
+    """Start the reminder worker once per process (best-effort)."""
+    global REMINDER_WORKER_TASK, REMINDER_WORKER_STARTED
+    if REMINDER_WORKER_STARTED:
+        return
+    try:
+        REMINDER_WORKER_TASK = asyncio.create_task(_reminder_worker_loop())
+        REMINDER_WORKER_STARTED = True
+        log.info("[REMINDER] Worker started")
+    except Exception as e:
+        log.warning(f"[REMINDER] Failed to start worker: {e}", exc_info=True)
+
+
+async def _reminder_worker_loop() -> None:
+    """Poll DB for due reminders and send them."""
+    # Small startup delay so we don't contend with MCP init/startup bursts
+    await asyncio.sleep(2.0)
+    while True:
+        try:
+            await _process_due_reminders_once()
+        except Exception as e:
+            log.warning(f"[REMINDER] Worker iteration failed: {e}", exc_info=True)
+        await asyncio.sleep(30.0)
+
+
+async def _process_due_reminders_once() -> None:
+    """
+    One reminder worker iteration:
+    - find due reminders in DB
+    - lock them (tool_state status -> sending)
+    - send WhatsApp message
+    - mark sent / failed and emit events
+    """
+    from storage.db import get_db_session
+    from storage.reminders import list_due_reminders, lock_reminder, mark_reminder_sent, mark_reminder_failed
+    from storage.event_logger import log_event
+
+    now = datetime.now(timezone.utc)
+    try:
+        with get_db_session() as db:
+            due = list_due_reminders(db, now=now)
+    except Exception as e:
+        log.warning(f"[REMINDER] Failed to load due reminders: {e}", exc_info=True)
+        return
+
+    if not due:
+        return
+
+    # Ensure MCP is initialized before any sends
+    try:
+        await _mcp_initialize()
+    except Exception:
+        return
+
+    for wa_phone, reminder in due[:50]:
+        reminder_id = (reminder or {}).get("id")
+        if not reminder_id:
+            continue
+
+        # Lock reminder to reduce duplicate sends across concurrent workers
+        try:
+            with get_db_session() as db:
+                locked = lock_reminder(db, wa_phone, reminder_id, worker_id=REMINDER_WORKER_ID)
+                if not locked:
+                    continue
+                log_event(
+                    db=db,
+                    wa_phone=wa_phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="REMINDER_LOCKED",
+                    event_source="agent",
+                    state="REMINDER",
+                    status="SUCCESS",
+                    details={"reminder_id": reminder_id, "reason": reminder.get("reason")},
+                )
+        except Exception:
+            continue
+
+        payload = reminder.get("payload") if isinstance(reminder, dict) else {}
+        send_mode = (payload or {}).get("send_mode") or "text"
+
+        try:
+            if send_mode == "template":
+                template_name = (payload or {}).get("template_name") or "serve_welcome"
+                language_code = (payload or {}).get("language_code") or "en"
+                await mcp_wa_send_template(wa_phone, template_name, language_code=language_code)
+            else:
+                text = (payload or {}).get("text") or INACTIVITY_FOLLOWUP_PROMPT
+                buttons = (payload or {}).get("buttons") or INACTIVITY_FOLLOWUP_BUTTONS
+                await mcp_wa_send(wa_phone, text, buttons=buttons)
+
+            with get_db_session() as db:
+                mark_reminder_sent(db, wa_phone, reminder_id)
+                log_event(
+                    db=db,
+                    wa_phone=wa_phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="REMINDER_SENT",
+                    event_source="agent",
+                    state="REMINDER",
+                    status="SUCCESS",
+                    details={"reminder_id": reminder_id, "reason": reminder.get("reason")},
+                )
+
+            # Optional feedback request after sending reminder (2nd reminder touch)
+            if (payload or {}).get("feedback_after_send"):
+                try:
+                    feedback_prompt = (
+                        "Quick one — was this reminder helpful?\n"
+                        "1 = Poor, 2 = Fair, 3 = Okay, 4 = Good, 5 = Excellent"
+                    )
+                    await mcp_wa_send(wa_phone, feedback_prompt, buttons=["1", "2", "3", "4", "5"])
+                    # Mark pending feedback in DB so we can capture 1-5 reply later
+                    from storage.session_store import update_session_state_and_tool_state
+                    with get_db_session() as db:
+                        update_session_state_and_tool_state(
+                            db=db,
+                            wa_phone=wa_phone,
+                            state="ONBOARDING",
+                            sub_state=None,
+                            tool_state_updates={
+                                "pending_reminder_feedback": {
+                                    "reminder_id": reminder_id,
+                                    "reason": reminder.get("reason"),
+                                    "asked_at": datetime.now(timezone.utc).isoformat(),
+                                }
+                            },
+                        )
+                        log_event(
+                            db=db,
+                            wa_phone=wa_phone,
+                            agent_name=settings.AGENT_NAME,
+                            event_type="REMINDER_FEEDBACK_ASKED",
+                            event_source="agent",
+                            state="REMINDER",
+                            status="SUCCESS",
+                            details={"reminder_id": reminder_id, "reason": reminder.get("reason")},
+                        )
+                except Exception as e:
+                    log.warning(f"[REMINDER] Failed to ask feedback: {e}", exc_info=True)
+        except Exception as e:
+            err = str(e)
+            try:
+                with get_db_session() as db:
+                    mark_reminder_failed(db, wa_phone, reminder_id, error=err)
+                    log_event(
+                        db=db,
+                        wa_phone=wa_phone,
+                        agent_name=settings.AGENT_NAME,
+                        event_type="REMINDER_FAILED",
+                        event_source="agent",
+                        state="REMINDER",
+                        status="ERROR",
+                        details={"reminder_id": reminder_id, "reason": reminder.get("reason"), "error": err[:500]},
+                    )
+            except Exception:
+                pass
 
 WELCOME_ALLOWED_INTENTS = {"CONSENT_YES", "CONSENT_NO", "QUERY", "DEFERRAL", "STOP", "RETURNING", "AMBIGUOUS"}
 ELIGIBILITY_PART1_ALLOWED_INTENTS = {
@@ -1517,7 +1727,36 @@ async def mcp_slot_book(hold_id: str):
 
 
 async def mcp_reminder_create(when_iso: str, reason: str, volunteer_id: str | None = None):
-    return await _mcp_call("reminder.create", {"when_ISO": when_iso, "reason": reason, "volunteerId": volunteer_id}, timeout=10)
+    """
+    Local reminder.create implementation.
+
+    MCP server tool `reminder.create` is a stub right now, so we persist reminders locally
+    in `serve_agent_sessions.tool_state.reminders` and let the in-process reminder worker send them.
+    """
+    try:
+        # This legacy wrapper does not know the WhatsApp phone. If volunteer_id looks like a phone,
+        # persist against that; otherwise return an error (callers should use add_reminder with wa_phone).
+        wa_phone = normalize_phone(volunteer_id or "")
+        if not wa_phone or not re.fullmatch(r"\d{8,15}", wa_phone):
+            return {"ok": False, "error": "volunteer_id is not a WhatsApp phone; pass wa_phone to local reminder scheduler"}
+
+        from storage.reminders import add_reminder
+        with get_db_session() as db:
+            reminder = add_reminder(
+                db,
+                wa_phone=wa_phone,
+                when_iso=when_iso,
+                reason=reason,
+                payload={
+                    "send_mode": "text",
+                    "text": INACTIVITY_FOLLOWUP_PROMPT,
+                    "buttons": INACTIVITY_FOLLOWUP_BUTTONS,
+                },
+            )
+        return {"ok": True, "reminder": reminder}
+    except Exception as e:
+        log.warning(f"[REMINDER] Failed to persist reminder: {e}", exc_info=True)
+        return {"ok": False, "error": str(e)}
 
 
 async def mcp_telemetry_emit(event: str, payload: dict):
@@ -1565,8 +1804,8 @@ def _detect_deferral(text: str) -> bool:
         r"\b("
         r"later|next\s+week|another\s+(time|day)|tomorrow|"
         r"not\s+today|not\s+now|not\s+right\s+now|not\s+sure|"
-        r"busy|travel(l)?ing|remind|maybe\s+later|do\s+this\s+later|"
-        r"come\s+back|check\s+back|ping\s+me\s+later"
+        r"busy|travel(l)?ing|remind|maybe\s+later|do\s+this\s+later|do\s+it\s+later|"
+        r"come\s+back|check\s+back|ping\s+me\s+later|i\s+will\s+do\s+it\s+later"
         r")\b"
     )
     return bool(re.search(pattern, text.lower()))
@@ -1847,6 +2086,43 @@ def _add_to_history(phone: str, user_msg: str = None, bot_msg: str = None):
             log.debug(f"[MEMORY] Added bot message to history for {phone}")
     except Exception as e:
         log.warning(f"[MEMORY] Failed to add to history: {e}")
+
+
+def _should_followup_state(state: str) -> bool:
+    return state not in {"OPTOUT", "REJECTED", "COMPLETE", "CLOSE"}
+
+
+def _next_weekend_reminder_iso(now: datetime) -> str:
+    # Next Saturday at 10:00 local time (Asia/Kolkata) approximated in UTC offset
+    # Assume server time is UTC; convert to IST by adding 5:30 if needed is out-of-scope here.
+    # Use UTC timestamp for simplicity.
+    target = now + timedelta(days=(5 - now.weekday()) % 7)
+    target = target.replace(hour=10, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target = target + timedelta(days=7)
+    return target.isoformat()
+
+
+async def _schedule_inactivity_followup(phone: str, last_user_ts: float) -> None:
+    await asyncio.sleep(60 * 60)  # 60 minutes
+    sess = SESSIONS.get(phone)
+    if not sess:
+        return
+    if sess.get("_last_user_ts") != last_user_ts:
+        return
+    if sess.get("_inactivity_followup_done") or sess.get("_inactivity_followup_sent"):
+        return
+    if not _should_followup_state(sess.get("state")):
+        return
+    try:
+        await mcp_wa_send(phone, INACTIVITY_FOLLOWUP_PROMPT, buttons=INACTIVITY_FOLLOWUP_BUTTONS)
+        _add_to_history(phone, bot_msg=INACTIVITY_FOLLOWUP_PROMPT)
+        sess["_inactivity_followup_sent"] = True
+        sess["_inactivity_followup_stage"] = "FIRST"
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+    except Exception as e:
+        log.warning(f"[FOLLOWUP] Failed to send inactivity followup: {e}", exc_info=True)
 
 
 # ---------- SK-Powered Hybrid Parser ----------
@@ -2278,7 +2554,6 @@ def _ensure_db_session_id(phone: str, sess: dict) -> None:
             from storage.db import get_db_session
             from storage.session_store import get_or_create_session
             from storage.event_logger import log_event
-            from .config import settings
             
             with get_db_session() as db:
                 db_session = get_or_create_session(
@@ -2514,7 +2789,6 @@ def _rehydrate_or_create_session(phone: str) -> dict:
             from storage.db import get_db_session
             from storage.session_store import get_or_create_session
             from storage.event_logger import log_event
-            from .config import settings
             
             with get_db_session() as db:
                 db_session = get_or_create_session(
@@ -2551,6 +2825,68 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
     """
     phone = normalize_phone(phone)
     sess = _rehydrate_or_create_session(phone)
+    _start_reminder_worker_if_needed()
+
+    # Capture feedback replies to reminder feedback prompt (1-5), without disturbing state flow.
+    if text != "__kick__":
+        captured_feedback = False
+        try:
+            from sqlalchemy import select
+            from storage.tables import serve_agent_sessions
+            from storage.session_store import update_session_state_and_tool_state
+
+            with get_db_session() as db:
+                row = db.execute(
+                    select(serve_agent_sessions.c.tool_state).where(serve_agent_sessions.c.wa_phone == phone)
+                ).first()
+                tool_state = row[0] if row and isinstance(row[0], dict) else {}
+                pending = (tool_state or {}).get("pending_reminder_feedback")
+                if isinstance(pending, dict) and text.strip() in {"1", "2", "3", "4", "5"}:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    fb_entry = {
+                        "rating": text.strip(),
+                        "at": now_iso,
+                        "source": "reminder",
+                        "reason": pending.get("reason"),
+                        "reminder_id": pending.get("reminder_id"),
+                    }
+                    history = tool_state.get("reminder_feedback_history", [])
+                    if not isinstance(history, list):
+                        history = []
+                    history.append(fb_entry)
+                    update_session_state_and_tool_state(
+                        db=db,
+                        wa_phone=phone,
+                        state=sess.get("state", "ONBOARDING"),
+                        sub_state=sess.get("sub_state"),
+                        tool_state_updates={
+                            "pending_reminder_feedback": None,
+                            "reminder_feedback_history": history,
+                        },
+                    )
+                    log_event(
+                        db=db,
+                        wa_phone=phone,
+                        agent_name=settings.AGENT_NAME,
+                        event_type="REMINDER_FEEDBACK_COLLECTED",
+                        event_source="user",
+                        state=sess.get("state"),
+                        sub_state=sess.get("sub_state"),
+                        status="SUCCESS",
+                        details=fb_entry,
+                        session_id=sess.get("_db_session_id"),
+                    )
+                    captured_feedback = True
+
+            if captured_feedback:
+                # Thank you message and stop here (don't progress state with a rating number)
+                await mcp_wa_send(phone, "Thank you — noted. 🙏")
+                _add_to_history(phone, bot_msg="Thank you — noted. 🙏")
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+        except Exception as e:
+            log.warning(f"[REMINDER] Failed to capture reminder feedback: {e}", exc_info=True)
     
     state = sess["state"]
     profile = sess.get("profile", {})
@@ -2578,6 +2914,97 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
     # Add user message to conversation history (SK Memory)
     if text != "__kick__":  # Don't add internal triggers
         _add_to_history(phone, user_msg=text)
+
+    # Track last user activity and schedule inactivity followup
+    if text != "__kick__":
+        sess["_last_user_ts"] = time.time()
+        if _should_followup_state(state):
+            asyncio.create_task(_schedule_inactivity_followup(phone, sess["_last_user_ts"]))
+        sess["ts"] = time.time()
+        SESSIONS[phone] = sess
+
+    # Handle inactivity follow-up responses
+    if text != "__kick__" and sess.get("_inactivity_followup_stage"):
+        stage = sess.get("_inactivity_followup_stage")
+        text_lower = text.lower().strip()
+        if stage == "FIRST":
+            if "now" in text_lower:
+                sess["_inactivity_followup_sent"] = False
+                sess["_inactivity_followup_stage"] = None
+                sess["_inactivity_followup_done"] = True
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                await mcp_wa_send(phone, "Great — let's continue.")
+                _add_to_history(phone, bot_msg="Great — let's continue.")
+                await _handle(phone, "__kick__")
+                return
+            if "later" in text_lower:
+                await mcp_wa_send(phone, INACTIVITY_FOLLOWUP_LATER_PROMPT, buttons=INACTIVITY_FOLLOWUP_LATER_BUTTONS)
+                _add_to_history(phone, bot_msg=INACTIVITY_FOLLOWUP_LATER_PROMPT)
+                sess["_inactivity_followup_stage"] = "SECOND"
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            await mcp_wa_send(phone, INACTIVITY_FOLLOWUP_PROMPT, buttons=INACTIVITY_FOLLOWUP_BUTTONS)
+            _add_to_history(phone, bot_msg=INACTIVITY_FOLLOWUP_PROMPT)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
+        if stage == "SECOND":
+            now = datetime.now(timezone.utc)
+            when_iso = None
+            if "day" in text_lower and "3" not in text_lower:
+                # Schedule at 23h (not 24h) so WhatsApp template is typically not required.
+                when_iso = (now + timedelta(hours=23)).isoformat()
+            elif "3" in text_lower:
+                when_iso = (now + timedelta(days=3)).isoformat()
+            elif "weekend" in text_lower:
+                when_iso = _next_weekend_reminder_iso(now)
+            if when_iso:
+                try:
+                    # Persist reminder locally (MCP reminder.create is a stub)
+                    from storage.reminders import add_reminder
+                    from storage.event_logger import log_event as _log_event
+                    with get_db_session() as db:
+                        reminder = add_reminder(
+                            db,
+                            wa_phone=phone,
+                            when_iso=when_iso,
+                            reason="inactivity_followup",
+                            payload={
+                                "send_mode": "text",
+                                "text": INACTIVITY_FOLLOWUP_PROMPT,
+                                "buttons": INACTIVITY_FOLLOWUP_BUTTONS,
+                                "feedback_after_send": True,
+                            },
+                        )
+                        _log_event(
+                            db=db,
+                            wa_phone=phone,
+                            agent_name=settings.AGENT_NAME,
+                            event_type="REMINDER_SCHEDULED",
+                            event_source="user",
+                            state="ONBOARDING",
+                            sub_state="INACTIVITY_FOLLOWUP",
+                            status="SUCCESS",
+                            details={"reason": "inactivity_followup", "when_iso": when_iso, "reminder_id": reminder.get("id")},
+                            session_id=sess.get("_db_session_id"),
+                        )
+                except Exception as e:
+                    log.warning(f"[FOLLOWUP] Failed to create reminder: {e}", exc_info=True)
+                await mcp_wa_send(phone, INACTIVITY_FOLLOWUP_CONFIRM)
+                _add_to_history(phone, bot_msg=INACTIVITY_FOLLOWUP_CONFIRM)
+                sess["_inactivity_followup_sent"] = False
+                sess["_inactivity_followup_stage"] = None
+                sess["_inactivity_followup_done"] = True
+                sess["ts"] = time.time()
+                SESSIONS[phone] = sess
+                return
+            await mcp_wa_send(phone, INACTIVITY_FOLLOWUP_LATER_PROMPT, buttons=INACTIVITY_FOLLOWUP_LATER_BUTTONS)
+            _add_to_history(phone, bot_msg=INACTIVITY_FOLLOWUP_LATER_PROMPT)
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
 
     # Store mid-flow questions asked by users
     if text != "__kick__" and looks_like_question(text):
@@ -2623,9 +3050,11 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
         _add_to_history(phone, bot_msg=defer_msg)
         sess["_deferred_prev_state"] = state
         sess["_deferred_reason"] = "USER_DEFERRED"
-        sess["state"] = "DEFERRED"
+        sess["_feedback_next_state"] = "DEFERRED"
+        sess["state"] = "FEEDBACK"
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
+        await _handle(phone, "__kick__")
         return
     
     # Per-turn flag for state-level FAQ handling
@@ -2937,12 +3366,16 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
                 or (isinstance(deferral_payload, str) and deferral_payload.lower() in {"ill_do_this_later", "later", "defer", "do_later"})
                 or "do this later" in deferral_text_norm
                 or "ill do this later" in deferral_text_norm
+                or "do it later" in deferral_text_norm
+                or "ill do it later" in deferral_text_norm
+                or "i will do it later" in deferral_text_norm
             ):
                 await mcp_wa_send(phone, GENERIC_DEFERRED_MSG)
                 _add_to_history(phone, bot_msg=GENERIC_DEFERRED_MSG)
                 sess["_deferred_prev_state"] = "WELCOME"
                 sess["_deferred_reason"] = "WELCOME_LATER"
                 sess["state"] = "DEFERRED"
+                _persist_deferral_reminder(phone, sess=sess, reason="WELCOME_LATER")
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
                 return
@@ -2970,7 +3403,9 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
                 faq_answer = WELCOME_FAQ_PAID
             elif "certificate" in normalized_text:
                 faq_answer = QA_FAQ_CERTIFICATE
-            elif "serve" in normalized_text or "know" in normalized_text or "about" in normalized_text:
+            elif "evidyaloka" in normalized_text:
+                faq_answer = WELCOME_FAQ_EVIDYALOKA
+            elif "serve" in normalized_text or "know about us" in normalized_text or "about us" in normalized_text:
                 faq_answer = QA_FAQ_ABOUT_SERVE
 
             if faq_answer:
@@ -3198,9 +3633,11 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
         if re.search(r"\b(stop|unsubscribe|leave|quit|exit|end)\b", text_lower):
             await mcp_wa_send(phone, QA_STOP_ACK)
             _add_to_history(phone, bot_msg=QA_STOP_ACK)
-            sess["state"] = "OPTOUT"
+            sess["_feedback_next_state"] = "OPTOUT"
+            sess["state"] = "FEEDBACK"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
+            await _handle(phone, "__kick__")
             return
         
         # Handle deferral / clear decline
@@ -3214,9 +3651,11 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
             _add_to_history(phone, bot_msg=WELCOME_MAYBE_LATER)
             sess["_deferred_prev_state"] = "WELCOME_VIDEO"
             sess["_deferred_reason"] = "WELCOME_LATER"
-            sess["state"] = "DEFERRED"
+            sess["_feedback_next_state"] = "DEFERRED"
+            sess["state"] = "FEEDBACK"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
+            await _handle(phone, "__kick__")
             return
         
         # If user asks a question, answer then move on (no footer re-ask)
@@ -3285,18 +3724,22 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
         if intent_detected in {"STOP"}:
             await mcp_wa_send(phone, QA_STOP_ACK)
             _add_to_history(phone, bot_msg=QA_STOP_ACK)
-            sess["state"] = "OPTOUT"
+            sess["_feedback_next_state"] = "OPTOUT"
+            sess["state"] = "FEEDBACK"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
+            await _handle(phone, "__kick__")
             return
         if intent_detected in {"DEFERRAL", "CONSENT_NO"}:
             await mcp_wa_send(phone, WELCOME_MAYBE_LATER)
             _add_to_history(phone, bot_msg=WELCOME_MAYBE_LATER)
             sess["_deferred_prev_state"] = "WELCOME_VIDEO"
             sess["_deferred_reason"] = "WELCOME_LATER"
-            sess["state"] = "DEFERRED"
+            sess["_feedback_next_state"] = "DEFERRED"
+            sess["state"] = "FEEDBACK"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
+            await _handle(phone, "__kick__")
             return
         
         # Default: continue
@@ -3700,6 +4143,7 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
                     sess["_deferred_prev_state"] = state
                     sess["_deferred_reason"] = "WELCOME_USER_LATER"
                     sess["state"] = "DEFERRED"
+                    _persist_deferral_reminder(phone, sess=sess, reason="WELCOME_USER_LATER")
                     sess["ts"] = time.time()
                     SESSIONS[phone] = sess
                     return
@@ -3712,6 +4156,7 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
                     sess["_deferred_prev_state"] = state
                     sess["_deferred_reason"] = "WELCOME_USER_LATER"
                     sess["state"] = "DEFERRED"
+                    _persist_deferral_reminder(phone, sess=sess, reason="WELCOME_USER_LATER")
                     sess["ts"] = time.time()
                     SESSIONS[phone] = sess
                     return
@@ -3746,7 +4191,8 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
                 stop_msg = f"Understood, {name}. I'll stop messaging you. Thank you for your time."
                 await mcp_wa_send(phone, stop_msg)
                 _add_to_history(phone, bot_msg=stop_msg)
-                sess["state"] = "OPTOUT"
+                sess["_feedback_next_state"] = "OPTOUT"
+                sess["state"] = "FEEDBACK"
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
                 
@@ -3759,6 +4205,7 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
                     })
                 except Exception:
                     pass
+                await _handle(phone, "__kick__")
                 return
                 
             else:  # AMBIGUOUS or unknown
@@ -4185,11 +4632,13 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
                             sess["_deferred_prev_state"] = state
                             sess["_deferred_reason"] = "COMMITMENT_INSUFFICIENT"
                             sess["state"] = "DEFERRED"
+                            _persist_deferral_reminder(phone, sess=sess, reason="COMMITMENT_INSUFFICIENT")
                         except Exception as e:
                             log.warning(f"[ELIG] Failed to create commitment deferral: {e}")
                             sess["_deferred_prev_state"] = state
                             sess["_deferred_reason"] = "COMMITMENT_INSUFFICIENT"
                             sess["state"] = "DEFERRED"
+                            _persist_deferral_reminder(phone, sess=sess, reason="COMMITMENT_INSUFFICIENT")
 
                         sess["ts"] = time.time()
                         SESSIONS[phone] = sess
@@ -4231,11 +4680,13 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
                     sess["_deferred_prev_state"] = state
                     sess["_deferred_reason"] = "COMMITMENT_INSUFFICIENT"
                     sess["state"] = "DEFERRED"
+                    _persist_deferral_reminder(phone, sess=sess, reason="COMMITMENT_INSUFFICIENT")
                 except Exception as e:
                     log.warning(f"[ELIG] Failed to create commitment deferral: {e}")
                     sess["_deferred_prev_state"] = state
                     sess["_deferred_reason"] = "COMMITMENT_INSUFFICIENT"
                     sess["state"] = "DEFERRED"
+                    _persist_deferral_reminder(phone, sess=sess, reason="COMMITMENT_INSUFFICIENT")
 
                 sess.pop("_commitment_llm_deferral", None)
                 sess["ts"] = time.time()
@@ -4437,6 +4888,7 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
             sess["_deferred_prev_state"] = "PREFS_DAYTIME"
             sess["_deferred_reason"] = "PREFS_LATER"
             sess["state"] = "DEFERRED"
+            _persist_deferral_reminder(phone, sess=sess, reason="PREFS_LATER")
             sess["ts"] = time.time(); SESSIONS[phone] = sess
             return
         elif interpretation.get("followup"):
@@ -4606,6 +5058,7 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
                 sess["_deferred_prev_state"] = state
                 sess["_deferred_reason"] = "ORIENTATION_LATER"
                 sess["state"] = "DEFERRED"
+                _persist_deferral_reminder(phone, sess=sess, reason="ORIENTATION_LATER")
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
                 try:
@@ -4831,6 +5284,7 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
                 await mcp_wa_send(phone, defer_msg)
                 _add_to_history(phone, bot_msg=defer_msg)
                 sess["state"] = "DEFERRED"
+                _persist_deferral_reminder(phone, sess=sess, reason="ORIENTATION_LATER")
                 sess["orientation_pending"] = True
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
@@ -4885,6 +5339,7 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
                 except Exception as e:
                     log.warning(f"[ORIENT] Deferral creation via LLM intent failed: {e}")
                 sess["state"] = "DEFERRED"
+                _persist_deferral_reminder(phone, sess=sess, reason="ORIENTATION_LATER")
                 sess["orientation_pending"] = True
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
@@ -5121,6 +5576,18 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
 
         if prev_state == "PREFS_DAYTIME":
             sess.pop("_prefs_evening_attempts", None)
+
+        # If user is still deferring, acknowledge and stay deferred (avoid loop)
+        if text != "__kick__" and (is_defer_response(text) or _detect_deferral(text)):
+            await mcp_wa_send(phone, GENERIC_DEFERRED_MSG)
+            _add_to_history(phone, bot_msg=GENERIC_DEFERRED_MSG)
+            sess["_deferred_prev_state"] = prev_state
+            sess["_deferred_reason"] = "USER_DEFERRED"
+            sess["state"] = "DEFERRED"
+            _persist_deferral_reminder(phone, sess=sess, reason="USER_DEFERRED")
+            sess["ts"] = time.time()
+            SESSIONS[phone] = sess
+            return
 
         sess["state"] = prev_state
         sess["ts"] = time.time()

@@ -96,7 +96,8 @@ async def handle_qa_window(phone: str, text: str, sess: Dict[str, Any], profile:
         ack = QA_STOP_ACK
         await mcp_wa_send(phone, ack)
         _add_to_history(phone, bot_msg=ack)
-        sess["state"] = "OPTOUT"
+        sess["_feedback_next_state"] = "OPTOUT"
+        sess["state"] = "FEEDBACK"
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         try:
@@ -107,6 +108,7 @@ async def handle_qa_window(phone: str, text: str, sess: Dict[str, Any], profile:
             })
         except Exception:
             pass
+        await _handle(phone, "__kick__")
         return
     
     # B) DEFERRAL
@@ -121,7 +123,8 @@ async def handle_qa_window(phone: str, text: str, sess: Dict[str, Any], profile:
             _add_to_history(phone, bot_msg=defer_msg)
             sess["_deferred_prev_state"] = sess.get("state")
             sess["_deferred_reason"] = "ORIENTATION_LATER"
-            sess["state"] = "DEFERRED"
+            sess["_feedback_next_state"] = "DEFERRED"
+            sess["state"] = "FEEDBACK"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
             try:
@@ -132,6 +135,7 @@ async def handle_qa_window(phone: str, text: str, sess: Dict[str, Any], profile:
                 })
             except Exception:
                 pass
+            await _handle(phone, "__kick__")
             return
         except Exception as e:
             log.warning(f"[QA] Deferral creation failed: {e}")

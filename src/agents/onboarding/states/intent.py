@@ -114,9 +114,11 @@ async def handle_intent(phone: str, text: str, sess: Dict[str, Any], profile: Di
             log.info(f"[INTENT] User deferred/stopped, sending exit message")
             await mcp_wa_send(phone, INTENT_EXIT)
             _add_to_history(phone, bot_msg=INTENT_EXIT)
-            sess["state"] = "REJECTED"
+            sess["_feedback_next_state"] = "REJECTED"
+            sess["state"] = "FEEDBACK"
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
+            await _handle(phone, "__kick__")
             return
         else:
             # User wants to continue - transition to PEEK_CHOICE
@@ -164,9 +166,11 @@ async def handle_intent(phone: str, text: str, sess: Dict[str, Any], profile: Di
         except Exception as e:
             log.warning(f"[INTENT] Failed to persist: {e}", exc_info=True)
         
-        sess["state"] = "REJECTED"
+        sess["_feedback_next_state"] = "REJECTED"
+        sess["state"] = "FEEDBACK"
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
+        await _handle(phone, "__kick__")
         return
     
     # Generate a single-line reflective response using LLM

@@ -5,7 +5,7 @@ Ask if user wants to see a class preview video.
 import logging
 import time
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 
 from ..messages import (
@@ -232,12 +232,14 @@ async def handle_class_preview_ask(
     # Free text fallback
     text_lower = text.lower().strip()
     if re.search(r"\b(stop|unsubscribe|leave|quit|exit|end)\b", text_lower):
-        sess["state"] = "OPTOUT"
+        sess["_feedback_next_state"] = "OPTOUT"
+        sess["state"] = "FEEDBACK"
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         stop_msg = "Understood. I'll stop messages. If you change your mind, just say 'Hi' here anytime. 💛"
         await mcp_wa_send(phone, stop_msg)
         _add_to_history(phone, bot_msg=stop_msg)
+        await _handle(phone, "__kick__")
         return
     
     if re.search(r"\b(later|not now|not right now|another time|some other time|maybe later|after|busy)\b", text_lower):
@@ -251,6 +253,36 @@ async def handle_class_preview_ask(
             )
         except Exception as e:
             log.warning(f"[CLASS_PREVIEW_ASK] Failed to create deferral: {e}")
+        # Local reminder (DB) so we can nudge within 24h
+        try:
+            from storage.db import get_db_session
+            from storage.reminders import add_reminder
+            from storage.event_logger import log_event
+            from ..config import settings
+            from ..messages import INACTIVITY_FOLLOWUP_PROMPT, INACTIVITY_FOLLOWUP_BUTTONS
+            when_iso = (datetime.now(timezone.utc) + timedelta(hours=23)).isoformat()
+            with get_db_session() as db:
+                reminder = add_reminder(
+                    db,
+                    wa_phone=phone,
+                    when_iso=when_iso,
+                    reason="user_requested_later",
+                    payload={"send_mode": "text", "text": INACTIVITY_FOLLOWUP_PROMPT, "buttons": INACTIVITY_FOLLOWUP_BUTTONS, "feedback_after_send": True},
+                )
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="REMINDER_SCHEDULED",
+                    event_source="agent",
+                    state="ONBOARDING",
+                    sub_state="CLASS_PREVIEW_ASK",
+                    status="SUCCESS",
+                    details={"reason": "user_requested_later", "when_iso": when_iso, "reminder_id": reminder.get("id")},
+                    session_id=sess.get("_db_session_id"),
+                )
+        except Exception as e:
+            log.warning(f"[CLASS_PREVIEW_ASK] Failed to schedule local reminder: {e}", exc_info=True)
         sess["state"] = "DEFERRED"
         sess["ts"] = time.time()
         SESSIONS[phone] = sess

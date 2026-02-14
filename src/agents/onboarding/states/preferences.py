@@ -6,6 +6,7 @@ import logging
 import time
 import re
 import asyncio
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any
 from ..messages import (
     PREFS_INTRO_COLLAB, PREFS_FOLLOWUP_DAYS, PREFS_FOLLOWUP_TIME, PREFS_FOLLOWUP_LANGUAGE,
@@ -244,6 +245,36 @@ async def handle_preferences(phone: str, text: str, sess: Dict[str, Any], profil
         sess["_deferred_prev_state"] = "PREFERENCES"
         sess["_deferred_reason"] = "PREFS_LATER"
         sess["state"] = "DEFERRED"
+        # Local reminder (DB) so we can nudge within 24h
+        try:
+            from storage.db import get_db_session
+            from storage.reminders import add_reminder
+            from storage.event_logger import log_event
+            from ..config import settings
+            from ..messages import INACTIVITY_FOLLOWUP_PROMPT, INACTIVITY_FOLLOWUP_BUTTONS
+            when_iso = (datetime.now(timezone.utc) + timedelta(hours=23)).isoformat()
+            with get_db_session() as db:
+                reminder = add_reminder(
+                    db,
+                    wa_phone=phone,
+                    when_iso=when_iso,
+                    reason="PREFS_LATER",
+                    payload={"send_mode": "text", "text": INACTIVITY_FOLLOWUP_PROMPT, "buttons": INACTIVITY_FOLLOWUP_BUTTONS, "feedback_after_send": True},
+                )
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="REMINDER_SCHEDULED",
+                    event_source="agent",
+                    state="DEFERRED",
+                    sub_state="PREFERENCES",
+                    status="SUCCESS",
+                    details={"reason": "PREFS_LATER", "when_iso": when_iso, "reminder_id": reminder.get("id")},
+                    session_id=sess.get("_db_session_id"),
+                )
+        except Exception as e:
+            log.warning(f"[PREFS] Failed to schedule local reminder: {e}", exc_info=True)
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         return

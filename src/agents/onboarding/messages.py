@@ -70,7 +70,7 @@ If you have any other questions, you can ask too."""
 WELCOME_FAQ_BUTTONS = [
     "Is it Paid?",
     "About Certificate?",
-    "Know about us?",
+    "About eVidyaloka?",
 ]
 
 WELCOME_SERVE_OVERVIEW = """Beautiful 🌼
@@ -89,7 +89,19 @@ WELCOME_FAQ_FOLLOWUP = """Let's get started — I'll explain things along the wa
 WELCOME_STATEMENT_ACK = "Got it 🙂 I'm here to help."
 
 WELCOME_FAQ_PAID = "It’s a volunteer role with no payment."
+WELCOME_FAQ_EVIDYALOKA = (
+    "eVidyaloka is a nonprofit that connects volunteer teachers to students in "
+    "government schools through online classes. SERVE is eVidyaloka’s volunteer "
+    "teaching initiative."
+)
 WELCOME_FAQ_OTHER = "If you have any other questions, you can ask here too 🙂"
+
+# ---------- Inactivity Follow-ups ----------
+INACTIVITY_FOLLOWUP_PROMPT = "Would you like to continue now or later?"
+INACTIVITY_FOLLOWUP_BUTTONS = ["Now", "Later"]
+INACTIVITY_FOLLOWUP_LATER_PROMPT = "When should I remind you?"
+INACTIVITY_FOLLOWUP_LATER_BUTTONS = ["In a day", "In 3 days", "This weekend"]
+INACTIVITY_FOLLOWUP_CONFIRM = "Got it — I'll remind you then."
 
 # ---------- FAQ Acknowledgement & Bridge ----------
 FAQ_ACK_CHOICES = [
@@ -312,7 +324,7 @@ IDENTITY_PROGRESS = """Step 3/4 — You’re here → Identity & Preferences
 
 IDENTITY_NAME_PROMPT = """Lovely!  
 
-BTW! What name should I call you? Please reply with just your first name (e.g., Asha). 🙂"""
+BTW! What name should I call you? Please reply with just your name (e.g., Asha). 🙂"""
 
 IDENTITY_CONTACT_PROMPT = """Thanks {name}!  
 
@@ -393,7 +405,8 @@ PERSUADE_COMMITMENT = """Totally get it. Many volunteers start small and adjust.
 If you can try around 2 hours a week for about 3 months, it really helps the kids build a habit.
 Would giving it a try be okay? (Yes/No)"""
 
-ELIGIBILITY_AGE_PROMPT = """First, to make sure you meet our policy — may I check if you're 18 or older?"""
+ELIGIBILITY_AGE_PROMPT = """First, to make sure you meet our policy — may I check if you're 18 or older?
+By replying Yes, you confirm you're 18+ and okay with a volunteer (unpaid) role."""
 
 ELIGIBILITY_AGE_UNCLEAR = """I didn't quite catch that. Could you confirm: are you 18 or older? (Yes/No)"""
 
@@ -527,8 +540,11 @@ QA_CLOSING_MSG = """Thanks, {name}! Our coordinator will soon get in touch with 
 QA_FALLBACK_SOFT = """Thanks for your question. Our coordinator will get in touch with you soon."""
 
 # ---------- Section 5.5: Feedback ----------
-QA_FEEDBACK_PROMPT = "Before we wrap up, how was this onboarding experience for you?"
-QA_FEEDBACK_BUTTONS = ["Helpful", "Not helpful"]
+QA_FEEDBACK_PROMPT = (
+    "Before we wrap up, how was this onboarding experience for you?\n"
+    "1 = Poor, 2 = Fair, 3 = Okay, 4 = Good, 5 = Excellent"
+)
+QA_FEEDBACK_BUTTONS = None
 QA_FEEDBACK_CLOSING = "Thank you, {name}! Your feedback helps us improve. A coordinator will be in touch if needed."
 
 QA_MANDATORY_ORIENT = """One last step: a short WhatsApp check-in (about 10–15 minutes) is required for all volunteers.

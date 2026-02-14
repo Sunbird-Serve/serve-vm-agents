@@ -240,9 +240,11 @@ async def handle_continue_confirm(
         
         sess["_deferred_prev_state"] = "CONTINUE_CONFIRM"
         sess["_deferred_reason"] = "user_requested_later"
-        sess["state"] = "DEFERRED"
+        sess["_feedback_next_state"] = "DEFERRED"
+        sess["state"] = "FEEDBACK"
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
+        await _handle(phone, "__kick__")
         return
     
     # Free text fallback
@@ -273,12 +275,14 @@ async def handle_continue_confirm(
         except Exception as e:
             log.warning(f"[CONTINUE_CONFIRM] Failed to persist: {e}", exc_info=True)
         
-        sess["state"] = "OPTOUT"
+        sess["_feedback_next_state"] = "OPTOUT"
+        sess["state"] = "FEEDBACK"
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         stop_msg = "Understood. I'll stop messages. If you change your mind, just say 'Hi' here anytime. 💛"
         await mcp_wa_send(phone, stop_msg)
         _add_to_history(phone, bot_msg=stop_msg)
+        await _handle(phone, "__kick__")
         return
     
     elif intent == "CONTINUE":
@@ -390,6 +394,37 @@ async def handle_continue_confirm(
         sess["_deferred_prev_state"] = "CONTINUE_CONFIRM"
         sess["_deferred_reason"] = "user_requested_later"
         sess["state"] = "DEFERRED"
+        # Local reminder (DB) so we can nudge within 24h
+        try:
+            from storage.db import get_db_session
+            from storage.reminders import add_reminder
+            from storage.event_logger import log_event
+            from ..config import settings
+            from ..messages import INACTIVITY_FOLLOWUP_PROMPT, INACTIVITY_FOLLOWUP_BUTTONS
+
+            when_iso = (datetime.now(timezone.utc) + timedelta(hours=23)).isoformat()
+            with get_db_session() as db:
+                reminder = add_reminder(
+                    db,
+                    wa_phone=phone,
+                    when_iso=when_iso,
+                    reason="user_requested_later",
+                    payload={"send_mode": "text", "text": INACTIVITY_FOLLOWUP_PROMPT, "buttons": INACTIVITY_FOLLOWUP_BUTTONS, "feedback_after_send": True},
+                )
+                log_event(
+                    db=db,
+                    wa_phone=phone,
+                    agent_name=settings.AGENT_NAME,
+                    event_type="REMINDER_SCHEDULED",
+                    event_source="agent",
+                    state="DEFERRED",
+                    sub_state="CONTINUE_CONFIRM",
+                    status="SUCCESS",
+                    details={"reason": "user_requested_later", "when_iso": when_iso, "reminder_id": reminder.get("id")},
+                    session_id=sess.get("_db_session_id"),
+                )
+        except Exception as e:
+            log.warning(f"[CONTINUE_CONFIRM] Failed to schedule local reminder: {e}", exc_info=True)
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         return

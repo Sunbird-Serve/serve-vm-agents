@@ -1096,13 +1096,15 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
                 except Exception as e:
                     log.warning(f"[PERSISTENCE] Failed to finalize rejected session for {phone}: {e}", exc_info=True)
                 
-                sess["state"] = "REJECTED"
+                sess["_feedback_next_state"] = "REJECTED"
+                sess["state"] = "FEEDBACK"
                 sess["_eligibility_mode"] = None
                 sess["_eligibility_clarification_sent"] = False
                 sess["_eligibility_missing_req"] = None
                 sess["_eligibility_clarification_step"] = None
                 sess["ts"] = time.time()
                 SESSIONS[phone] = sess
+                await _handle(phone, "__kick__")
                 return
         
         # Handle ISSUE_OTHER: user typed free text about their issue
@@ -1380,13 +1382,15 @@ async def handle_eligibility(phone: str, text: str, sess: Dict[str, Any], profil
             except Exception as e:
                 log.warning(f"[PERSISTENCE] Failed to finalize rejected session for {phone}: {e}", exc_info=True)
             
-            sess["state"] = "REJECTED"
+            sess["_feedback_next_state"] = "REJECTED"
+            sess["state"] = "FEEDBACK"
             sess["_eligibility_mode"] = None
             sess["_eligibility_clarification_sent"] = False
             sess["_eligibility_missing_req"] = None
             sess["_eligibility_clarification_step"] = None
             sess["ts"] = time.time()
             SESSIONS[phone] = sess
+            await _handle(phone, "__kick__")
             return
         else:
             # Unclear response - re-ask the issue-specific question

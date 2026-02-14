@@ -274,12 +274,14 @@ async def handle_video(
         except Exception as e:
             log.warning(f"[VIDEO] Failed to persist: {e}", exc_info=True)
         
-        sess["state"] = "OPTOUT"
+        sess["_feedback_next_state"] = "OPTOUT"
+        sess["state"] = "FEEDBACK"
         sess["ts"] = time.time()
         SESSIONS[phone] = sess
         stop_msg = "Understood. I'll stop messages. If you change your mind, just say 'Hi' here anytime. 💛"
         await mcp_wa_send(phone, stop_msg)
         _add_to_history(phone, bot_msg=stop_msg)
+        await _handle(phone, "__kick__")
         return
     
     # If user asked about the video, answer briefly before proceeding
