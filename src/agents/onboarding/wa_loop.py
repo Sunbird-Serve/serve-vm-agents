@@ -3258,7 +3258,6 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
                     
                     # Persistence: record template sent
                     try:
-                        from datetime import datetime, timezone
                         from storage.session_store import update_session_state_and_tool_state
                         
                         now_iso = datetime.now(timezone.utc).isoformat()
@@ -3311,7 +3310,6 @@ async def _handle(phone: str, text: str, evt: Optional[Dict] = None):
 
             # Persistence: record welcome text messages in sessions + events
             try:
-                from datetime import datetime, timezone
                 from storage.session_store import update_session_state_and_tool_state
 
                 now_iso = datetime.now(timezone.utc).isoformat()
