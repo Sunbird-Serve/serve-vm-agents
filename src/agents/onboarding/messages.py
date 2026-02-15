@@ -97,9 +97,9 @@ WELCOME_FAQ_EVIDYALOKA = (
 WELCOME_FAQ_OTHER = "If you have any other questions, you can ask here too 🙂"
 
 # ---------- Inactivity Follow-ups ----------
-INACTIVITY_FOLLOWUP_PROMPT = "Would you like to continue now or later?"
+INACTIVITY_FOLLOWUP_PROMPT = "How would you like this to be continued?"
 INACTIVITY_FOLLOWUP_BUTTONS = ["Now", "Later"]
-INACTIVITY_FOLLOWUP_LATER_PROMPT = "When should I remind you?"
+INACTIVITY_FOLLOWUP_LATER_PROMPT = "When would you like to be reminded?"
 INACTIVITY_FOLLOWUP_LATER_BUTTONS = ["In a day", "In 3 days", "This weekend"]
 INACTIVITY_FOLLOWUP_CONFIRM = "Got it — I'll remind you then."
 
@@ -235,8 +235,10 @@ ELIGIBILITY_PROGRESS = """Step 2/4 — You’re here → Eligibility
 
 ELIGIBILITY_PART1_PROMPT = """Before we go ahead, just two quick checks:
 
-1) Are you 18 or above?
-2) Are you okay with this being a volunteer (unpaid) role?
+1) This volunteering opportunity is open to individuals 18 years and above.
+2) This is a volunteer (unpaid) role offered as part of our education programs.
+
+If you mark “Yes”, it will be considered that you have read, understood, and provided your consent to the above.
 
 You can simply reply Yes or No 🙂"""
 
