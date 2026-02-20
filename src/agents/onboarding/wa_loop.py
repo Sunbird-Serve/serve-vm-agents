@@ -586,6 +586,32 @@ PREFS_INTERPRET_RESPONSE_SCHEMA = {
 }
 
 
+def _parse_llm_json(raw: str) -> dict:
+    if not raw:
+        raise ValueError("LLM returned empty response")
+
+    text = raw.strip()
+
+    # Some models wrap valid JSON inside markdown fences.
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
+    if fenced:
+        text = fenced.group(1).strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Fallback: extract the first JSON object if extra prose is included.
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start:end + 1]
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+        raise ValueError(f"LLM response is not valid JSON: {raw[:500]}")
+
+
 async def _llm_call_structured(
     messages: list[dict],
     *,
@@ -602,12 +628,7 @@ async def _llm_call_structured(
     }
     result = await _mcp_call("llm.call", payload, timeout=timeout)
     raw = _extract_llm_text(result)
-    if not raw:
-        raise ValueError("LLM returned empty response")
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"LLM response is not valid JSON: {raw}") from exc
+    parsed = _parse_llm_json(raw)
     try:
         jsonschema.validate(parsed, schema)
     except ValidationError as exc:
